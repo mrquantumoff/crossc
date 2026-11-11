@@ -40,7 +40,9 @@
 //! [`MAX_STREAMS`] streams of two packets of [`MAX_PACKET_MS`] at the
 //! largest offered format (768000 bytes/s): 4 x 2 x 3.84 MB = 30.72 MB of
 //! nonpaged pool, plus one page of rounding per packet. Before, it was
-//! 2 GiB per stream and any number of streams.
+//! 2 GiB per stream and any number of streams. Each of these streams also
+//! holds a 250 ms tap ring (every stream does, so the tap can move to it):
+//! 4 x 192000 bytes more at that format.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -51,8 +53,10 @@ pub const MAX_PACKET_MS: u64 = 5_000;
 /// Longest packet in bytes, whatever the byte rate claims to be.
 pub const MAX_PACKET_BYTES: u64 = 8 << 20;
 /// Streams that may exist on the device at the same time. Windows uses one
-/// (the audio engine's, or an exclusive-mode client's instead of it); the
-/// rest is headroom for the moment one is closed while the next is opened.
+/// (the audio engine's, or an exclusive-mode client's instead of it); with
+/// the DEFAULT mode list on (`acx::DEFAULT_MODE_LIST`, off by default) it
+/// could use one per signal processing mode. The rest is headroom for the
+/// moment one is closed while the next is opened.
 pub const MAX_STREAMS: u32 = 4;
 
 /// Smallest and largest accepted packet size in bytes (both inclusive) for

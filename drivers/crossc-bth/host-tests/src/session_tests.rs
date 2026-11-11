@@ -26,7 +26,7 @@ fn setup(format: PcmFormat, ring_frames: usize) -> (Session, Vec<u8>) {
     let mut s = Session::new();
     assert!(s.set_endpoint(true));
     assert!(s.stream_created(S1, format));
-    assert!(s.install_ring(S1, ring_frames * format.frame_bytes()));
+    assert!(s.offer_ring(S1, 0, ring_frames * format.frame_bytes()));
     let storage = vec![0u8; s.ring_capacity()];
     (s, storage)
 }
@@ -314,10 +314,10 @@ fn ring_size_is_250_ms() {
     let mut s = Session::new();
     s.set_endpoint(true);
     assert!(s.stream_created(S1, F24));
-    assert!(s.install_ring(S1, 8 * 10 + 5));
+    assert!(s.offer_ring(S1, 0, 8 * 10 + 5));
     assert_eq!(s.ring_capacity(), 80);
-    assert!(!s.install_ring(S1, 7));
-    assert!(!s.install_ring(S2, 800));
+    assert!(!s.offer_ring(S1, 0, 7));
+    assert!(!s.offer_ring(S2, 0, 800));
 }
 
 #[test]
@@ -561,7 +561,7 @@ fn parked_read_too_small_for_the_stream_that_came() {
     let mut out = vec![0u8; HDR + 4];
     assert_eq!(s.begin_read(A, &[], &mut out), Ok(0));
     assert!(s.stream_created(S1, F24));
-    assert!(s.install_ring(S1, 80));
+    assert!(s.offer_ring(S1, 0, 80));
     let mut st = vec![0u8; s.ring_capacity()];
     s.render(S1, &mut st, &[7u8; 16]);
     assert!(s.read_ready());
@@ -600,18 +600,19 @@ fn stream_states() {
 }
 
 #[test]
-fn newest_stream_owns_the_tap_and_the_old_one_is_ignored() {
+fn newest_stream_takes_the_tap_from_a_paused_one_and_the_old_one_is_ignored() {
     let (mut s, mut st1) = setup(F16, 100);
     s.attach(A).unwrap();
     s.stream_running(S1, true);
     s.render(S1, &mut st1, &packet16(0, 10));
+    s.stream_running(S1, false);
 
     // The format is switched: a new stream appears before the old one is gone.
     assert!(s.stream_created(S2, F24));
     assert_eq!(s.ring_capacity(), 0, "the old stream's storage is no longer used");
     assert_eq!(s.state().frames_dropped, 10, "frames of the old format are lost");
     assert_eq!((s.state().stream, s.state().format), (StreamState::Paused, F24));
-    assert!(s.install_ring(S2, 80 * 8));
+    assert!(s.offer_ring(S2, 0, 80 * 8));
     let mut st2 = vec![0u8; s.ring_capacity()];
 
     // The old stream's late events change nothing.
@@ -619,7 +620,7 @@ fn newest_stream_owns_the_tap_and_the_old_one_is_ignored() {
     s.render(S1, &mut st2, &packet16(10, 10));
     s.render_silence(S1, &mut st2, 40);
     assert!(!s.stream_running(S1, false));
-    assert!(!s.install_ring(S1, 400));
+    assert!(!s.offer_ring(S1, 0, 400));
     assert!(!s.stream_destroyed(S1));
     assert_eq!(s.state(), before);
 
@@ -630,6 +631,243 @@ fn newest_stream_owns_the_tap_and_the_old_one_is_ignored() {
     assert_eq!(h.format, F24);
     assert_eq!((h.first_frame, h.frames, h.flags), (10, 3, PCM_FLAG_DISCONTINUITY));
     assert_eq!(data, &[0x11u8; 24]);
+}
+
+const S3: usize = 0x30;
+
+/// 24-in-32 stereo frames whose bytes are all `b`.
+fn packet32(b: u8, frames: usize) -> Vec<u8> {
+    vec![b; frames * 8]
+}
+
+#[test]
+fn a_new_stream_leaves_a_running_tap_alone_and_takes_it_when_it_runs() {
+    let (mut s, mut st1) = setup(F16, 100);
+    s.attach(A).unwrap();
+    s.stream_running(S1, true);
+    s.render(S1, &mut st1, &packet16(0, 10));
+
+    // A second stream (another mode, say) appears while the first plays.
+    let before = s.state();
+    assert!(s.stream_created(S2, F96), "known to the session");
+    assert!(!s.offer_ring(S2, 0xB000, 8 * 100), "remembered, not used yet");
+    assert_eq!(s.state(), before, "the wire state still describes the running stream");
+    assert_eq!(s.tap_stream(), S1);
+    s.render(S2, &mut st1, &packet32(0x22, 10));
+    assert_eq!(s.state(), before, "the other stream's packets do not reach the tap");
+
+    // The first pauses; nothing else runs, so it keeps the tap and its frames.
+    assert!(s.stream_running(S1, false));
+    assert_eq!((s.tap_stream(), s.state().stream, s.state().format), (S1, StreamState::Paused, F16));
+    assert_eq!(s.state().frames_dropped, 0);
+
+    // The second starts: it takes the tap with the storage it offered.
+    assert!(s.stream_running(S2, true));
+    assert_eq!((s.tap_stream(), s.state().stream, s.state().format), (S2, StreamState::Running, F96));
+    assert_eq!((s.ring_capacity(), s.ring_at()), (8 * 100, 0xB000));
+    assert_eq!(s.state().frames_dropped, 10, "the first stream's unread frames are lost");
+    let mut st2 = vec![0u8; s.ring_capacity()];
+    s.render(S2, &mut st2, &packet32(0x33, 3));
+    let reply = read_now(&mut s, &st2, A, HDR + 4096);
+    let (h, data) = PcmHeader::split(&reply).unwrap();
+    assert_eq!(h.format, F96);
+    assert_eq!((h.first_frame, h.frames, h.flags), (10, 3, PCM_FLAG_DISCONTINUITY));
+    assert_eq!(data, &packet32(0x33, 3)[..]);
+
+    // The first one's late events change nothing.
+    let before = s.state();
+    s.render(S1, &mut st2, &packet16(10, 10));
+    assert!(!s.stream_destroyed(S1));
+    assert_eq!(s.state(), before);
+}
+
+#[test]
+fn the_last_stream_to_run_takes_the_tap_even_from_a_running_one() {
+    let (mut s, mut st1) = setup(F16, 100);
+    s.attach(A).unwrap();
+    s.stream_running(S1, true);
+    s.render(S1, &mut st1, &packet16(0, 10));
+    assert!(s.stream_created(S2, F96));
+    assert!(!s.offer_ring(S2, 0xB000, 8 * 50));
+    let seq = s.state().seq;
+
+    // The engine starts the new stream before it stops the old one.
+    assert!(s.stream_running(S2, true));
+    assert_eq!((s.tap_stream(), s.state().stream, s.state().format), (S2, StreamState::Running, F96));
+    assert_eq!((s.ring_capacity(), s.ring_at()), (8 * 50, 0xB000));
+    assert_eq!(s.state().frames_dropped, 10, "the old stream's unread frames are lost");
+    assert_ne!(s.state().seq, seq);
+
+    // The old one stops: nothing changes.
+    let before = s.state();
+    assert!(!s.stream_running(S1, false));
+    assert_eq!(s.state(), before);
+
+    // It runs again: it takes the tap back with its own storage.
+    assert!(s.stream_running(S1, true));
+    assert_eq!((s.tap_stream(), s.state().stream, s.state().format), (S1, StreamState::Running, F16));
+    assert_eq!(s.ring_capacity(), 100 * 4, "S1's storage from setup is still on offer");
+    // Running again while it has the tap is no change.
+    assert!(!s.stream_running(S1, true));
+}
+
+#[test]
+fn when_the_tap_pauses_it_moves_to_a_stream_that_still_runs() {
+    let (mut s, _st1) = setup(F16, 100);
+    s.offer_ring(S1, 0xA000, 4 * 100);
+    s.stream_running(S1, true);
+    assert!(s.stream_created(S2, F96));
+    assert!(!s.offer_ring(S2, 0xB000, 8 * 50));
+    assert!(s.stream_running(S2, true));
+    assert_eq!(s.tap_stream(), S2);
+    let seq = s.state().seq;
+    // S2 pauses while S1 still runs: back to S1 and its storage.
+    assert!(s.stream_running(S2, false));
+    assert_eq!((s.tap_stream(), s.state().stream, s.state().format), (S1, StreamState::Running, F16));
+    assert_eq!((s.ring_capacity(), s.ring_at()), (4 * 100, 0xA000));
+    assert_ne!(s.state().seq, seq);
+}
+
+#[test]
+fn the_tap_moves_to_a_running_stream_when_its_stream_goes_away() {
+    let (mut s, _st1) = setup(F16, 100);
+    s.attach(A).unwrap();
+    s.offer_ring(S1, 0xA000, 4 * 100);
+    s.stream_running(S1, true);
+    assert!(s.stream_created(S2, F96));
+    assert!(!s.offer_ring(S2, 0xB000, 8 * 50));
+    assert!(s.stream_running(S2, true));
+    assert_eq!(s.tap_stream(), S2);
+    assert!(s.stream_destroyed(S2));
+    assert_eq!((s.tap_stream(), s.state().stream, s.state().format), (S1, StreamState::Running, F16));
+    assert_eq!(s.ring_at(), 0xA000);
+    assert!(s.stream_destroyed(S1));
+    assert_eq!((s.tap_stream(), s.state().stream, s.state().format), (0, StreamState::None, PcmFormat::default()));
+    assert_eq!((s.ring_capacity(), s.ring_at()), (0, 0));
+}
+
+#[test]
+fn with_nothing_running_the_tap_moves_to_the_stream_left_when_its_own_goes_away() {
+    let (mut s, _st1) = setup(F16, 100);
+    s.stream_running(S1, true);
+    assert!(s.stream_created(S2, F24));
+    assert!(s.stream_running(S1, false));
+    assert_eq!(s.tap_stream(), S1, "nothing else runs");
+    let seq = s.state().seq;
+    assert!(s.stream_destroyed(S1));
+    // S2 exists, so the service is told about it (paused), not "no stream".
+    assert_eq!((s.tap_stream(), s.state().stream, s.state().format), (S2, StreamState::Paused, F24));
+    assert_ne!(s.state().seq, seq);
+    assert!(s.stream_running(S2, true));
+    assert_eq!((s.tap_stream(), s.state().stream, s.state().format), (S2, StreamState::Running, F24));
+    assert_eq!(s.ring_capacity(), 0, "S2 offered no storage: its frames are counted as dropped");
+    s.render(S2, &mut [], &packet32(0, 4));
+    assert_eq!(s.state().frames_dropped, 4);
+}
+
+/// The review's sequence: A runs and holds the tap, B is created ("not
+/// now") and offers its ring, A pauses and goes away. B gets the tap at
+/// once, with the ring it offered, as a new stream would have in 1.0.0.
+#[test]
+fn a_paused_stream_left_alone_gets_the_tap_with_the_ring_it_offered() {
+    let (mut s, _st1) = setup(F16, 100);
+    s.attach(A).unwrap();
+    s.offer_ring(S1, 0xA000, 4 * 100);
+    s.stream_running(S1, true);
+    assert!(s.stream_created(S2, F96));
+    assert_eq!(s.tap_stream(), S1);
+    assert!(!s.offer_ring(S2, 0xB000, 8 * 50), "remembered, not used yet");
+    assert!(s.stream_running(S1, false));
+    assert!(s.stream_destroyed(S1));
+    assert_eq!((s.tap_stream(), s.state().stream, s.state().format), (S2, StreamState::Paused, F96));
+    assert_eq!((s.ring_capacity(), s.ring_at()), (8 * 50, 0xB000));
+    // Its frames reach the reader, flagged as a new stream's.
+    s.stream_running(S2, true);
+    let mut st2 = vec![0u8; s.ring_capacity()];
+    s.render(S2, &mut st2, &packet32(0x44, 2));
+    let reply = read_now(&mut s, &st2, A, HDR + 4096);
+    let (h, data) = PcmHeader::split(&reply).unwrap();
+    assert_eq!(h.format, F96);
+    assert_eq!((h.frames, h.flags), (2, PCM_FLAG_DISCONTINUITY));
+    assert_eq!(data, &packet32(0x44, 2)[..]);
+}
+
+#[test]
+fn of_several_paused_streams_left_the_newest_gets_the_tap() {
+    let (mut s, _st1) = setup(F16, 100);
+    s.stream_running(S1, true);
+    assert!(s.stream_created(S2, F24));
+    assert!(s.stream_created(S3, F96));
+    assert_eq!(s.tap_stream(), S1, "S1 runs: neither new stream takes the tap");
+    assert!(s.stream_running(S1, false));
+    assert!(s.stream_destroyed(S1));
+    assert_eq!((s.tap_stream(), s.state().format), (S3, F96), "S3 is the newest");
+    assert!(s.stream_destroyed(S3));
+    assert_eq!((s.tap_stream(), s.state().format), (S2, F24));
+    assert!(s.stream_destroyed(S2));
+    assert_eq!((s.tap_stream(), s.state().stream), (0, StreamState::None), "no stream left");
+    // Slots are used again in another order; age, not slot, decides.
+    assert!(s.stream_created(S3, F96));
+    assert!(s.stream_created(S1, F16));
+    assert!(s.stream_created(S2, F24));
+    assert_eq!(s.tap_stream(), S2, "nothing runs: each new stream took the tap");
+    assert!(s.stream_destroyed(S2));
+    assert_eq!((s.tap_stream(), s.state().format), (S1, F16), "S1 is newer than S3");
+}
+
+#[test]
+fn withdrawn_storage_is_never_used_again() {
+    let (mut s, _st1) = setup(F16, 100);
+    s.stream_running(S1, true);
+    assert!(s.stream_created(S2, F24));
+    assert!(!s.offer_ring(S2, 0xB000, 8 * 50));
+    assert!(s.offered(S2, 0xB000) && !s.offered(S2, 0xC000) && !s.offered(S1, 0xB000));
+    s.withdraw_ring(S2);
+    assert!(!s.offered(S2, 0xB000));
+    assert!(s.stream_running(S1, false));
+    assert!(s.stream_running(S2, true));
+    assert_eq!(s.tap_stream(), S2);
+    assert_eq!((s.ring_capacity(), s.ring_at()), (0, 0));
+    // Offered again (a new PrepareHardware): used at once, it is the tap now.
+    assert!(s.offer_ring(S2, 0xC000, 8 * 50));
+    assert_eq!((s.ring_capacity(), s.ring_at()), (8 * 50, 0xC000));
+    // The tap's stream takes it back: the ring goes with it.
+    s.withdraw_ring(S2);
+    assert_eq!((s.ring_capacity(), s.ring_at()), (0, 0));
+    // Withdrawing for an unknown stream, or twice, is harmless.
+    s.withdraw_ring(S3);
+    s.withdraw_ring(S2);
+}
+
+#[test]
+fn offers_need_a_known_stream_and_one_of_its_frames() {
+    let mut s = Session::new();
+    s.set_endpoint(true);
+    assert!(!s.offer_ring(S1, 0xA000, 800), "unknown stream");
+    assert!(s.stream_created(S1, F24));
+    assert!(!s.offer_ring(S1, 0xA000, 7), "less than one 8-byte frame");
+    assert!(!s.offered(S1, 0xA000), "a refused offer is not remembered");
+    assert_eq!(s.ring_capacity(), 0);
+    assert!(s.offer_ring(S1, 0xA000, 8 * 3 + 5));
+    assert_eq!((s.ring_capacity(), s.ring_at()), (24, 0xA000));
+}
+
+#[test]
+fn the_session_knows_at_most_max_tracked_streams() {
+    use crate::audio_core::MAX_TRACKED;
+    assert!(MAX_TRACKED >= crate::rt_limits::MAX_STREAMS as usize);
+    let mut s = Session::new();
+    s.set_endpoint(true);
+    for i in 1..=MAX_TRACKED {
+        assert!(s.stream_created(i * 0x10, F16));
+    }
+    assert!(!s.stream_created(0x1000, F16), "no slot left");
+    assert_eq!(s.tap_stream(), MAX_TRACKED * 0x10);
+    assert!(!s.stream_running(0x1000, true), "never known");
+    // A freed slot is used again.
+    assert!(!s.stream_destroyed(0x10), "not the tap's stream");
+    assert!(s.stream_created(0x1000, F16));
+    assert_eq!(s.tap_stream(), 0x1000);
 }
 
 #[test]
@@ -647,7 +885,7 @@ fn removing_the_ring_drops_its_frames_and_reads_park() {
     assert!(!s.read_ready());
     assert_eq!(s.state().frames_dropped, 20);
     // Storage of the wrong length is treated the same.
-    assert!(s.install_ring(S1, 400));
+    assert!(s.offer_ring(S1, 0, 400));
     s.render(S1, &mut vec![0u8; 399], &packet16(20, 10));
     assert_eq!(s.state().frames_dropped, 30);
     assert!(!s.read_ready());
@@ -703,7 +941,7 @@ fn a_new_stream_flags_the_gap_even_if_the_reader_had_drained_the_ring() {
     // The ring is empty, nothing is lost; the stream is replaced all the same.
     assert!(s.stream_destroyed(S1));
     assert!(s.stream_created(S2, F16));
-    assert!(s.install_ring(S2, 64));
+    assert!(s.offer_ring(S2, 0, 64));
     assert_eq!(s.state().frames_dropped, 0);
     s.render(S2, &mut st, &packet16(8, 4));
     let h = chunk(&mut s, &st);
@@ -720,7 +958,7 @@ fn frames_lost_with_the_ring_storage_are_flagged() {
     // (ReleaseHardware) and takes new storage (PrepareHardware).
     s.render(S1, &mut st, &packet16(4, 4));
     s.remove_ring();
-    assert!(s.install_ring(S1, 64));
+    assert!(s.offer_ring(S1, 0, 64));
     s.render(S1, &mut st, &packet16(8, 4));
     let h = chunk(&mut s, &st);
     assert_eq!((h.first_frame, h.frames, h.flags), (8, 4, PCM_FLAG_DISCONTINUITY));
@@ -738,7 +976,7 @@ fn frames_rendered_without_ring_storage_are_flagged() {
     s.remove_ring();
     assert_eq!(s.state().frames_dropped, 0);
     s.render(S1, &mut [], &packet16(4, 4));
-    assert!(s.install_ring(S1, 64));
+    assert!(s.offer_ring(S1, 0, 64));
     s.render(S1, &mut st, &packet16(8, 4));
     let h = chunk(&mut s, &st);
     assert_eq!((h.first_frame, h.frames, h.flags), (8, 4, PCM_FLAG_DISCONTINUITY));

@@ -769,25 +769,49 @@ pub unsafe fn stats(dev: *mut DeviceContext) -> (wire::AudioState, u64) {
     }
 }
 
-/// A stream with `format` was created. Returns true if it feeds the tap
-/// from now on (false: the contract cannot describe the format; the stream
-/// is a plain null sink). PASSIVE.
+/// Point `ring` / `ring_len` at the storage the session uses now (it can
+/// change with every stream event: the tap follows the running stream, see
+/// `audio_core.rs`). SAFETY: the caller holds the audio lock.
+unsafe fn sync_ring(a: *mut AudioDev) {
+    unsafe {
+        let at = session(a).ring_at();
+        if at == 0 {
+            (*a).ring = null_mut();
+            (*a).ring_len = 0;
+        } else {
+            (*a).ring = at as *mut u8;
+            (*a).ring_len = session(a).ring_capacity();
+        }
+    }
+}
+
+/// A stream with `format` was created. Returns true if the session knows
+/// it from now on: it feeds the tap now or can later, and must report its
+/// Run / Pause, ring storage and end (false: the contract cannot describe
+/// the format, or too many streams; the stream is a plain null sink).
+/// PASSIVE.
 pub unsafe fn stream_created(dev: *mut DeviceContext, id: Id, format: wire::PcmFormat) -> bool {
     unsafe {
         let a = audio(dev);
         lock(a);
-        let tapped = session(a).stream_created(id, format);
-        if tapped {
-            // An older stream's storage is no longer the ring's; that
-            // stream frees it itself.
-            (*a).ring = null_mut();
-            (*a).ring_len = 0;
-        }
+        let known = session(a).stream_created(id, format);
+        sync_ring(a);
         unlock(a);
-        if tapped {
+        if known {
             kick_wait(dev);
         }
-        tapped
+        known
+    }
+}
+
+/// Stream `id` feeds the tap right now. Any IRQL <= DISPATCH.
+pub unsafe fn feeds_tap(dev: *mut DeviceContext, id: Id) -> bool {
+    unsafe {
+        let a = audio(dev);
+        lock(a);
+        let tap = id != 0 && session(a).tap_stream() == id;
+        unlock(a);
+        tap
     }
 }
 
@@ -797,10 +821,7 @@ pub unsafe fn stream_destroyed(dev: *mut DeviceContext, id: Id) {
         let a = audio(dev);
         lock(a);
         let was_tap = session(a).stream_destroyed(id);
-        if was_tap {
-            (*a).ring = null_mut();
-            (*a).ring_len = 0;
-        }
+        sync_ring(a);
         unlock(a);
         if was_tap {
             kick_wait(dev);
@@ -808,22 +829,28 @@ pub unsafe fn stream_destroyed(dev: *mut DeviceContext, id: Id) {
     }
 }
 
-/// Run / Pause. PASSIVE.
-pub unsafe fn stream_running(dev: *mut DeviceContext, id: Id, running: bool) {
+/// Run / Pause. Returns true if stream `id` feeds the tap afterwards.
+/// PASSIVE.
+pub unsafe fn stream_running(dev: *mut DeviceContext, id: Id, running: bool) -> bool {
     unsafe {
         let a = audio(dev);
         lock(a);
         let changed = session(a).stream_running(id, running);
+        sync_ring(a);
+        let tap = session(a).tap_stream() == id;
         unlock(a);
         if changed {
             kick_wait(dev);
         }
+        tap
     }
 }
 
-/// Stream `id` offers `len` bytes of nonpaged storage at `ptr` for the ring.
-/// Returns true if the ring uses it from now on; the stream must then call
-/// [`ring_remove`] before freeing it. PASSIVE.
+/// Stream `id` offers `len` bytes of nonpaged storage at `ptr` for the ring,
+/// used now if the stream feeds the tap, or later when the tap moves to it.
+/// Returns true if the session took the offer; the stream must then call
+/// [`ring_remove`] before freeing the storage. False: the stream must free
+/// it itself. PASSIVE.
 pub unsafe fn ring_install(dev: *mut DeviceContext, id: Id, ptr: *mut u8, len: usize) -> bool {
     unsafe {
         let a = audio(dev);
@@ -831,28 +858,28 @@ pub unsafe fn ring_install(dev: *mut DeviceContext, id: Id, ptr: *mut u8, len: u
             return false;
         }
         lock(a);
-        let used = session(a).install_ring(id, len);
-        if used {
-            (*a).ring = ptr;
-            (*a).ring_len = session(a).ring_capacity();
-        }
+        let _in_use = session(a).offer_ring(id, ptr as usize, len);
+        let taken = session(a).offered(id, ptr as usize);
+        sync_ring(a);
         unlock(a);
-        used
+        taken
     }
 }
 
-/// Stop using `ptr` as ring storage (no-op if the ring uses something
-/// else). After this returns nothing reads or writes it any more: every
-/// access is made under the lock taken here. IRQL <= DISPATCH.
-pub unsafe fn ring_remove(dev: *mut DeviceContext, ptr: *mut u8) {
+/// Stream `id` takes its storage at `ptr` back. After this returns nothing
+/// reads or writes it any more: every access is made under the lock taken
+/// here. IRQL <= DISPATCH.
+pub unsafe fn ring_remove(dev: *mut DeviceContext, id: Id, ptr: *mut u8) {
     unsafe {
         let a = audio(dev);
         lock(a);
-        if !ptr.is_null() && (*a).ring == ptr {
+        session(a).withdraw_ring(id);
+        if !ptr.is_null() && session(a).ring_at() == ptr as usize {
+            // Not expected (the stream is the only one to offer `ptr`), but
+            // the storage is about to be freed: never leave it in use.
             session(a).remove_ring();
-            (*a).ring = null_mut();
-            (*a).ring_len = 0;
         }
+        sync_ring(a);
         unlock(a);
     }
 }

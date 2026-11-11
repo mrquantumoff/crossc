@@ -60,6 +60,21 @@ Rules the driver keeps regardless of the service:
 * The audio engine never blocks on the service. The endpoint's clock is a
   driver timer; with nobody attached, or a reader that falls behind, PCM is
   dropped (counted, flagged as a discontinuity) and the stream keeps its pace.
+* The endpoint's host pin offers its formats (48 kHz/24-in-32 as the
+  default, 96 kHz/24-in-32, 48 kHz/16) in the RAW signal processing mode
+  list only, as 1.0.0 did. The driver can also give it a DEFAULT list with
+  the same formats (`DEFAULT_MODE_LIST` in `acx.rs`), but that is off: it
+  rests on the untested idea that it would let Windows play at 96 kHz (both
+  lists default to 48 kHz, so it may well not), and with two modes the audio
+  engine can run two streams at once, which the driver does not mix: only
+  one would reach the buds.
+* Several streams can exist at once (a format switch creates the new one
+  before the old one is gone); the stream state and the tap describe one of
+  them: a new stream takes the tap unless the current one is running, the
+  last stream to start running takes it, and when the tap's stream pauses or
+  ends while another runs, the tap moves there; when it ends and none runs,
+  the tap moves to the newest stream left. Each move is a new stream to the
+  service (sequence bump, empty ring, discontinuity).
 * No memory is shared with user mode; PCM is copied through buffered IOCTLs.
 * Everything the service can send is validated in the driver; a wrong or
   malicious caller gets an error, never a fault.

@@ -270,5 +270,14 @@ int main(void) {
         printf("init ACX_REQUEST_PARAMETERS: Size=%u\n", (unsigned)r.Size);
     }
     G(KSCATEGORY_CAPTURE); G(KSCATEGORY_TOPOLOGY); G(KSAUDFNAME_VOLUME_CONTROL); G(KSAUDFNAME_WAVE_MUTE);
+
+    /* ---- DEFAULT signal processing mode list on the host pin ---- */
+    I(AcxDataFormatListCreate); I(AcxPinAssignModeDataFormatList);
+    S(ACX_DATAFORMAT_LIST_CONFIG); O(ACX_DATAFORMAT_LIST_CONFIG, Flags);
+    {
+        ACX_DATAFORMAT_LIST_CONFIG c; ACX_DATAFORMAT_LIST_CONFIG_INIT(&c);
+        printf("init ACX_DATAFORMAT_LIST_CONFIG: Size=%u Flags=%u\n", c.Size, c.Flags);
+    }
+    G(AUDIO_SIGNALPROCESSINGMODE_DEFAULT);
     return 0;
 }

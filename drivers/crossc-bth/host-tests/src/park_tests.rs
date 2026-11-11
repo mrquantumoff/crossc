@@ -121,7 +121,7 @@ impl Sim {
         let mut s = Session::new();
         assert!(s.set_endpoint(true));
         assert!(s.stream_created(S1, F16));
-        assert!(s.install_ring(S1, RING_BYTES));
+        assert!(s.offer_ring(S1, 0, RING_BYTES));
         Self {
             kind,
             s,
@@ -230,7 +230,7 @@ impl Sim {
             }
             Do::Drain => {
                 self.s.remove_ring();
-                assert!(self.s.install_ring(S1, RING_BYTES));
+                assert!(self.s.offer_ring(S1, 0, RING_BYTES));
             }
             Do::Detach => {
                 if self.s.detach(0).is_some() {

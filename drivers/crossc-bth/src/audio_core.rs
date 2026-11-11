@@ -130,6 +130,34 @@ pub type Id = usize;
 /// Identity of one parked request; 0 means "none". Never reused.
 pub type Ticket = u64;
 
+/// Streams the session can know at once. The driver never has more than
+/// `rt_limits::MAX_STREAMS` (asserted in `acx.rs`).
+pub const MAX_TRACKED: usize = 4;
+
+/// A stream the session knows: what the tap needs if it moves there.
+#[derive(Clone, Copy, Debug)]
+struct Tracked {
+    /// 0: free slot.
+    id: Id,
+    format: PcmFormat,
+    running: bool,
+    /// Ring storage the stream offered ([`Session::offer_ring`]); 0 bytes:
+    /// none.
+    ring_at: usize,
+    ring_bytes: usize,
+    /// Order of creation: larger is newer ([`Session::stream_created`]).
+    born: u64,
+}
+
+const NO_STREAM: Tracked = Tracked {
+    id: 0,
+    format: PcmFormat { sample_rate: 0, channels: 0, container_bits: 0, valid_bits: 0 },
+    running: false,
+    ring_at: 0,
+    ring_bytes: 0,
+    born: 0,
+};
+
 #[derive(Clone, Copy, Debug)]
 pub struct Session {
     seq: u32,
@@ -138,10 +166,16 @@ pub struct Session {
     /// Handle whose ATTACH is pending.
     holder: Id,
     link: bool,
-    /// Stream that feeds the tap.
+    /// Stream that feeds the tap; its state and format.
     stream: Id,
     stream_state: StreamState,
     format: PcmFormat,
+    /// Every stream that exists (the tap's included), free slots have id 0.
+    tracked: [Tracked; MAX_TRACKED],
+    /// Streams created so far (the next one's `born`).
+    births: u64,
+    /// The `at` of the ring storage in use ([`Session::offer_ring`]).
+    ring_at: usize,
     rendered: u64,
     dropped: u64,
     /// Of `rendered`: frames the audio engine cannot have written (late timer
@@ -178,6 +212,9 @@ impl Session {
             stream: 0,
             stream_state: StreamState::None,
             format: PcmFormat { sample_rate: 0, channels: 0, container_bits: 0, valid_bits: 0 },
+            tracked: [NO_STREAM; MAX_TRACKED],
+            births: 0,
+            ring_at: 0,
             rendered: 0,
             dropped: 0,
             silence: 0,
@@ -519,39 +556,134 @@ impl Session {
     }
 
     // ---- stream -------------------------------------------------------------
+    //
+    // Several streams can exist at once (a format switch creates the new one
+    // before the old one is gone; with a RAW and a DEFAULT mode list, off by
+    // default in acx.rs, the engine could open one of each). One of them feeds the tap and is the
+    // stream the wire state describes; the others are remembered, with their
+    // format, Run state and ring storage, so the tap can move to them:
+    // * a new stream takes the tap unless the tap's stream is running;
+    // * a stream that starts running takes it (the last one to run wins,
+    //   also over a stream that still runs: the engine starts the stream it
+    //   renders to last, as the newest-stream rule before assumed);
+    // * when the tap's stream pauses or goes away while another one runs,
+    //   the tap moves to that one;
+    // * when it goes away and none runs, the tap moves to the newest stream
+    //   left (paused), so a stream that exists is always the one described.
+    // Every move starts an empty ring and flags the gap, like a new stream.
 
-    /// A stream was created. The newest stream feeds the tap; an older one
-    /// that still exists is ignored from here on. Returns false (and changes
-    /// nothing) for a format the contract cannot describe.
+    /// Index of stream `id` in `tracked`.
+    fn slot(&self, id: Id) -> Option<usize> {
+        if id == 0 {
+            return None;
+        }
+        self.tracked.iter().position(|t| t.id == id)
+    }
+
+    /// A running stream other than the tap's.
+    fn running_other(&self) -> Option<usize> {
+        self.tracked.iter().position(|t| t.id != 0 && t.id != self.stream && t.running)
+    }
+
+    /// The newest stream other than the tap's, running or not.
+    fn newest_other(&self) -> Option<usize> {
+        (0..MAX_TRACKED)
+            .filter(|&i| self.tracked.get(i).is_some_and(|t| t.id != 0 && t.id != self.stream))
+            .max_by_key(|&i| self.tracked.get(i).map_or(0, |t| t.born))
+    }
+
+    /// Stream `tracked[i]` feeds the tap from now on.
+    fn take(&mut self, i: usize) {
+        let Some(&t) = self.tracked.get(i) else {
+            return;
+        };
+        self.remove_ring();
+        self.stream = t.id;
+        self.stream_state = if t.running { StreamState::Running } else { StreamState::Paused };
+        self.format = t.format;
+        self.discontinuity = true;
+        self.use_offer(i);
+        self.bump();
+    }
+
+    /// Use the storage `tracked[i]` offered as the ring, if `tracked[i]`
+    /// feeds the tap and the storage holds a frame.
+    fn use_offer(&mut self, i: usize) -> bool {
+        let Some(&t) = self.tracked.get(i) else {
+            return false;
+        };
+        let fb = self.frame_bytes();
+        if t.id == 0 || t.id != self.stream || fb == 0 || t.ring_bytes < fb {
+            return false;
+        }
+        self.drop_ring();
+        self.ring.set_capacity(t.ring_bytes - t.ring_bytes % fb);
+        self.ring_at = t.ring_at;
+        true
+    }
+
+    /// A stream was created. It takes the tap unless the tap's stream is
+    /// running. Returns false (and changes nothing) for a format the
+    /// contract cannot describe, or when [`MAX_TRACKED`] streams exist; the
+    /// stream is then never named to the session again.
     pub fn stream_created(&mut self, id: Id, format: PcmFormat) -> bool {
         if id == 0 || !format.is_valid() {
             return false;
         }
-        self.remove_ring();
-        self.stream = id;
-        self.stream_state = StreamState::Paused;
-        self.format = format;
-        self.discontinuity = true;
-        self.bump();
+        let Some(i) = self.slot(id).or_else(|| self.tracked.iter().position(|t| t.id == 0)) else {
+            return false;
+        };
+        self.births += 1;
+        let born = self.births;
+        if let Some(t) = self.tracked.get_mut(i) {
+            *t = Tracked { id, format, born, ..NO_STREAM };
+        }
+        if self.stream == id || self.stream_state != StreamState::Running {
+            self.take(i);
+        }
         true
     }
 
     /// The stream is gone. Returns true if it was the one feeding the tap.
+    /// The tap then moves to a stream that runs, else to the newest one
+    /// left (paused: it may run next, and the service sees a stream exists,
+    /// as with one stream), else there is no stream.
     pub fn stream_destroyed(&mut self, id: Id) -> bool {
-        if id == 0 || id != self.stream {
+        let Some(i) = self.slot(id) else {
+            return false;
+        };
+        if let Some(t) = self.tracked.get_mut(i) {
+            *t = NO_STREAM;
+        }
+        if id != self.stream {
             return false;
         }
         self.remove_ring();
         self.stream = 0;
         self.stream_state = StreamState::None;
         self.format = PcmFormat::default();
-        self.bump();
+        match self.running_other().or_else(|| self.newest_other()) {
+            Some(j) => self.take(j),
+            None => self.bump(),
+        }
         true
     }
 
-    /// Run / Pause of the stream. Returns true if the state changed.
+    /// Run / Pause of stream `id`. A stream that starts running takes the
+    /// tap. Returns true if the state changed (the tap's stream ran or
+    /// paused, or the tap moved).
     pub fn stream_running(&mut self, id: Id, running: bool) -> bool {
-        if id == 0 || id != self.stream {
+        let Some(i) = self.slot(id) else {
+            return false;
+        };
+        if let Some(t) = self.tracked.get_mut(i) {
+            t.running = running;
+        }
+        if id != self.stream {
+            if running {
+                self.take(i);
+                return true;
+            }
             return false;
         }
         let new = if running { StreamState::Running } else { StreamState::Paused };
@@ -559,30 +691,73 @@ impl Session {
             return false;
         }
         self.stream_state = new;
-        self.bump();
+        if let (false, Some(j)) = (running, self.running_other()) {
+            self.take(j);
+        } else {
+            self.bump();
+        }
         true
     }
 
-    /// Stream `id` offers `bytes` of ring storage. Returns true if the ring
-    /// now uses it; its length is then [`Session::ring_capacity`] (`bytes`
-    /// rounded down to whole frames).
-    pub fn install_ring(&mut self, id: Id, bytes: usize) -> bool {
-        if id == 0 || id != self.stream {
+    /// The stream that feeds the tap, 0 if none.
+    pub fn tap_stream(&self) -> Id {
+        self.stream
+    }
+
+    /// Stream `id` offers `bytes` of ring storage at `at` (an address the
+    /// session only hands back, see [`Session::ring_at`]). It is remembered
+    /// for when the stream feeds the tap. Returns true if the ring uses it
+    /// now; its length is then [`Session::ring_capacity`] (`bytes` rounded
+    /// down to whole frames). False, and nothing remembered, for an unknown
+    /// stream or storage shorter than one of its frames.
+    pub fn offer_ring(&mut self, id: Id, at: usize, bytes: usize) -> bool {
+        let Some(i) = self.slot(id) else {
             return false;
-        }
-        let fb = self.frame_bytes();
+        };
+        let Some(t) = self.tracked.get_mut(i) else {
+            return false;
+        };
+        let fb = t.format.frame_bytes();
         if fb == 0 || bytes < fb {
             return false;
         }
-        self.drop_ring();
-        self.ring.set_capacity(bytes - bytes % fb);
-        true
+        t.ring_at = at;
+        t.ring_bytes = bytes;
+        self.use_offer(i)
+    }
+
+    /// Stream `id` has storage at `at` on offer (it must withdraw it before
+    /// freeing it).
+    pub fn offered(&self, id: Id, at: usize) -> bool {
+        self.slot(id).and_then(|i| self.tracked.get(i)).is_some_and(|t| t.ring_bytes > 0 && t.ring_at == at)
+    }
+
+    /// Stream `id` takes its ring storage back (to free it). If the ring
+    /// uses it, the ring is removed (its frames are lost).
+    pub fn withdraw_ring(&mut self, id: Id) {
+        let Some(i) = self.slot(id) else {
+            return;
+        };
+        if let Some(t) = self.tracked.get_mut(i) {
+            t.ring_at = 0;
+            t.ring_bytes = 0;
+        }
+        if id == self.stream {
+            self.remove_ring();
+        }
+    }
+
+    /// Where the ring storage in use is ([`Session::offer_ring`]'s `at`), 0
+    /// if there is none.
+    pub fn ring_at(&self) -> usize {
+        if self.ring.capacity() == 0 { 0 } else { self.ring_at }
     }
 
     /// Stop using the ring storage (its frames are lost).
     pub fn remove_ring(&mut self) {
         self.drop_ring();
         self.ring.set_capacity(0);
+        self.ring_at = 0;
     }
 
     /// Whole frames in `bytes`, and their byte length, for a packet of

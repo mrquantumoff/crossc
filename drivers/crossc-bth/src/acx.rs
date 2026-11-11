@@ -200,6 +200,12 @@ const KSDATAFORMAT_SUBTYPE_PCM: GUID =
 /// ksmedia.h `KSDATAFORMAT_SPECIFIER_WAVEFORMATEX` {05589F81-C356-11CE-BF01-00AA0055595A}
 const KSDATAFORMAT_SPECIFIER_WAVEFORMATEX: GUID =
     guid(0x0558_9F81, 0xC356, 0x11CE, [0xBF, 0x01, 0x00, 0xAA, 0x00, 0x55, 0x59, 0x5A]);
+/// ksmedia.h `AUDIO_SIGNALPROCESSINGMODE_DEFAULT` {C18E2F7E-933D-4965-B7D1-1EEF228D2AF3}
+static AUDIO_SIGNALPROCESSINGMODE_DEFAULT: GUID =
+    guid(0xC18E_2F7E, 0x933D, 0x4965, [0xB7, 0xD1, 0x1E, 0xEF, 0x22, 0x8D, 0x2A, 0xF3]);
+/// ksmedia.h `AUDIO_SIGNALPROCESSINGMODE_RAW` {9E90EA20-B493-4FD1-A1A8-7E1361A956CF}
+static AUDIO_SIGNALPROCESSINGMODE_RAW: GUID =
+    guid(0x9E90_EA20, 0xB493, 0x4FD1, [0xA1, 0xA8, 0x7E, 0x13, 0x61, 0xA9, 0x56, 0xCF]);
 /// Vendor component id of the render circuit {871EEB92-ABB3-43B1-9E2F-4C2206CC0CCF}.
 static RENDER_COMPONENT_ID: GUID = guid(0x871E_EB92, 0xABB3, 0x43B1, [0x9E, 0x2F, 0x4C, 0x22, 0x06, 0xCC, 0x0C, 0xCF]);
 
@@ -390,7 +396,32 @@ const fn pcm_stereo(rate: u32, container_bits: u16, valid_bits: u16) -> KsWaveFo
     }
 }
 
-/// Formats offered on the host pin (RAW mode list). Index 0 is the default.
+/// Give the host pin a DEFAULT signal processing mode list next to its RAW
+/// one (same [`FORMATS`], same default). Off: the pin offers RAW only,
+/// exactly as 1.0.0 did, the only layout run on a device so far.
+///
+/// Why it exists: the hypothesis that the audio engine's DEFAULT-mode
+/// streams would then be described by the pin itself, and that this could
+/// let Windows play at 96 kHz. Nothing shows that yet: both lists default to
+/// 48 kHz, and the engine takes a mode's format from its list's default
+/// (KSPROPERTY_PIN_PROPOSEDATAFORMAT2).
+///
+/// Why it is off: the host pin allows any number of streams, and a pin with
+/// streams in several modes is a multi-stream pin to the engine: it can run
+/// a DEFAULT and a RAW stream at the same time. The driver does not mix
+/// them; the tap follows the last stream to run (audio_core.rs), so the
+/// other stream's app would be silent on the buds. With RAW only, every
+/// shared-mode app is mixed into one stream by the engine.
+///
+/// To try it on a device, set this to true and look for two "stream
+/// created" trace lines with different modes, both followed by "stream
+/// running": that is the case above. Also unchecked on a device: whether
+/// ACX takes a list owned by the circuit and assigned after the pin was
+/// created.
+const DEFAULT_MODE_LIST: bool = false;
+
+/// Formats offered on the host pin, in its RAW mode list (and in its
+/// DEFAULT one, see [`DEFAULT_MODE_LIST`]). Index 0 is the default.
 /// 24-bit is offered as 24 valid bits in a 32-bit container, the layout the
 /// sample (`Pcm48000c2_24in32`) and HD Audio use; packed 3-byte samples are
 /// not offered.
@@ -593,6 +624,16 @@ const _: () = {
     assert!(WAVE_FORMAT_EXTENSIBLE == 0xFFFE && KSAUDIO_SPEAKER_STEREO == 3);
     assert!(FORMATS[0].cb_size == 22 && FORMATS[0].format_size == 104);
 
+    // ---- DEFAULT mode list (msvc-layout.txt, last part) --------------------
+    assert!(_ACXFUNCENUM::AcxDataFormatListCreateTableIndex == 60);
+    assert!(_ACXFUNCENUM::AcxPinAssignModeDataFormatListTableIndex == 141);
+    assert!(size_of::<ACX_DATAFORMAT_LIST_CONFIG>() == 8);
+    assert!(offset_of!(ACX_DATAFORMAT_LIST_CONFIG, Flags) == 4);
+    // AUDIO_SIGNALPROCESSINGMODE_DEFAULT / _RAW: compare their definitions
+    // with the `guid AUDIO_SIGNALPROCESSINGMODE_*` lines of msvc-layout.txt.
+    // The tap's session can know every stream the driver allows.
+    assert!(rt_limits::MAX_STREAMS as usize <= crate::audio_core::MAX_TRACKED);
+
     // ---- unified volume (msvc-layout.txt, "unified volume" part) ----------
     assert!(_ACXFUNCENUM::AcxCircuitInitAssignCategoriesTableIndex == 5);
     assert!(_ACXFUNCENUM::AcxCircuitInitAssignPropertiesTableIndex == 7);
@@ -781,11 +822,13 @@ struct StreamCtx {
     /// context of the WDFDEVICE, an ancestor of the stream, so it is still
     /// there when the stream's cleanup callback runs.
     slots: *const StreamSlots,
-    /// This stream's format is one the audio contract can describe and it
-    /// was registered with the tap ([`audio::stream_created`]).
-    tap: bool,
-    /// Ring storage for the tap: nonpaged pool, allocated in PrepareHardware,
-    /// freed in ReleaseHardware (or at destroy) after the tap let go of it.
+    /// This stream's format is one the audio contract can describe and the
+    /// tap's session knows the stream ([`audio::stream_created`]): it feeds
+    /// the tap now, or can later (the tap follows the running stream).
+    known: bool,
+    /// Ring storage for the tap: nonpaged pool, allocated in PrepareHardware
+    /// by every known stream (the tap can move to it), freed in
+    /// ReleaseHardware (or at destroy) after the session let go of it.
     ring: *mut u8,
     ring_bytes: usize,
     /// ACX_STREAM_STATE as tracked by our callbacks.
@@ -1533,12 +1576,38 @@ unsafe fn create_render_circuit(device: WDFDEVICE, avrcp: bool) -> Result<Built,
         (*jc).dev = crate::device_ctx(device.cast());
         check(acx!(AcxPinAddJacksTableIndex, PFN_ACXPINADDJACKS, pins[1], &raw mut jack, 1), "AcxPinAddJacks")?;
 
-        // ---- formats on the host pin (RAW mode list) ------------------------
+        // ---- formats on the host pin: RAW (and, off by default, DEFAULT) ---
+        // ACX creates the RAW list with the pin (the sample fills only that
+        // one). See DEFAULT_MODE_LIST for the DEFAULT list and why it is off.
         let list = acx!(AcxPinGetRawDataFormatListTableIndex, PFN_ACXPINGETRAWDATAFORMATLIST, pins[0]);
         if list.is_null() {
             trace!("acx: AcxPinGetRawDataFormatList returned null");
             return Err((STATUS_INSUFFICIENT_RESOURCES, circuit));
         }
+        add_formats(device, circuit, list).map_err(|s| (s, circuit))?;
+        if DEFAULT_MODE_LIST {
+            // Without the DEFAULT list the pin is exactly what 1.0.0 offered
+            // (RAW only), which plays; so a failure here is traced, not
+            // fatal. A half-filled list was never assigned and goes away
+            // with the circuit, its parent.
+            match add_default_mode_list(device, circuit, pins[0]) {
+                Ok(()) => trace!("acx: host pin modes: RAW, DEFAULT ({} formats each)", FORMATS.len()),
+                Err(status) => trace!("acx: no DEFAULT mode list ({:#x}); host pin modes: RAW", status),
+            }
+        } else {
+            trace!("acx: host pin modes: RAW ({} formats)", FORMATS.len());
+        }
+
+        // ACX connects host pin -> (volume -> mute ->) bridge pin by default.
+        check(acx!(AcxCircuitAddPinsTableIndex, PFN_ACXCIRCUITADDPINS, circuit, pins.as_mut_ptr(), 2), "AcxCircuitAddPins")?;
+        Ok(Built { circuit, jack, vol })
+    }
+}
+
+/// Add [`FORMATS`] to `list`, `FORMATS[0]` as its default. Each list gets
+/// its own ACXDATAFORMAT objects, parented to the circuit.
+unsafe fn add_formats(device: WDFDEVICE, circuit: ACXCIRCUIT, list: ACXDATAFORMATLIST) -> Result<(), NTSTATUS> {
+    unsafe {
         for (i, ks) in FORMATS.iter().enumerate() {
             // ACX_DATAFORMAT_CONFIG_INIT_KS; ACX copies the KS format.
             let mut cfg: ACX_DATAFORMAT_CONFIG = zeroed();
@@ -1569,10 +1638,60 @@ unsafe fn create_render_circuit(device: WDFDEVICE, avrcp: bool) -> Result<Built,
                 )?;
             }
         }
+        Ok(())
+    }
+}
 
-        // ACX connects host pin -> (volume -> mute ->) bridge pin by default.
-        check(acx!(AcxCircuitAddPinsTableIndex, PFN_ACXCIRCUITADDPINS, circuit, pins.as_mut_ptr(), 2), "AcxCircuitAddPins")?;
-        Ok(Built { circuit, jack, vol })
+/// Give the host pin a list for `AUDIO_SIGNALPROCESSINGMODE_DEFAULT` with
+/// the same formats as its RAW list. The list is parented to the circuit;
+/// it is assigned to the pin only once it is complete.
+unsafe fn add_default_mode_list(device: WDFDEVICE, circuit: ACXCIRCUIT, pin: ACXPIN) -> Result<(), NTSTATUS> {
+    unsafe {
+        // ACX_DATAFORMAT_LIST_CONFIG_INIT
+        let mut cfg = ACX_DATAFORMAT_LIST_CONFIG { Size: size_of::<ACX_DATAFORMAT_LIST_CONFIG>() as ULONG, Flags: 0 };
+        let mut attr = attributes();
+        attr.ParentObject = circuit.cast();
+        let mut list: ACXDATAFORMATLIST = null_mut();
+        check(
+            acx!(
+                AcxDataFormatListCreateTableIndex,
+                PFN_ACXDATAFORMATLISTCREATE,
+                device,
+                &raw mut attr,
+                &raw mut cfg,
+                &raw mut list
+            ),
+            "AcxDataFormatListCreate(DEFAULT)",
+        )?;
+        if list.is_null() {
+            trace!("acx: AcxDataFormatListCreate(DEFAULT) returned no list");
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        add_formats(device, circuit, list)?;
+        check(
+            acx!(
+                AcxPinAssignModeDataFormatListTableIndex,
+                PFN_ACXPINASSIGNMODEDATAFORMATLIST,
+                pin,
+                &raw const AUDIO_SIGNALPROCESSINGMODE_DEFAULT,
+                list
+            ),
+            "AcxPinAssignModeDataFormatList(DEFAULT)",
+        )
+    }
+}
+
+/// Name of a signal processing mode for the trace.
+unsafe fn mode_name(mode: *const GUID) -> &'static str {
+    unsafe {
+        let same =
+            |a: &GUID, b: &GUID| a.Data1 == b.Data1 && a.Data2 == b.Data2 && a.Data3 == b.Data3 && a.Data4 == b.Data4;
+        match mode.as_ref() {
+            None => "no",
+            Some(m) if same(m, &AUDIO_SIGNALPROCESSINGMODE_RAW) => "RAW",
+            Some(m) if same(m, &AUDIO_SIGNALPROCESSINGMODE_DEFAULT) => "DEFAULT",
+            Some(_) => "another",
+        }
     }
 }
 
@@ -1923,7 +2042,7 @@ unsafe extern "C" fn evt_circuit_create_stream(
     _pin: ACXPIN,
     mut stream_init: PACXSTREAM_INIT,
     format: ACXDATAFORMAT,
-    _signal_processing_mode: *const GUID,
+    signal_processing_mode: *const GUID,
     _var_arguments: ACXOBJECTBAG,
 ) -> NTSTATUS {
     unsafe {
@@ -2037,17 +2156,25 @@ unsafe extern "C" fn evt_circuit_create_stream(
         };
         (*s).dev = crate::device_ctx(device.cast());
         (*s).ring_bytes = ring_bytes(&fmt);
-        (*s).tap = fmt.is_valid()
+        (*s).known = fmt.is_valid()
             && fmt.frame_bytes() == (*s).block_align as usize
             && audio::stream_created((*s).dev, s as usize, fmt);
         trace!(
-            "acx: stream created: {} Hz, {} ch, {} valid bits in {}-bit containers, block {} bytes, tap {}, {} of {} streams",
+            "acx: stream created: {} mode, {} Hz, {} ch, {} valid bits in {}-bit containers, block {} bytes, \
+             tap {}, {} of {} streams",
+            mode_name(signal_processing_mode),
             (*s).sample_rate,
             (*s).channels,
             valid_bits,
             (*s).bits,
             (*s).block_align,
-            (*s).tap,
+            if !(*s).known {
+                "never"
+            } else if audio::feeds_tap((*s).dev, s as usize) {
+                "yes"
+            } else {
+                "not now"
+            },
             if slots.is_null() { 0 } else { (*slots).in_use() },
             rt_limits::MAX_STREAMS
         );
@@ -2060,7 +2187,7 @@ unsafe extern "C" fn evt_circuit_create_stream(
 unsafe extern "C" fn evt_stream_cleanup(obj: WDFOBJECT) {
     unsafe {
         let s = stream_ctx(obj);
-        if !s.is_null() && !(*s).dev.is_null() && (*s).tap {
+        if !s.is_null() && !(*s).dev.is_null() && (*s).known {
             audio::stream_destroyed((*s).dev, s as usize);
         }
         // Give the stream slot back (WDF calls a cleanup callback once).
@@ -2104,7 +2231,7 @@ unsafe fn free_ring(s: *mut StreamCtx) {
         }
         (*s).ring = null_mut();
         if !(*s).dev.is_null() {
-            audio::ring_remove((*s).dev, ring);
+            audio::ring_remove((*s).dev, s as usize, ring);
         }
         ExFreePool(ring.cast());
     }
@@ -2297,16 +2424,20 @@ unsafe extern "C" fn evt_stream_prepare_hardware(stream: ACXSTREAM) -> NTSTATUS 
             return status;
         }
         // Ring for the PCM tap: RING_MS of this stream's format, nonpaged
-        // (it is written by the timer DPC). Without it the stream still
-        // plays; its audio is counted as dropped.
-        if (*s).tap && (*s).ring.is_null() && (*s).ring_bytes > 0 {
+        // (it is written by the timer DPC). Every known stream offers one,
+        // also while another stream feeds the tap: the tap can move here
+        // when this stream runs (audio_core.rs). Without it the stream still
+        // plays; its audio is counted as dropped while it feeds the tap.
+        if (*s).known && (*s).ring.is_null() && (*s).ring_bytes > 0 {
             let ring = ExAllocatePool2(POOL_FLAG_NON_PAGED as POOL_FLAGS, (*s).ring_bytes as SIZE_T, POOL_TAG).cast::<u8>();
             if ring.is_null() {
                 trace!("acx: no memory for the {}-byte tap ring; this stream's audio is dropped", (*s).ring_bytes);
             } else if audio::ring_install((*s).dev, s as usize, ring, (*s).ring_bytes) {
                 (*s).ring = ring;
             } else {
-                // A newer stream took the tap in the meantime.
+                // The session does not take it (cannot happen for a known
+                // stream with a valid format); nothing refers to it.
+                trace!("acx: tap ring not taken");
                 ExFreePool(ring.cast());
             }
         }
@@ -2389,10 +2520,9 @@ unsafe extern "C" fn evt_stream_run(stream: ACXSTREAM) -> NTSTATUS {
         // completes, so Pause/Run in the middle of one neither repeats nor
         // loses frames.
         let _ = call_unsafe_wdf_function_binding!(WdfTimerStart, (*s).timer, -((one - played_hns).max(1) as i64));
-        if (*s).tap {
-            audio::stream_running((*s).dev, s as usize, true);
-        }
-        trace!("acx: stream running");
+        // The tap follows the running stream: the last one to run takes it.
+        let tap = (*s).known && audio::stream_running((*s).dev, s as usize, true);
+        trace!("acx: stream running ({} Hz, feeds the tap: {})", (*s).sample_rate, tap);
         STATUS_SUCCESS
     }
 }
@@ -2411,9 +2541,10 @@ unsafe extern "C" fn evt_stream_pause(stream: ACXSTREAM) -> NTSTATUS {
         // resumes from this value.
         let _ = position_bytes(s);
         (*s).state.store(_ACX_STREAM_STATE::AcxStreamStatePause as u32, Ordering::SeqCst);
-        // Nothing is flushed: frames already in the tap stay for the reader.
-        if (*s).tap {
-            audio::stream_running((*s).dev, s as usize, false);
+        // Nothing is flushed: frames already in the tap stay for the reader,
+        // unless another stream is running; the tap then moves to that one.
+        if (*s).known && !audio::stream_running((*s).dev, s as usize, false) {
+            trace!("acx: stream paused; the tap is with another stream");
         }
         print_stats(s, "paused");
         STATUS_SUCCESS
@@ -2584,7 +2715,7 @@ unsafe fn consume_packet(s: *const StreamCtx, stale: bool) {
         } else if core::slice::from_raw_parts(p, size).iter().any(|&b| b != 0) {
             (*s).nonsilent_packets.fetch_add(1, Ordering::Relaxed);
         }
-        if (*s).tap {
+        if (*s).known {
             audio::render((*s).dev, s as usize, p, size, stale);
         }
     }
