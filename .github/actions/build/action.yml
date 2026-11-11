@@ -1,0 +1,183 @@
+name: Build and package crossc
+description: >
+  Builds the test-signed crossc_bth driver package and the user-mode programs in release mode, assembles the
+  bundle with tools/package.ps1 and, when asked, uploads it as a workflow artifact. Shared by ci.yml and release.yml.
+  Needs a checked-out repository on a Windows x64 runner.
+
+inputs:
+  toolchain:
+    description: Rust toolchain to build with (a release number, not "stable", so builds are repeatable).
+    required: true
+  version:
+    description: Bundle version (with or without a leading "v"). Empty lets tools/package.ps1 choose (dev-<commit>).
+    required: false
+    default: ""
+  upload:
+    description: >-
+      "true" uploads the bundle as a workflow artifact. Only the release workflow does, to hand the bundle
+      to its publish job; ordinary CI runs build and check the bundle and keep nothing.
+    required: false
+    default: "false"
+  retention-days:
+    description: How long the workflow artifact is kept (when uploaded).
+    required: false
+    default: "1"
+
+outputs:
+  version:
+    description: Version the bundle was built as.
+    value: ${{ steps.package.outputs.version }}
+  artifact-name:
+    description: Name of the uploaded workflow artifact (the bundle zip, the symbols zip and SHA256SUMS.txt).
+    value: ${{ steps.package.outputs.bundle-name }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust ${{ inputs.toolchain }}
+      uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      with:
+        toolchain: ${{ inputs.toolchain }}
+
+    # One cache for both Cargo workspaces, under a key that ci.yml and release.yml share: a run on master fills
+    # it, and tag builds (which can only read caches of the default branch) start warm. The key does not see
+    # the RUSTFLAGS of the user-mode build step below: change shared-key when those flags change.
+    - name: Cache cargo registry and build outputs
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        shared-key: package-crt-static
+        workspaces: |
+          . -> target
+          drivers/crossc-bth -> target
+        # cargo-make runs the windows-drivers-rs build steps as rust-script scripts, compiled here.
+        cache-directories: ~/AppData/Local/rust-script
+        save-if: ${{ github.ref_type == 'branch' }}
+
+    # windows-drivers-rs CI installs cargo-make with this action too. Both tools are in the action's manifest,
+    # which pins the SHA-256 of each download.
+    - name: Install cargo-make and cargo-about
+      uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      with:
+        tool: cargo-make@0.37.24,cargo-about@0.9.3
+
+    # rust-script runs every packaging and signing step of the windows-drivers-rs makefile and is not in that
+    # manifest. The makefile (wdk-build 0.6.0, rust-driver-makefile.toml) runs "cargo install rust-script
+    # --version 0.30.0" itself before its steps, which replaces any other version by one it compiles on the
+    # spot. So exactly that version is built here, from its crates.io source and with its lock file: the
+    # makefile's install then finds it and does nothing, and no release binary of the tool is involved. The
+    # cargo cache above keeps the result, so a warm run builds nothing in either place. Raise the version
+    # together with wdk-build.
+    - name: Install rust-script
+      shell: pwsh
+      run: cargo install --locked rust-script@0.30.0
+
+    # THIRD-PARTY-LICENSES.html depends only on the two dependency graphs and the cargo-about setup, and
+    # cargo-about needs two to three minutes for it on a hosted runner. It is generated when one of the files
+    # below changes and reused, byte for byte, otherwise.
+    - name: Look up the license report for these dependencies
+      id: licenses
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: dist/THIRD-PARTY-LICENSES.html
+        key: licenses-cargo-about-0.9.3-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'drivers/crossc-bth/Cargo.lock', 'drivers/crossc-bth/Cargo.toml', '.github/release/about.toml', '.github/release/about.hbs', 'tools/package.ps1') }}
+
+    # Before everything that takes long: a dependency under a license that is not on the accepted list
+    # (.github/release/about.toml) fails here, a few minutes into the job.
+    - name: Check third-party licenses and generate the report
+      if: steps.licenses.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: ./tools/package.ps1 -LicensesOnly -OutDir dist
+
+    - name: Install LLVM and the WDK
+      uses: ./.github/actions/driver-prereqs
+
+    - name: Build the driver package (cargo make default --release)
+      shell: pwsh
+      working-directory: drivers/crossc-bth
+      run: cargo make default --release --locked
+
+    # The C runtime is linked statically, so the programs start on a PC without the Visual C++ Redistributable
+    # (the bundle carries no vcruntime140.dll; tools/package.ps1 checks the import tables). Set on this step
+    # only: the driver build above takes its flags from drivers/crossc-bth/.cargo/config.toml.
+    - name: Build the user-mode programs
+      shell: pwsh
+      env:
+        RUSTFLAGS: -C target-feature=+crt-static
+      run: |
+        $packages = @('-p', 'crossc-cli', '-p', 'crossc-installer')
+        if (Test-Path crates/crossc-service/Cargo.toml) { $packages += @('-p', 'crossc-service') }
+        Write-Host "cargo build --release --locked $($packages -join ' ')"
+        cargo build --release --locked @packages
+
+    - name: Assemble the bundle
+      id: package
+      shell: pwsh
+      env:
+        CROSSC_VERSION: ${{ inputs.version }}
+      run: |
+        # The license report is already in dist: generated above, or restored for unchanged dependencies.
+        $packageArgs = @{ OutDir = 'dist'; LicensesFile = 'dist/THIRD-PARTY-LICENSES.html' }
+        if ($env:CROSSC_VERSION) { $packageArgs.Version = $env:CROSSC_VERSION }
+        ./tools/package.ps1 @packageArgs
+
+    # The driver is signed with a certificate that cargo-make creates in the runner user's store during the
+    # build. Nothing exports its private key and the runner is thrown away after the job; deleting the key here
+    # as well makes "the key no longer exists" true on a self-hosted or reused runner too. A failure fails the
+    # job: .github/release/TEST-SIGNING.md, which ships in the bundle, states that the key is gone. That
+    # includes a driver package whose certificate was not among the deleted ones, which is what a
+    # windows-drivers-rs that keeps the key somewhere else would look like.
+    - name: Delete the driver signing key
+      if: always()
+      shell: pwsh
+      run: |
+        $store = 'Cert:\CurrentUser\WDRTestCertStore'
+
+        # What this build shipped: the certificate in the driver package and its copy in the bundle.
+        $shipped = @(Get-Item -ErrorAction Ignore -Path @(
+            'drivers/crossc-bth/target/release/crossc_bth_package/WDRLocalTestCert.cer'
+            'dist/crossc-*-x64/driver/WDRLocalTestCert.cer'
+          ) | ForEach-Object {
+            [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($_.FullName).Thumbprint
+          } | Sort-Object -Unique)
+
+        $deletedKeys = @()
+        if (Test-Path $store) {
+          $certs = @(Get-ChildItem $store)
+          foreach ($cert in $certs) {
+            $hasKey = $cert.HasPrivateKey
+            Write-Host "Deleting $($cert.Subject) [$($cert.Thumbprint)], private key present: $hasKey"
+            Remove-Item -LiteralPath $cert.PSPath -DeleteKey
+            if ($hasKey) { $deletedKeys += $cert.Thumbprint }
+          }
+          $left = @(Get-ChildItem $store)
+          if ($left.Count -ne 0) { throw "$($left.Count) certificate(s) still in $store" }
+          Write-Host "Deleted $($certs.Count) certificate(s) and their private keys."
+        } else {
+          Write-Host 'No WDRTestCertStore on this runner.'
+        }
+
+        if ($shipped.Count -eq 0) {
+          Write-Host 'No driver package here: the build did not get as far as signing one.'
+          exit 0
+        }
+        $notDeleted = @($shipped | Where-Object { $deletedKeys -notcontains $_ })
+        if ($notDeleted.Count -ne 0) {
+          throw ("The driver package is signed with certificate [$($notDeleted -join ', ')], but $store held no " +
+            "certificate with that thumbprint and a private key. Its key was NOT deleted, while TEST-SIGNING.md " +
+            "in the bundle says it was: find out where the build keeps the signing key and delete it there.")
+        }
+        Write-Host "The key of the shipped certificate [$($shipped -join ', ')] was among those deleted."
+
+    - name: Upload the bundle
+      if: inputs.upload == 'true'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.package.outputs.bundle-name }}
+        path: |
+          dist/crossc-*-x64.zip
+          dist/crossc-*-symbols.zip
+          dist/SHA256SUMS.txt
+        if-no-files-found: error
+        retention-days: ${{ inputs.retention-days }}
+        # The payload is two zip files: recompressing them only costs time.
+        compression-level: 0

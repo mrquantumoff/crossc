@@ -1,0 +1,10 @@
+[package]
+name = "crossc-ioctl"
+version = "0.1.0"
+edition = "2024"
+description = "IOCTL contract between the crossc-bth driver and user mode (no_std, shared)"
+publish = false
+# No workspace inheritance on purpose: this crate is also a path dependency of
+# drivers/crossc-bth, which is its own Cargo workspace.
+
+[dependencies]

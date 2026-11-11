@@ -1,0 +1,29 @@
+[package]
+name = "crossc-core"
+version = "0.1.0"
+edition = "2024"
+description = "Device access, AVDTP session, SSC stream setup, packetiser and the audio session state machine shared by crossc-service and crossc-cli"
+publish = false
+
+[features]
+# The fake AVDTP sink and fake driver, for tests in this crate and in the
+# crates that build on it (enable it from a dev-dependency).
+testing = []
+
+[dependencies]
+avdtp = { path = "../avdtp" }
+crossc-ioctl = { path = "../crossc-ioctl" }
+ssc-enc = { path = "../ssc-enc" }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_Devices_Bluetooth",
+    "Win32_Devices_DeviceAndDriverInstallation",
+]

@@ -1,0 +1,5 @@
+# Cargo and C-oracle build output (never commit: target/c-oracle holds binaries built from third-party C sources)
+target/
+
+# Local diagnostics output (contains device names, Bluetooth addresses and machine config)
+tools/diag/diag-*.txt

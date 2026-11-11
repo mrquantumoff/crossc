@@ -1,0 +1,45 @@
+ssc-enc: provenance and third-party notices
+===========================================
+
+ssc-enc is a Rust port of the C encoder samsung-ssc-encoder
+(https://github.com/WillyBilly06/samsung-ssc-encoder, revision 94f1896f1b80830554b0cc8deec47ab04130e19f),
+Copyright (c) 2026 William Ho (WillyBilly06), distributed under the BSD-3-Clause license. Parts of that encoder
+are adapted from the CELT layer of libopus 1.1, Copyright 2001-2011 Xiph.Org, Skype Limited, Octasic,
+Jean-Marc Valin, Timothy B. Terriberry, CSIRO, Gregory Maxwell, Mark Borgerding, Erik de Castro Lopo, also
+BSD-3-Clause. Both notices are reproduced verbatim in LICENSE-THIRD-PARTY and apply to this crate.
+
+Ported files (src/ of this crate <- src/ of samsung-ssc-encoder):
+
+  tables.rs   <- ssc_enc_tables.c   (CELT tables from libopus 1.1)
+  ec.rs       <- ssc_enc_ec.c       (libopus 1.1 entenc.c, entcode.c, laplace.c)
+  energy.rs   <- ssc_enc_energy.c   (libopus 1.1 quant_bands.c)
+  alloc.rs    <- ssc_enc_alloc.c    (libopus 1.1 rate.c)
+  mdct.rs     <- ssc_enc_mdct.c
+  pitch.rs    <- ssc_enc_pitch.c    (libopus 1.1 pitch.c, celt_lpc.c, celt.c)
+  analysis.rs <- ssc_enc_analysis.c (libopus 1.1 celt_encoder.c, bands.c)
+  bands.rs    <- ssc_enc_bands.c    (libopus 1.1 bands.c, vq.c, cwrs.c)
+  encoder.rs  <- ssc_encoder.c      (libopus 1.1 celt_encode_with_ec)
+  consts.rs   <- ssc_enc_internal.h
+  lib.rs      <- include/ssc_encoder.h (API semantics)
+
+New code (BSD-3-Clause, same terms): math.rs (C math-function semantics), tests/api.rs, tests/stack.rs.
+
+Test code: tests/ref_frames.rs replicates the configuration table and checks of samsung-ssc-encoder
+tests/run_tests.py and tests/ssc_conformance.c; synthetic() in tests/common/mod.rs follows the stress signal of
+run_tests.py (make_synthetic); the decode/tell check in tests/oracle.rs follows ssc_conformance.c. Same
+copyright and license as above.
+
+No code from any other implementation was used.
+
+Test data (tests/vectors/) is a truncated copy (first 48 frames of each file) of samsung-ssc-encoder
+tests/vectors, same license and copyright as above. The *.ssc files under tests/vectors/ref_frames are frames
+produced by Samsung's own encoder from those inputs, as distributed with samsung-ssc-encoder for
+interoperability testing.
+
+oracle/ssc_oracle.c (BSD-3-Clause, same terms; its file reading and bitrate-list parsing are adapted from
+samsung-ssc-encoder tests/ssc_conformance.c and examples/ssc_enc_tool.c) drives the C encoder and its checker decoder
+(samsung-ssc-encoder tests/decoder, BSD-3-Clause, adapted from libopus 1.1) in the test suite; those C sources
+are compiled from a separate checkout and are not part of this crate.
+
+Samsung, Galaxy and Galaxy Buds are trademarks of Samsung Electronics Co., Ltd. This crate is independent and
+not affiliated with or endorsed by Samsung.

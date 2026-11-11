@@ -1,0 +1,1158 @@
+# crossc spike: setup, first live test and rollback
+
+This walks you through milestone 1: put `crossc_bth.sys` in place of the inbox
+`BthA2dp.sys` on **the Galaxy Buds' A2DP node only**, open the AVDTP signaling
+channel (L2CAP PSM 0x19) as initiator, and run DISCOVER / GET_ALL_CAPABILITIES
+with `crossc-cli probe`.
+
+Shell legend:
+
+* **(user)**: a normal, non-elevated PowerShell is enough.
+* **(admin)**: an elevated PowerShell ("Run as administrator").
+
+Every command block is meant to be pasted as-is. Paths assume the repo is at
+`C:\src\crossc`; change `$repo` if yours is somewhere else.
+
+> **Risk.** This loads a kernel driver that has never run before. A bug in it
+> means a bugcheck (BSOD). Before you start:
+> * Have your BitLocker recovery key to hand (https://account.microsoft.com/devices/recoverykey).
+> * Create a restore point.
+> * Close anything you can't afford to lose.
+
+> **Quick path.** Once test signing is on (section 1) and the buds are paired
+> (section 3), `tools\install-driver.ps1` does sections 0, 2, 4, 5 and the 5c
+> check in one go: build, trust the cert, replace any older staged package,
+> install on the buds' node only, and verify. It asks for elevation once.
+>
+> ```powershell
+> .\tools\install-driver.ps1              # debug build + install
+> .\tools\install-driver.ps1 -Release     # release build
+> .\tools\install-driver.ps1 -NoBuild     # reinstall the last build
+> .\tools\install-driver.ps1 -Uninstall [-RemoveCert]   # back to BthA2dp
+> ```
+>
+> Prefer a window? `crossc-installer` does the same steps with a live status
+> checklist (admin, test signing, Secure Boot, Memory integrity, package,
+> certificate, buds node, staged packages), a streaming log and a "next step"
+> hint. Build works unelevated; for Install / Uninstall / Remove certificate
+> click "Restart as administrator" (one UAC prompt). See
+> `crates/crossc-installer/README.md`.
+>
+> ```powershell
+> cargo run -p crossc-installer --release
+> ```
+
+---
+
+## 0. Build (user)
+
+```powershell
+$repo = "C:\src\crossc"
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
+
+# Driver package: .sys + .inf + .cat, test-signed, plus WDRLocalTestCert.cer
+cd "$repo\drivers\crossc-bth"
+cargo make
+# -> $repo\drivers\crossc-bth\target\debug\crossc_bth_package\
+#    crossc_bth.sys  crossc_bth.inf  crossc_bth.cat  crossc_bth.pdb  WDRLocalTestCert.cer
+
+# CLI + libraries
+cd $repo
+cargo build --release -p crossc-cli
+# -> $repo\target\release\crossc-cli.exe
+```
+
+`cargo make` creates a self-signed code-signing cert `CN=WDRLocalTestCert` in
+your *user* store `WDRTestCertStore` the first time, **including its private
+key**. It then reuses it for every build. If you delete it (step 8.3), the next
+build creates a new one, which must be trusted again (step 2).
+
+The build fails on purpose if `crossc_bth.inx` ever gets a model line with the
+generic A2DP ID `BTHENUM\{0000110b-...}` (see step 5 for why).
+
+---
+
+## 1. Allow test-signed drivers (admin, one-time, reboot)
+
+1. **Secure Boot must be OFF.** With Secure Boot on, `testsigning` is refused
+   ("The value is protected by Secure Boot policy"). Check it:
+
+   ```powershell
+   Confirm-SecureBootUEFI   # False = off (good). True = disable it in UEFI setup first.
+   ```
+
+2. **BitLocker.** Changing boot configuration or Secure Boot triggers
+   BitLocker recovery unless you suspend protection first:
+
+   ```powershell
+   manage-bde -status C:
+   Suspend-BitLocker -MountPoint "C:" -RebootCount 2
+   ```
+
+   Then turn off Secure Boot in UEFI setup if needed.
+
+3. **Turn on test signing:**
+
+   ```powershell
+   bcdedit /set testsigning on
+   bcdedit /enum "{current}" | Select-String testsigning   # testsigning  Yes
+   Restart-Computer
+   ```
+
+   After the reboot the desktop shows a "Test Mode" watermark.
+
+4. **Memory integrity (HVCI).** HVCI should accept test-signed drivers in test
+   mode. If the driver later fails to load with Code 52 or
+   `0xC0000428`/`STATUS_INVALID_IMAGE_HASH`, turn off Windows Security ->
+   Device security -> Core isolation -> Memory integrity, and reboot.
+
+---
+
+## 2. Trust the test certificate (admin)
+
+```powershell
+$pkg = "C:\src\crossc\drivers\crossc-bth\target\debug\crossc_bth_package"
+certutil -addstore -f Root             "$pkg\WDRLocalTestCert.cer"
+certutil -addstore -f TrustedPublisher "$pkg\WDRLocalTestCert.cer"
+```
+
+---
+
+## 3. Pair the buds, LE Audio off (user)
+
+1. Settings -> Bluetooth & devices -> **Use LE Audio when available: Off**
+   (on 24H2+ it is under *Devices* / *Bluetooth devices*). If the buds were
+   paired with LE Audio on, remove them first.
+2. Put the buds in pairing mode (both in the case, lid open, hold the touchpads
+   until they chime, or use Galaxy Wearable). Pair them from
+   Settings -> Add device -> Bluetooth.
+3. Play some audio once with the inbox driver, so you know the baseline works.
+4. **(admin)** Collect the diagnostics (the hardware IDs come from here):
+
+   ```powershell
+   & "C:\src\crossc\tools\diag\collect.ps1"
+   ```
+
+---
+
+## 4. Find the buds' A2DP node (admin)
+
+The node you want is the BTHENUM child for the buds' **A2DP Sink** SDP
+record. Its UUID is 0x110B, its class is MEDIA, and its service is `BthA2dp`.
+
+```powershell
+Get-PnpDevice -PresentOnly | Where-Object InstanceId -like 'BTHENUM\{0000110B-0000-1000-8000-00805F9B34FB}*' |
+  ForEach-Object {
+    $p = Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_HardwareIds, DEVPKEY_Device_CompatibleIds, DEVPKEY_Device_Service, DEVPKEY_Device_DriverRank
+    [pscustomobject]@{
+      Name         = $_.FriendlyName
+      Status       = $_.Status
+      Service      = ($p | Where-Object KeyName -eq DEVPKEY_Device_Service).Data
+      DriverRank   = '{0:X8}' -f ($p | Where-Object KeyName -eq DEVPKEY_Device_DriverRank).Data
+      HardwareIds  = ($p | Where-Object KeyName -eq DEVPKEY_Device_HardwareIds).Data -join ' | '
+      CompatibleIds = ($p | Where-Object KeyName -eq DEVPKEY_Device_CompatibleIds).Data -join ' | '
+      InstanceId   = $_.InstanceId
+    }
+  } | Format-List
+```
+
+On this machine (measured) the buds' node is:
+
+* InstanceId `BTHENUM\{0000110B-0000-1000-8000-00805F9B34FB}_VID&00010075_PID&A013\B&1A2B3C4D&0&AABBCCDDEEFF_C00000000`
+* HardwareIds `..._VID&00010075_PID&a013 | ..._LOCALMFG&0046`
+  (VID 0x0075 = Samsung, PID 0xA013 = Buds4 Pro)
+* CompatibleIds `BTHENUM\{0000110b-...} | BTHENUM\{0000110b-...}_GENERIC`
+* Service `BthA2dp`, DriverRank `00FF2000` (inbox INF matched the generic
+  *compatible* ID)
+
+The INF's model line is exactly that `_VID&00010075_PID&a013` hardware ID. If
+yours differs (other buds, other firmware), put your node's
+`..._VID&xxxxxxxx_PID&xxxx` hardware ID in `crossc_bth.inx` and rebuild.
+
+```powershell
+$node = 'BTHENUM\{0000110B-0000-1000-8000-00805F9B34FB}_VID&00010075_PID&A013\B&1A2B3C4D&0&AABBCCDDEEFF_C00000000'
+```
+
+---
+
+## 5. Install crossc_bth on THAT node only (admin)
+
+**How the ranking works, and why the INF has no generic line.** PnP picks the
+lowest DriverRank, then the newest DriverVer. Once step 2 trusts the test
+cert, its signature scores the same as Microsoft's (AllSigningEqual, default
+since Windows 7, not overridden on this machine). A generic
+`BTHENUM\{0000110b-...}` line would therefore tie with the inbox INF
+(`00FF2000`) and win on date, taking over **every** A2DP headset on its next
+install. The buds-specific hardware ID ranks `00FF0000` instead: it beats the
+inbox driver **for the buds only**, and no other device matches it.
+
+The flip side: **once the package is staged (and the cert trusted), the buds'
+node gets crossc_bth automatically** whenever it is (re)installed: re-pairing,
+"Update driver -> Search automatically", a reinstall, or step 5b below. Staging
+is not a no-op for the buds. Undo with step 8.
+
+### 5a. Stage the package and check the ranking
+
+```powershell
+pnputil /add-driver "C:\src\crossc\drivers\crossc-bth\target\debug\crossc_bth_package\crossc_bth.inf"
+pnputil /enum-devices /instanceid "$node" /drivers
+```
+
+Expected in the `/drivers` list: **crossc_bth.inf** (oemNN.inf, provider
+*crossc*) with `Matching Device ID: ..._VID&00010075_PID&a013`, `Driver Rank:
+00FF0000`, status *Best Ranked*; `microsoft_bluetooth_a2dp_src.inf` at
+`00FF2000` *Outranked* (still *Installed* until 5b). If crossc shows any rank other
+than `00FF0000` (a non-zero high byte means a worse signature score), the
+signature is probably not trusted: redo steps 1-2 and check again.
+
+Check that nothing else can pick it: run the same command for every other
+`BTHENUM\{0000110B-...}` node from step 4 (other headsets). crossc_bth.inf must
+**not** appear in their *Matching Drivers*:
+
+```powershell
+Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'BTHENUM\{0000110B-*' -and $_.InstanceId -ne $node } |
+  ForEach-Object { $_.InstanceId; pnputil /enum-devices /instanceid $_.InstanceId /drivers | Select-String 'crossc' }
+# no "crossc" lines expected
+```
+
+### 5b. Install it on the buds' node
+
+Either (simplest; with the specific ID it only touches matching devices):
+
+```powershell
+pnputil /add-driver "C:\src\crossc\drivers\crossc-bth\target\debug\crossc_bth_package\crossc_bth.inf" /install
+```
+
+or Device Manager: `devmgmt.msc` -> the node from step 4 (Properties ->
+Details -> "Device instance path" must equal `$node`) -> Driver -> **Update
+driver** -> **Browse my computer for drivers** -> **Let me pick from a list of
+available drivers on my computer** -> **crossc A2DP sink (spike)** (provider
+*crossc*) -> Next, accept any warning.
+
+The buds' "Stereo"/A2DP audio endpoint disappears; that is expected. Hands-free
+(HFP, UUID 0x111E) and AVRCP are separate nodes and stay on their inbox
+drivers.
+
+### 5c. Check it bound
+
+```powershell
+Get-PnpDeviceProperty -InstanceId $node -KeyName DEVPKEY_Device_Service, DEVPKEY_Device_DriverInfPath, DEVPKEY_Device_ProblemCode, DEVPKEY_Device_Stack |
+  Format-Table KeyName, Data
+# Service = crossc_bth, DriverInfPath = oemNN.inf, ProblemCode = 0
+# Stack = \Driver\ksthunk, \Driver\crossc_bth, \Driver\BthEnum
+sc.exe query crossc_bth
+```
+
+`ksthunk` is the MEDIA class upper filter; it sits above BthA2dp today and
+will sit above crossc_bth too. Our IOCTLs are not kernel-streaming IOCTLs, so
+it should pass them through. If `crossc-cli list/info` fails oddly (create
+refused, IOCTLs answered with errors the driver trace never shows), suspect
+ksthunk first.
+
+Problem codes: **52** = signature not trusted (redo steps 1-2). **10** =
+start failed (DeviceAdd failed, e.g. the profile interface query; see
+DebugView). **31/39** = driver did not load (see DebugView or `C:\Windows\INF\setupapi.dev.log`).
+
+---
+
+## 6. Watch the driver's trace (admin)
+
+The driver prints with `DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL)`,
+which the default filter lets through, so no registry change is needed.
+
+1. Get DebugView from Sysinternals: `winget install Microsoft.Sysinternals.DebugView`
+   (or download it from https://learn.microsoft.com/sysinternals/downloads/debugview).
+2. Run `Dbgview.exe` **as administrator** -> Capture -> tick **Capture Kernel**.
+   Set Edit -> Filter/Highlight -> Include `crossc:` to hide other output.
+3. Restart the node to see the start sequence:
+
+   ```powershell
+   pnputil /restart-device "$node"
+   ```
+
+   Expected lines:
+
+   ```
+   crossc: DriverEntry v0.1.0
+   crossc: EvtDriverDeviceAdd
+   crossc: device added
+   crossc: D0Entry
+   crossc: remote A0:B1:C2:D3:E4:F5 (flags 0x6) ...
+   ```
+
+   `flags 0x6` = address valid + came from `IOCTL_INTERNAL_BTHENUM_GET_DEVINFO`.
+   `0x4` means that IOCTL failed and the address was parsed from the instance id.
+
+---
+
+## 7. Probe the buds (admin)
+
+Take the buds out of the case (powered and in range). Opening PSM 0x19 pages
+them if no ACL link is up.
+
+```powershell
+$cli = "C:\src\crossc\target\release\crossc-cli.exe"
+& $cli list
+& $cli info
+& $cli probe -v
+```
+
+`probe` opens the signaling channel and sends DISCOVER, then
+GET_ALL_CAPABILITIES for each SEP (it falls back to GET_CAPABILITIES if that
+is rejected). It prints every SEP and capability, including the decoded
+Samsung SSC flags byte:
+
+```
+SEP 0x03: Audio Sink  [GET_ALL_CAPABILITIES]
+  Media Transport
+  Content Protection: SCMS-T (0x0002)
+  Media Codec (media type 0): vendor 0x00000075 codec 0x0103 value [16]
+    Samsung SSC flags = 0x16 (00010110)
+      [ ] 0x80 96 kHz (legacy)
+      ...
+    -> 48k/24 HiFi: true   96k/24 UHQv2 usable: true
+  Delay Reporting
+```
+
+If the buds refuse without security, try `& $cli probe -v --secure`. That
+requests an authenticated and encrypted link.
+
+### 7a. Which reported MTU is which (unverified driver mapping)
+
+The driver reports `out_mtu = OutResults.Params.Mtu` and `in_mtu =
+InResults.Params.Mtu`, and puts our requested `in_mtu` into `ConfigOut`. That
+mapping is a reading of `bthddi.h`, not verified. `probe` and `media` request
+`in_mtu=1021` by default and print a `MTU check:` line. Make it conclusive by
+opening twice with two different unusual values:
+
+```powershell
+& $cli raw "open 0x19 1013" "close 1"
+& $cli raw "open 0x19 1021" "close 1"
+```
+
+Whichever reported field follows the request (1013, then 1021) is **our
+receive MTU**. If it is `in_mtu`, the mapping is right. If `out_mtu` follows
+it, the mapping is swapped: the driver's WRITE length check and the CLI's
+fragmentation use the wrong number. Record both lines and the DebugView `open
+done ... out_mtu= in_mtu=` lines.
+
+### 7b. Media channel MTU (needs SET_CONFIGURATION + OPEN first)
+
+A second L2CAP channel on PSM 0x19 is only the media transport channel after
+the sink accepted SET_CONFIGURATION and OPEN for a SEP. `media` does exactly
+that, with SBC (one value per field, Media Transport + Media Codec only, no
+Delay Reporting), opens the second channel, prints its MTUs, then sends CLOSE
+(ABORT if CLOSE is refused) and closes both channels. It never sends START, so
+no audio flows.
+
+```powershell
+& $cli media -v                 # first free SBC sink SEP
+& $cli media -v --seid 0x01     # a specific SEP
+& $cli media -v --in-mtu 1013   # second data point for 7a
+```
+
+Record: the media channel's `out_mtu` / `in_mtu` (SSC wants >= 1005 for
+`out_mtu`), whether the second open succeeds at all on this node, how long it
+takes, and any SET_CONFIGURATION reject (`error_name` decodes the A2DP codes
+0xC1-0xE5).
+
+### 7c. Raw experiments
+
+Raw experiments use one handle for the whole command list. Channels close when
+the process exits.
+
+```powershell
+# DISCOVER by hand (label 0): header 00, signal 01
+& $cli raw "open 0x19" "send 1 00 01" "recv 1 5000" "close 1"
+# interactive:
+& $cli raw
+```
+
+Save the DebugView log and the console output of the first run: the open
+milestone-1 questions (does the node start, does OPEN succeed, do reads and
+disconnect behave) are answered from those two logs.
+
+A synchronous close (CLOSE ioctl, process exit, D0Exit) now gives up after
+8 s; DebugView then shows `close ABANDONED ... (slot frees itself when bthport
+drains)` and the CLI's `close` fails with Win32 error 121. That line answers
+whether bthport honours cancel / flushes on CLOSE_CHANNEL.
+
+---
+
+## 8. Roll back to BthA2dp (admin)
+
+1. **Put the inbox driver back on the node.** Either:
+   * Device Manager -> the node -> Properties -> Driver -> **Roll Back Driver**, or
+   * Update driver -> Browse -> Let me pick -> **Microsoft Bluetooth A2dp Source**.
+
+   Check:
+
+   ```powershell
+   Get-PnpDeviceProperty -InstanceId $node -KeyName DEVPKEY_Device_Service | Format-Table KeyName, Data   # BthA2dp
+   ```
+
+2. **Remove the package from the driver store.** Do this before anything
+   re-installs the node (re-pair, "search automatically"): while the package
+   is staged and trusted it outranks BthA2dp for the buds.
+
+   ```powershell
+   pnputil /enum-drivers | Select-String -Context 1,6 'crossc_bth.inf'
+   # note the "Published Name" (oemNN.inf), then:
+   pnputil /delete-driver oemNN.inf /uninstall /force
+   sc.exe query crossc_bth     # should report: service does not exist
+   ```
+
+3. **Remove the test certificate** from the machine trust stores **and** from
+   your user store `WDRTestCertStore`, where cargo-make keeps it with its
+   private key (anything running as you could sign code with it):
+
+   ```powershell
+   certutil -delstore Root             WDRLocalTestCert
+   certutil -delstore TrustedPublisher WDRLocalTestCert
+   certutil -user -delstore WDRTestCertStore WDRLocalTestCert
+   ```
+
+   The next `cargo make` creates a new cert; trust it again (step 2) if you
+   come back.
+
+4. **Turn test signing off:**
+
+   ```powershell
+   Suspend-BitLocker -MountPoint "C:" -RebootCount 2
+   bcdedit /set testsigning off
+   Restart-Computer
+   ```
+
+   Re-enable Secure Boot in UEFI setup and Memory integrity if you changed
+   them. BitLocker resumes by itself after the reboot count; check with
+   `manage-bde -status C:`.
+
+5. **Last resort.** Remove the buds in Settings -> Bluetooth and pair them
+   again. This re-creates the BTHENUM nodes, and **only because step 2
+   deleted the package** they get BthA2dp. With the package still staged,
+   re-pairing would install crossc_bth on the buds again. If the machine bugchecks in a loop because of
+   the driver, boot to WinRE -> Troubleshoot -> Startup Settings -> **Safe
+   Mode**, turn Bluetooth off (or disable the radio in Device Manager), then
+   run step 2 from an elevated prompt.
+
+## 9. Stream SSC (play) (admin)
+
+`play` does the whole source side: DISCOVER, GET_ALL_CAPABILITIES, picks the
+SSC SEP (vendor 0x75 / codec 0x0103) and checks that its capability octet
+offers every bit of the chosen configuration, SET_CONFIGURATION (Media
+Transport + SSC with the one-octet configuration + Delay Reporting if the buds
+offer it), OPEN, opens the media channel, START, then streams SSC encoded live
+on this machine. On the end of the source or **Ctrl+C** it sends CLOSE (ABORT
+if CLOSE is refused) and closes both channels. Ctrl+C during setup takes
+effect after the step in flight (up to 5 s) and START is never sent after it;
+a second Ctrl+C ends the process at once. **The audio comes out of the
+buds directly.** There is no Windows sound device yet, so nothing shows up in
+the volume mixer and other apps cannot play through it.
+
+Wear the buds and start with the volume low: the tone is -20 dBFS and the
+sweep -12 dBFS, but a decoding fault can come out as full-scale noise. Keep
+the phone's Bluetooth off (the buds take one A2DP source at a time). Rebuild
+first (`cargo build --release -p crossc-cli`).
+
+Without a device, `--dry-run` encodes and packetises as fast as possible and
+prints the encoder speed. Use it to check a WAV file or a combination of
+options before trying them on the buds:
+
+```powershell
+& $cli play --mode uhq --dry-run
+```
+
+Try these in order and stop at the first one that fails:
+
+```powershell
+# 1. HiFi 48 kHz/24, config 0x0C, 192 kbps, 1 kHz tone (20 s by default)
+& $cli play -v
+# 2. HiFi log sweep 20 Hz -> 21.6 kHz (should glide smoothly, no clicks or dropouts)
+& $cli play -v --sweep --seconds 20
+# 3. HiFi WAV: any WAV file (16/24/32-bit int or 32-bit float, mono or stereo, any sample rate)
+& $cli play -v --wav C:\path\to\music-48k-24bit.wav
+# 4. UHQ 96 kHz/24, 584 kbps, one 672-byte packet every 9 ms: both configuration octets
+& $cli play -v --mode uhq --config 0x0A --sweep
+& $cli play -v --mode uhq --config 0x0E --sweep
+# 5. Bitrate probes (use the UHQ octet that worked in 4)
+& $cli play -v --bitrate 229 --sweep
+& $cli play -v --bitrate 328 --sweep
+& $cli play -v --mode uhq --bitrate 291 --frames-per-packet 2 --sweep
+& $cli play -v --mode uhq --bitrate 152 --frames-per-packet 2 --sweep
+```
+
+Other options:
+
+* `--seconds S` sets the length. A WAV plays to its end by default.
+* `--tone HZ --level DBFS` changes the tone.
+* `--ts samples` makes the RTP timestamp count samples instead of packets
+  (+1 per packet is what Samsung's stack is reported to send).
+* `--lead N` sets how many packets we stay ahead of the wall clock (default 3).
+* `--no-delay-report` leaves Delay Reporting out of SET_CONFIGURATION.
+* `--force-config` sends a configuration octet the buds do not offer.
+* `--mode ssc48` (0x18) and `--mode ssc44` (0x28) are plain SSC at 328 kbps.
+  328 is a guess; try `--bitrate 229` too.
+
+A WAV file at another sample rate is resampled to the mode's rate before
+streaming (48000 Hz for HiFi and ssc48, 96000 Hz for UHQ, 44100 Hz for ssc44)
+with a windowed-sinc filter, and fed to the encoder as 32-bit float. It takes
+about 1.5-2.5 s per minute of stereo audio. So a 44.1 kHz file works in every
+mode, including `--mode uhq`.
+
+**MTU check.** Which driver field is the buds' MTU is still unverified (7a).
+`play` therefore drops reported values of 0 or 65535 and takes the smallest
+remaining one. If that value equals our own requested in_mtu, it may just be
+our request echoed back, so it also caps the limit at 1005 (the media MTU the
+phone used with Buds4 Pro). It refuses before START if a packet would be
+larger, and prints the packet size, the limit and the reason. Every default
+packet fits in 1005 bytes. `--force-mtu N` overrides the check.
+
+**Report back**, for each command:
+
+* Did you hear it? Was it clean, distorted, noisy, choppy or silent? Did the
+  sweep reach the top or cut out early? Which UHQ octet (0x0A or 0x0E)
+  sounded right?
+* The `SET_CONFIGURATION` / `START` result. On a reject, the error name, and
+  the full `-v` output with the signaling trace.
+* The `media channel: out_mtu=... in_mtu=...; packet ... limit ...` line.
+* Every `sink DELAYREPORT: ... ms` line.
+* The `final:` statistics line: packets, average and maximum WRITE latency,
+  `late` (sent more than 0.5 ms after the intended send time), `missed` (sent
+  after the playout deadline; each one is also logged with `re-anchoring`),
+  write errors.
+* The `encoder: ...x realtime` line.
+* How it ended: `finished`, `interrupted`, `sink sent CLOSE/ABORT/SUSPEND`,
+  `SIGNALING CHANNEL LOST` or `MEDIA CHANNEL LOST`, with the elapsed time.
+  A Buds3 Pro once dropped the link about 110 s into UHQ from Linux, so for
+  UHQ also run a long one (`--seconds 300`) and note when, or whether, it
+  drops. If it drops, save the driver trace from step 6.
+
+---
+
+## 10. ACX endpoint spike
+
+**What this build is.** The same `crossc_bth.sys` is now also an ACX audio
+driver. Besides the L2CAP pipe it exposes one render endpoint, a **null
+sink**: Windows renders PCM into it, the driver consumes it in real time,
+counts it and throws it away. Nothing is sent to the buds yet. The question
+this answers is whether one KMDF driver on the buds' BTHENUM node can be the
+Bluetooth profile client and an ACX device at the same time, built from Rust.
+
+**Not tested live.** The package builds, is signed, passes InfVerif and the
+link checks, but this driver has never been loaded. A mistake in the ACX path
+can bugcheck the machine when the buds' node starts. Read "Recovery" below
+before installing, and save your work.
+
+### 10a. Before installing
+
+* Keep `C:\crossc-known-good` (the last package that is known to
+  work). Do not delete it.
+* Start DebugView as in section 6 (Capture Kernel, filter `crossc:`), so the
+  start sequence is on screen if something goes wrong.
+* Optional link check, no elevation, loads nothing:
+
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File drivers\crossc-bth\tools\acxcheck\check-image.ps1
+  ```
+
+  Expected: `[debug] OK: ACX bind info present, WdfMinimumVersionRequired from wdk-sys`.
+
+### 10b. Install
+
+```powershell
+.\tools\install-driver.ps1            # debug build + install (one UAC prompt)
+```
+
+It rebuilds, removes the staged crossc_bth package, stages the new one and
+installs it on the buds' node. The INF changed (KS/audio registration,
+`AddInterface` entries, device DACL), so a plain driver-file copy is not
+enough; use the script.
+
+### 10c. Expected result
+
+1. DebugView, roughly in this order (the `acx:` lines are new):
+
+   ```
+   crossc: DriverEntry v0.1.0
+   crossc: acx: driver initialized (ACX 1.1)
+   crossc: EvtDriverDeviceAdd
+   crossc: acx: device initialized
+   crossc: device added
+   crossc: acx: render circuit added
+   crossc: D0Entry
+   crossc: acx: circuit power up (from ...)
+   crossc: remote A0:B1:C2:D3:E4:F5 (flags 0x6) ...
+   ```
+
+2. **Settings > System > Sound > Output** lists a new playback device,
+   expected name **Headphones (Buds4 Pro)**. "Headphones" comes from the
+   bridge pin category, "Buds4 Pro" from the INF interface `FriendlyName`.
+   Which string Windows uses for the part in parentheses on a Bluetooth node
+   is not verified; if the name differs, report what it shows.
+3. Its properties (Sound settings > the device > Output settings > Format)
+   offer **24 bit, 48000 Hz** (default), **24 bit, 96000 Hz** and
+   **16 bit, 48000 Hz**. 24-bit is carried as 24 valid bits in a 32-bit
+   container.
+4. Select it and play anything. It is **silent** (null sink), the player's
+   progress bar advances at normal speed, and DebugView shows
+
+   ```
+   crossc: acx: stream created: 48000 Hz, 2 ch, 32-bit container, block 8 bytes
+   crossc: acx: 2 RT packet(s) of ... bytes (... bytes allocated each)
+   crossc: acx: stream prepared
+   crossc: acx: stream running
+   ```
+
+   and, when playback stops (the audio engine closes the stream a few seconds
+   after the last sound):
+
+   ```
+   crossc: acx: stream paused: 48000 Hz/32-bit, runs 1, packets N (M with signal), frames F
+   crossc: acx: stream paused: late passes .. (max .. us), timeline shifts 0, SetRenderPacket late 0 / overrun 0
+   crossc: acx: stream stopped: ...
+   crossc: acx: RT packets freed
+   ```
+
+   `packets` should be about 100 per second of playback (10 ms packets;
+   the audio engine chooses the size), `frames` about 48000 per second, and
+   `with signal` greater than 0 while something audible was playing. Switch
+   the format to 96 kHz and repeat: `frames` should be about 96000 per second.
+5. The pipe still works next to it. From an elevated prompt, with `$cli` as
+   in section 7:
+
+   ```powershell
+   & $cli probe
+   ```
+
+   must behave exactly as before (GET_INFO, AVDTP discovery, capabilities).
+   Run it once while audio is playing to the endpoint and once while it is
+   idle.
+6. Channels of a killed client are still closed. With ACX on the device,
+   Windows' driver framework no longer tells the driver when a pipe handle is
+   closed (found by reading the framework's code, not by a test), so the
+   driver now closes a dead handle's channels when the handle's file object
+   is destroyed instead. Check that this works:
+
+   ```powershell
+   & $cli play -v                            # window 1: wait until it streams
+   Stop-Process -Name crossc-cli -Force      # window 2 (elevated)
+   & $cli info                               # window 2
+   ```
+
+   Expected: `info` prints `channels   0/...`, and DebugView shows, right
+   after the kill, two `chN closing` lines and
+   `crossc: file close: closed 2 channel(s) left open by a handle`.
+   If `info` still counts channels, the hook did not fire: restart the node
+   (`pnputil /restart-device "$node"`) to free them, and report it.
+
+**Report back:** the DebugView log from node start to the end of one
+playback, the endpoint name, which formats are offered, the stats lines, the
+`probe` output and the result of step 6. If the endpoint does not appear,
+also the output of
+
+```powershell
+pnputil /enum-devices /instanceid "$node" /stack /interfaces
+```
+
+### 10d. Kill switch: `DisableAcx`
+
+The value `DisableAcx` (REG_DWORD, non-zero) turns the endpoint off and
+leaves the pipe. It is read in two places, and they are not equivalent:
+
+* **Whole driver** (service key): the driver makes no ACX call at all, and
+  the code that runs is the pre-ACX driver's. Use this one for recovery.
+* **Per device** (hardware key): the driver has already called
+  `AcxDriverInitialize` when it loaded; only the calls for that device are
+  skipped. A driver that is initialised for ACX but whose device is not is a
+  combination no Microsoft sample uses, so it is itself untested.
+
+Per device (the device's hardware key; `$node` from section 4):
+
+```powershell
+reg add "HKLM\SYSTEM\CurrentControlSet\Enum\$node\Device Parameters" /v DisableAcx /t REG_DWORD /d 1 /f
+pnputil /restart-device "$node"
+```
+
+Written out, the key is
+`HKLM\SYSTEM\CurrentControlSet\Enum\BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}_VID&00010075_PID&a013\<instance>\Device Parameters`,
+where `<instance>` is the only subkey there (it contains the buds' address).
+With it set, DebugView shows `acx: DisableAcx set in the device key - ACX off for this device`.
+
+Whole driver (fixed path, easiest to type in Safe Mode; also skips
+`AcxDriverInitialize` in DriverEntry). It is read when the driver loads, so
+restart the node afterwards:
+
+```powershell
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\crossc_bth\Parameters" /v DisableAcx /t REG_DWORD /d 1 /f
+pnputil /restart-device "$node"
+```
+
+With it set, DebugView shows `acx: DisableAcx set in the service Parameters key - ACX off`.
+
+To turn ACX back on, delete the value (`reg delete "<key>" /v DisableAcx /f`)
+and restart the node.
+
+Limits of both switches: neither can skip the class-extension *binding* the
+WDF loader does before DriverEntry (the image asks for ACX 1.1 at load), and
+the INF changes stay in place (the wider device DACL of 10g and the
+`AddInterface` entries). If the driver does not even load, go back to the
+known-good package.
+
+### 10e. Back to the known-good package
+
+```powershell
+.\tools\install-driver.ps1 -Uninstall
+pnputil /add-driver C:\crossc-known-good\debug-pkg\crossc_bth.inf /install
+```
+
+(elevated for the `pnputil` line). `-Uninstall` removes the spike package and
+the buds fall back to BthA2dp; the second line installs the known-good
+pipe-only driver again. Check with section 5c and `crossc-cli probe`.
+
+### 10f. Recovery if it bugchecks
+
+`crossc_bth` is demand-start: it loads when the buds' A2DP node starts, that
+is at boot or sign-in if the buds are paired and the node exists, and again
+whenever the node restarts. If the machine bugchecks in a loop:
+
+1. Take the buds out of range or keep them in the closed case, if that
+   lets Windows boot. It may not: the node of a paired device exists without
+   the buds being connected.
+2. Boot into **Safe Mode**: hold Shift while clicking Restart, or let two
+   boots fail to get the recovery menu, then Troubleshoot > Advanced options >
+   Startup Settings > Restart > 4. Safe Mode loads a minimal driver set
+   without the Bluetooth stack, so the node should not start and the driver
+   should stay unloaded (not verified on this machine).
+3. In Safe Mode, from an elevated prompt, do one of:
+
+   * Disable ACX and keep the driver:
+
+     ```powershell
+     reg add "HKLM\SYSTEM\CurrentControlSet\Services\crossc_bth\Parameters" /v DisableAcx /t REG_DWORD /d 1 /f
+     ```
+
+   * Or remove the package, which puts the buds back on BthA2dp:
+
+     ```powershell
+     pnputil /enum-drivers | Select-String -Context 1,6 crossc_bth.inf   # find its oemNN.inf
+     pnputil /delete-driver oemNN.inf /uninstall /force
+     ```
+
+4. Reboot normally. Then reinstall the known-good package (10e) if you
+   removed the driver.
+5. Keep `C:\Windows\MEMORY.DMP` or the newest file in `C:\Windows\Minidump`
+   and report the bugcheck code and the faulting module.
+
+If Safe Mode is not reachable, use the recovery environment's Command Prompt:
+load the offline SYSTEM hive (`reg load HKLM\OFF C:\Windows\System32\config\SYSTEM`),
+set `HKLM\OFF\ControlSet001\Services\crossc_bth\Start` to `4` (disabled),
+`reg unload HKLM\OFF`, reboot, then remove the package as above.
+
+### 10g. Known limits of the spike
+
+* **Access to the pipe is wider than before.** The audio stack must be able
+  to open the device, so the INF now gives the device object ACX's own DACL
+  (SYSTEM and Administrators full, LOCAL SERVICE and interactive users
+  read/write). The pipe interface is on the same device object, so a
+  non-elevated process of the logged-on user can now open L2CAP channels to
+  the buds. Accepted for the spike; to be closed afterwards.
+* **A dead client's channels are closed a little later than before.** With
+  ACX on they are closed when the handle's file object is destroyed, which
+  is after its last pending request has ended, not at the moment the handle
+  is closed. When a process dies Windows cancels its pending requests, so
+  this follows at once (step 6 of 10c checks it). A program that closes its
+  handle while one of its own READs is still waiting keeps its channels open
+  until that READ ends. `crossc-cli` is not affected: it sends CLOSE_CHANNEL
+  itself.
+* No hardware volume or mute: Windows applies the volume in software, which
+  is what the later encoder path wants.
+* The endpoint is always "connected", whether or not the buds are in range.
+* Windows refuses to disable, update or remove the device while a stream to
+  the endpoint is running. Stop playback first.
+
+---
+
+## 11. The service
+
+`crossc-service.exe` is the user-mode half of the audio path: it takes the PCM
+Windows renders into the driver's endpoint, encodes it as SSC and streams it
+to the buds. It needs a driver that speaks protocol v2 (the audio IOCTLs).
+With an older driver it logs that and keeps retrying every 10 s.
+
+```powershell
+cd C:\src\crossc
+cargo build --release -p crossc-service
+$svc = "C:\src\crossc\target\release\crossc-service.exe"
+```
+
+**Not tested against the real driver.** The session logic is tested against a
+fake driver and a fake sink only. Try it in the foreground (11a) before
+installing it as a service.
+
+What it does, per crossc device (one per paired pair of buds):
+
+1. Waits for the driver (protocol v2, ACX on) and attaches to it.
+2. Waits until Windows reports the buds connected. It never connects to them
+   by itself; take them out of the case or press Connect.
+3. Opens AVDTP, configures the SSC stream for the endpoint's format and
+   reports the link to the driver. Windows then shows the endpoint as plugged
+   in.
+4. Streams while audio plays. 3 s after the audio stops it suspends the
+   stream.
+5. When the buds go away it reports the link down (the endpoint shows as
+   unplugged) and waits for them to come back.
+
+### 11a. Foreground run (admin)
+
+```powershell
+& $svc run        # logs to this console; Ctrl+C stops it cleanly
+& $svc run -v     # the same with the debug log (every AVDTP packet)
+```
+
+Stop the installed service first if there is one: the driver accepts one
+session at a time, and the second one logs that `AUDIO_ATTACH` failed and
+keeps retrying. `--for SECONDS` makes it stop by itself. A typical start:
+
+```
+... INFO  [AABBCCDDEEFF] attached: driver x.y.z (protocol v2), buds AA:BB:CC:DD:EE:FF
+... INFO  [AABBCCDDEEFF] state wait-driver -> wait-link
+... INFO  [AABBCCDDEEFF] the buds are connected
+... INFO  [AABBCCDDEEFF] SSC SEP 0x03: caps 0x3e [...], Delay Reporting
+... INFO  [AABBCCDDEEFF] link up: HiFi 48 kHz/24: config 0x0c, 192 kbps, ...
+... INFO  [AABBCCDDEEFF] state wait-link -> ready
+... INFO  [AABBCCDDEEFF] state ready -> streaming
+```
+
+### 11b. Install, status, uninstall (admin)
+
+```powershell
+& $svc install            # register the service "crossc" (auto-start, LocalSystem)
+& $svc install --start    # the same, and start it now
+& $svc status             # no admin needed for the service line
+& $svc uninstall          # stop and remove it
+```
+
+`install` registers `"<path>\crossc-service.exe" service` under the name
+`crossc` ("crossc SSC audio service"), restarted by Windows 5 s, 30 s and then
+60 s after a failure. Run it again after moving or rebuilding the executable:
+it updates the existing registration. A running service keeps its old
+executable until it is restarted (`Restart-Service crossc`). `uninstall`
+succeeds when the service is not installed.
+
+`status` prints whether the service is installed and running, and for every
+crossc device the driver version, the endpoint and stream state, and whether
+Windows reports the buds connected. The device lines need an elevated prompt.
+
+The service stops its sessions when the machine goes to sleep and starts them
+again on resume.
+
+### 11c. Log
+
+`C:\ProgramData\crossc\service.log`, rotated at 1 MB (`service.log.1`,
+`service.log.2`; three files at most). It has every state change, the
+configuration chosen, the buds' delay reports, statistics once a minute while
+streaming (packets, frames the driver dropped, discontinuities, WRITE
+latency), and each error once a minute at most.
+
+```powershell
+Get-Content C:\ProgramData\crossc\service.log -Tail 40 -Wait
+```
+
+### 11d. Settings
+
+Optional values under `HKLM\SOFTWARE\crossc`, read when the service starts:
+
+| Value | Type | Default | Meaning |
+|---|---|---|---|
+| `UhqConfig` | DWORD | `0x0A` | SSC configuration octet sent for UHQ 96 kHz. `0x0E` is what another implementation sends. |
+| `HifiBitrate` | DWORD | `192` | HiFi 48 kHz bitrate in kbps: 88, 96, 128, 192, 229, 256 or 328. |
+| `UhqBitrate` | DWORD | `584` | UHQ bitrate in kbps: 152, 250, 291, 308, 442 or 584. |
+| `LogLevel` | DWORD | `2` | 0 error, 1 warn, 2 info, 3 debug. |
+
+```powershell
+reg add "HKLM\SOFTWARE\crossc" /v LogLevel /t REG_DWORD /d 3 /f
+Restart-Service crossc
+```
+
+A value that is not valid is ignored with a warning in the log. Which mode is
+sent for which endpoint format is the table in `docs/DESIGN.md`; buds that
+offer neither HiFi nor UHQ get plain SSC at 229 kbps.
+
+---
+
+## 12. Audio path live test
+
+**What this build adds to the driver.** The endpoint of section 10 is no
+longer a null sink: the driver copies what Windows renders into a 250 ms
+buffer (the PCM tap) and hands it to `crossc-service` through the audio
+IOCTLs of protocol v2. The endpoint has a jack that follows the service's
+link flag, so it shows as unplugged until the service has an SSC stream to
+the buds. Every crossc IOCTL except `GET_INFO` now requires an elevated
+caller. The playback device is named after the buds' Bluetooth name.
+
+Where this section and an earlier one disagree, this one is current:
+
+* **Section 10:** the device name (10c step 2), "the endpoint is always
+  connected", and the pipe being open to non-elevated processes (10g).
+* **5b:** the driver to pick in Device Manager is now called
+  **Galaxy Buds (crossc SSC audio)**, not "crossc A2DP sink (spike)".
+* **7a and the "MTU check" paragraph of section 9:** the MTU mapping is no
+  longer the one described there. The live runs showed the two fields
+  swapped, and the driver now reports `out_mtu = InResults.Params.Mtu` (what
+  the buds accept) and `in_mtu = OutResults.Params.Mtu`. That changes the two
+  numbers in the `OPEN_CHANNEL` reply and the length limit of `WRITE`, which
+  is checked against `out_mtu`. The two-opens experiment of 7a is still the
+  way to confirm it, and has not been re-run on this build: `in_mtu` must now
+  follow the value that was requested.
+
+**Not tested live.** Like the ACX part of section 10, none of this has been
+loaded. It builds, is signed, passes InfVerif, clippy and the image check, and
+the buffer and session logic passes its unit tests on the host
+(`cd drivers\crossc-bth\host-tests; cargo test`). A mistake in the kernel part
+can still bugcheck the machine. Read 10f (recovery) first, keep
+`C:\crossc-known-good`, save your work.
+
+Both `DisableAcx` switches of 10d still work. With ACX off, `GET_STATE` still
+succeeds and returns a state without the ACX flag; every other audio IOCTL
+fails with "not supported". `crossc-service` reads that state, logs "the
+driver's audio endpoint is off (ACX disabled)" and waits for a driver with
+ACX. The pipe works as before.
+
+### 12a. Turn Driver Verifier on for this driver (admin, reboot)
+
+Driver Verifier makes Windows check every call the driver makes (IRQL, pool,
+locks, I/O, the WDF rules). A violation becomes an immediate bugcheck that
+names the rule, instead of a corruption that shows up later somewhere else.
+Use it for this whole test.
+
+```powershell
+verifier /standard /driver crossc_bth.sys
+shutdown /r /t 0
+```
+
+After the reboot, check:
+
+```powershell
+verifier /querysettings      # lists crossc_bth.sys and the standard flags
+```
+
+While it is on, the driver runs slower; short audio glitches under Verifier
+are not a finding by themselves.
+
+If the machine bugchecks at boot with Verifier on: Safe Mode (10f step 2),
+then `verifier /reset` and reboot. Verifier settings can also be told to
+drop themselves after a failed boot; if `verifier /?` on this build lists
+`/bootmode`, run `verifier /bootmode resetonbootfail` after the first command
+and before the reboot.
+
+Turn it off when the test is done (12d).
+
+### 12b. Install
+
+```powershell
+.\tools\install-driver.ps1            # debug build + install (one UAC prompt)
+```
+
+The INF changed again (device description `Galaxy Buds (crossc SSC audio)`),
+so use the script, not a file copy. Have DebugView running as in section 6.
+New lines at node start, compared with 10c:
+
+```
+crossc: acx: render circuit added (jack: unplugged until a service sets the link)
+crossc: remote A0:B1:C2:D3:E4:F5 (flags 0x6) devinfo flags=0x.. cod=0x......
+crossc: friendly name set from the Bluetooth name (N UTF-16 units): 0x0
+```
+
+Build the service and the CLI as well:
+
+```powershell
+cargo build --release -p crossc-service -p crossc-cli
+$svc = "C:\src\crossc\target\release\crossc-service.exe"
+$cli = "C:\src\crossc\target\release\crossc-cli.exe"
+```
+
+### 12c. Tests, in this order
+
+Stop after the first step that fails and report it; later steps build on the
+earlier ones. Keep the service **stopped** until step 3
+(`Stop-Service crossc` if it is installed).
+
+1. **The endpoint exists and is unplugged.** No service is running, so the
+   jack reports "not connected".
+   * Settings > System > Sound > Output does **not** offer the buds.
+   * `mmsys.cpl` > Playback > right-click > tick **Show Disconnected
+     Devices**: there is **Headphones (*the buds' Bluetooth name*)**, marked
+     **Not plugged in**. Write down the exact name. If it reads
+     `Headphones (Galaxy Buds (crossc SSC audio))` or anything else, restart
+     the node once (`pnputil /restart-device "$node"`) and look again: the
+     name is stored at the first start and may only be picked up at the
+     second. Report what both starts showed.
+
+2. **The admin gate.** From a PowerShell that is **not** elevated:
+
+   ```powershell
+   & $cli info        # works: GET_INFO needs no elevation
+   & $cli probe       # must fail with "Access is denied" (error 5)
+   ```
+
+   From an elevated one, `& $cli probe` must work as in section 7. Run it now:
+   it also shows that the pipe survived the changes. If the non-elevated
+   `probe` is *not* denied, stop and report it.
+
+3. **The service attaches and the endpoint becomes available** (elevated;
+   buds out of the case and connected to this PC):
+
+   ```powershell
+   & $svc run -v
+   ```
+
+   Expected in its log: `attached: driver ... (protocol v2)`, then
+   `link up: ...`. DebugView:
+
+   ```
+   crossc: audio: session attached
+   crossc: chN open ...                 (signaling, then media)
+   crossc: audio: link up
+   ```
+
+   Within a second or two the device of step 1 loses "Not plugged in" and
+   appears in Settings > Sound > Output. If the service logs `link up` but
+   Windows still shows "Not plugged in", report that (it would mean the jack
+   notification did not reach Windows).
+
+4. **Sound at 48 kHz / 24 bit.** Select the device as output; its format
+   (device > Output settings > Format) should be **24 bit, 48000 Hz**. Play
+   music. Expected: sound in the buds. DebugView:
+
+   ```
+   crossc: acx: stream created: 48000 Hz, 2 ch, 24 valid bits in 32-bit containers, block 8 bytes, tap true
+   crossc: acx: stream prepared (tap ring 96000 bytes)
+   crossc: acx: stream running
+   ```
+
+   Play for a minute, pause the player and wait until the stream pauses
+   (a few seconds). DebugView then prints the statistics, among them
+
+   ```
+   crossc: acx: tap (device totals): rendered R frames, dropped D, silence for stale packets S (P packets of this stream), attached true, link true
+   ```
+
+   `R` grows by about 48000 per second of playback. `D` should not grow
+   while the service is streaming (frames rendered before the service
+   attached count as dropped, so note `D` before and after). `S` and `P`
+   should be 0; a few after a visible stall are harmless. Note the service's
+   own statistics line too (frames the driver dropped, discontinuities).
+   Listen for clicks, repeats or drift over a few minutes.
+
+5. **Switch to 96 kHz / 24 bit.** Stop playback, set Format to **24 bit,
+   96000 Hz**, play again. Expected: the service log shows it reconfigure to
+   UHQ (if the buds offer it; otherwise it resamples), sound continues,
+   DebugView shows a new stream with `96000 Hz` and `tap ring 192000 bytes`.
+   Switch back to 48 kHz once and play again.
+
+6. **Stopping the service unplugs the device.** While music plays, press
+   Ctrl+C in the service window. Expected, DebugView:
+
+   ```
+   crossc: chN closing ...
+   crossc: audio: session detached (ATTACH cancelled or its handle closed): link was true, N channel(s) closed
+   ```
+
+   (`N` is 0 if the service closed its channels itself first, and `link
+   was false` if it also reported the link down first; both are fine.) The
+   device shows **Not plugged in** again and Windows moves the sound to
+   another output. `& $cli info` (elevated) shows no open channels.
+
+7. **A killed service is cleaned up too.** Start `& $svc run -v` again, play
+   music, then from a second elevated prompt:
+
+   ```powershell
+   Stop-Process -Name crossc-service -Force
+   & $cli info
+   ```
+
+   Expected: the same `session detached` line, the device unplugged,
+   `info` reporting no open channels. If the device stays available after
+   the service is gone, report it (then `pnputil /restart-device "$node"`
+   puts it right).
+
+8. **Buds in the case.** Start the service again and wait for `link up`. Put
+   both buds into the case and close it. Expected: the service logs the link
+   going down, DebugView shows `crossc: audio: link down`, the device shows
+   **Not plugged in**. Take the buds out: once Windows reports them
+   connected, the service brings the link up and the device is available
+   again.
+
+9. **Installed service.** `& $svc install --start`, then repeat steps 4 and 8
+   once with the service running as LocalSystem. Reboot once with the buds in
+   the case, sign in, take them out: the device must become available
+   without touching anything.
+
+10. **Sleep.** With music playing, put the PC to sleep and wake it. Expected
+    before sleep, in DebugView, one `session detached` line. Which one
+    depends on who is faster, and both are correct:
+
+    ```
+    crossc: audio: session detached (ATTACH cancelled or its handle closed): ...
+    crossc: audio: session detached (D0Exit): ...
+    ```
+
+    The installed service (step 9) is told about the suspend and closes its
+    session itself, which gives the first line; the driver then has nothing
+    left to detach when it powers down. If the driver powers down first, or
+    the service runs in the foreground (`run` does not listen for power
+    events), the driver ends the session, which gives the second line. After
+    resume: a new `session attached`, and sound again once the buds have
+    reconnected. A failure is: no `session detached` line at all, or no new
+    `session attached` after resume.
+
+### 12d. Afterwards
+
+Turn Driver Verifier off:
+
+```powershell
+verifier /reset
+shutdown /r /t 0
+```
+
+**What to send back:**
+
+* the DebugView log from node start to the end of the tests (File > Save);
+* `C:\ProgramData\crossc\service.log` (or the console output of `run -v`);
+* the device name Windows showed, at the first and at the second start;
+* for each of the ten steps: passed, or what happened instead;
+* the statistics lines of step 4 at 48 kHz and of step 5 at 96 kHz;
+* the output of the non-elevated `& $cli info` and `& $cli probe`;
+* if anything bugchecked: the stop code and its four parameters (for
+  Verifier stops `0xC4` / `0xC9` / `0x10D` the first parameter names the
+  rule), the faulting module, and the newest file in `C:\Windows\Minidump`
+  or `C:\Windows\MEMORY.DMP`, and whether Driver Verifier was on.
+
+### 12e. What the driver does that the contract text does not say
+
+The contract (`crates\crossc-ioctl`) is frozen for this build. The driver
+keeps every rule in it; these points go beyond its wording, and a client
+written from the text alone would not expect them:
+
+* **Who may open the device.** The contract says the INF limits the device to
+  SYSTEM and Administrators. ACX needs the device to be openable by Local
+  Service and by interactive users, so the INF allows that, and any
+  logged-on user can open it and call `GET_INFO`. Every other IOCTL is
+  refused by the driver itself unless the caller is elevated (step 2 of 12c).
+* **"Not supported".** While the endpoint does not exist (ACX off), every
+  audio IOCTL except `GET_STATE` fails with `STATUS_NOT_SUPPORTED`.
+* **ATTACH also ends on sleep and removal.** The pending `ATTACH` completes
+  with `STATUS_CANCELLED` when the device leaves D0 or is removed, not only
+  when it is cancelled or its handle is closed. The session is over then; the
+  client attaches again after resume.
+* **`READ_PCM` can fail late.** A `READ_PCM` accepted while no stream existed
+  is checked against the smallest possible frame. If the stream that then
+  starts has larger frames than the buffer holds, the pending request
+  completes with `STATUS_BUFFER_TOO_SMALL`. A buffer of `PCM_READ_BUFFER`
+  bytes never runs into this.
+* **`frames_rendered`** (and `frames_dropped`) count since the driver's
+  device object for the node was created, not since the driver was loaded.
+  They keep counting across sleep and resume; restarting the node
+  (`pnputil /restart-device`) or pairing the buds again sets them back to 0.
+* **"Busy"** is `STATUS_DEVICE_BUSY`, which user mode sees as
+  `ERROR_BUSY` (170).

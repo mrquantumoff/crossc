@@ -1,0 +1,1653 @@
+//! ACX (Audio Class eXtension) render endpoint.
+//!
+//! The same KMDF device that is the Bluetooth profile client (L2CAP pipe, see
+//! `lib.rs`) is also an ACX device with one render circuit, "Headphones0".
+//! The audio engine renders PCM into it; the stream engine here consumes the
+//! packets in real time (timer-driven position + packet-complete
+//! notifications) and copies each finished packet into the PCM tap
+//! (`audio.rs`), from where the user-mode service reads it and encodes it.
+//! With no service attached the audio is counted and dropped.
+//!
+//! The endpoint's jack reports the link flag the service sets (SET_LINK), so
+//! Windows shows the device as unplugged while the buds are away or no
+//! service is attached.
+//!
+//! Modelled on microsoft/Windows-driver-samples `audio/Acx/Samples`
+//! (AudioCodec: `Device.cpp`, `RenderCircuit.cpp`, `StreamEngine.cpp`), minus
+//! the volume/mute elements (so Windows applies software volume) and the
+//! S0-idle policy (D0Exit closes every L2CAP channel).
+//!
+//! # How ACX is called from Rust
+//! ACX is a KMDF class extension. Every DDI is an entry of the function table
+//! `AcxFunctions`, which lives *in this image* (`acxstub.lib`, data only) and
+//! is filled by the WDF loader before `DriverEntry` through `_Acx_BIND_INFO`
+//! in section `.kmdfclassbind$b` (walked by `WdfDriverEntry.lib`). The C
+//! headers wrap each entry in a `FORCEINLINE`; the [`acx!`] macro is the same
+//! thing: index the table with the bindgen `_ACXFUNCENUM` constant, cast to
+//! the bindgen `PFN_ACX*` type, pass `AcxDriverGlobals` first.
+//! Types come from bindgen over `acx.h` (build.rs, with clang's layout
+//! asserts); the `*_INIT` helpers, GUIDs and the KS wave-format struct are
+//! hand-written here and checked against cl.exe (`tools/acxcheck`).
+//!
+//! # Kill switch
+//! `DisableAcx` (REG_DWORD, non-zero) is read in two places:
+//! * `HKLM\SYSTEM\CurrentControlSet\Services\crossc_bth\Parameters` (whole
+//!   driver): no ACX call is made at all, not even `AcxDriverInitialize`. The
+//!   code that runs is the pre-ACX driver's. This is the recovery switch.
+//! * the device's hardware key (`...\Enum\<instance>\Device Parameters`):
+//!   every device-level ACX call is skipped for that device, but
+//!   `AcxDriverInitialize` has already run in `DriverEntry`. An
+//!   ACX-initialised driver with a non-ACX device is a combination no sample
+//!   exercises (untested).
+//!
+//! Neither can skip the class-extension *binding* done by the loader before
+//! `DriverEntry`, and neither undoes the INF changes.
+//!
+//! # Failure policy
+//! * `AcxDriverInitialize` fails -> ACX off for the driver, pipe unaffected.
+//! * `AcxDeviceInitInitialize` / `AcxDeviceInitialize` fail -> DeviceAdd fails
+//!   (the WDFDEVICE_INIT has already been modified by ACX).
+//! * Anything circuit-level fails -> logged, no endpoint, pipe unaffected.
+
+use core::mem::{offset_of, size_of, zeroed};
+use core::ptr::{addr_of_mut, null_mut};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+use crossc_ioctl::audio::PcmFormat;
+
+use wdk_sys::ntddk::{
+    ExAllocatePool2, ExFreePool, IoAllocateMdl, IoFreeMdl, KeFlushQueuedDpcs, KeQueryPerformanceCounter,
+    MmBuildMdlForNonPagedPool,
+};
+use wdk_sys::*;
+
+use crate::audio_core::ring_bytes;
+use crate::{CtxInfo, DeviceContext, attributes, audio, nt_success, trace};
+use sys::*;
+
+/// bindgen output for `acx.h` (ACX 1.1). Referenced WDF/NT types resolve to
+/// the wdk-sys definitions.
+#[allow(
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    dead_code,
+    unused_imports,
+    missing_docs,
+    unnecessary_transmutes,
+    clippy::all
+)]
+pub mod sys {
+    use wdk_sys::*;
+
+    include!(concat!(env!("OUT_DIR"), "/acx.rs"));
+}
+
+/// `acx.h`: `__declspec(selectany) ULONG AcxMinimumVersionRequired =
+/// ACX_MINIMUM_VERSION_REQUIRED;` - the client must define it; `acxstub.lib`'s
+/// `_Acx_BIND_INFO` points at it. Equals the ACX minor we build against
+/// (build.rs `ACX_VERSION`), so the driver does not load on an older ACX and
+/// plain `size_of` is the right `ACX_STRUCTURE_SIZE`.
+#[unsafe(no_mangle)]
+pub static mut AcxMinimumVersionRequired: ULONG = 1;
+
+/// Calls an ACX DDI through the in-image function table, exactly like the
+/// `FORCEINLINE` wrappers in the ACX headers.
+///
+/// SAFETY (caller): [`ACX_READY`] is true (the table was bound and
+/// `AcxDriverInitialize` succeeded), or the call is `AcxDriverInitialize`
+/// itself after [`table_bound`].
+macro_rules! acx {
+    ($index:ident, $pfn:ident $(, $arg:expr)* $(,)?) => {{
+        let entry: ACXFUNC = (&raw const AcxFunctions).cast::<ACXFUNC>().add(_ACXFUNCENUM::$index as usize).read();
+        let f = core::mem::transmute::<ACXFUNC, $pfn>(entry);
+        (f.unwrap_unchecked())(AcxDriverGlobals $(, $arg)*)
+    }};
+}
+
+/// Set once by [`driver_init`]; never cleared.
+static ACX_READY: AtomicBool = AtomicBool::new(false);
+
+const POOL_TAG: ULONG = u32::from_le_bytes(*b"xAcC");
+const HNS_PER_SEC: u64 = 10_000_000;
+/// ACX asks for at most two RT packets (ping-pong); same limit as the sample.
+const MAX_PACKETS: usize = 2;
+/// Late timer passes processed back to back before the stream timeline is
+/// shifted instead (the sample recurses without a bound).
+const MAX_CATCH_UP: u32 = 4;
+/// Packets of one timer pass that can hold audio: the one that just
+/// finished, and the next if the pass is a whole packet late. The audio
+/// engine writes packet N+1 only after it was told that packet N-1
+/// completed, so a third packet in the same pass cannot have been written.
+const FRESH_PACKETS_PER_PASS: u32 = 2;
+
+// ---------------------------------------------------------------------------
+// Constants bindgen cannot produce (DEFINE_GUID / macros). tools/acxcheck.
+// ---------------------------------------------------------------------------
+
+const fn guid(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> GUID {
+    GUID { Data1: d1, Data2: d2, Data3: d3, Data4: d4 }
+}
+
+/// ksmedia.h `KSCATEGORY_AUDIO` {6994AD04-93EF-11D0-A3CC-00A0C9223196}
+static KSCATEGORY_AUDIO: GUID = guid(0x6994_AD04, 0x93EF, 0x11D0, [0xA3, 0xCC, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96]);
+/// ksmedia.h `KSNODETYPE_HEADPHONES` {DFF21CE2-F70F-11D0-B917-00A0C9223196}
+static KSNODETYPE_HEADPHONES: GUID =
+    guid(0xDFF2_1CE2, 0xF70F, 0x11D0, [0xB9, 0x17, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96]);
+/// ksmedia.h `KSDATAFORMAT_TYPE_AUDIO` {73647561-0000-0010-8000-00AA00389B71}
+const KSDATAFORMAT_TYPE_AUDIO: GUID = guid(0x7364_7561, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71]);
+/// ksmedia.h `KSDATAFORMAT_SUBTYPE_PCM` {00000001-0000-0010-8000-00AA00389B71}
+const KSDATAFORMAT_SUBTYPE_PCM: GUID =
+    guid(0x0000_0001, 0x0000, 0x0010, [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71]);
+/// ksmedia.h `KSDATAFORMAT_SPECIFIER_WAVEFORMATEX` {05589F81-C356-11CE-BF01-00AA0055595A}
+const KSDATAFORMAT_SPECIFIER_WAVEFORMATEX: GUID =
+    guid(0x0558_9F81, 0xC356, 0x11CE, [0xBF, 0x01, 0x00, 0xAA, 0x00, 0x55, 0x59, 0x5A]);
+/// Vendor component id of the render circuit {871EEB92-ABB3-43B1-9E2F-4C2206CC0CCF}.
+static RENDER_COMPONENT_ID: GUID = guid(0x871E_EB92, 0xABB3, 0x43B1, [0x9E, 0x2F, 0x4C, 0x22, 0x06, 0xCC, 0x0C, 0xCF]);
+
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+const SPEAKER_FRONT_LEFT: u32 = 0x1;
+const SPEAKER_FRONT_RIGHT: u32 = 0x2;
+const KSAUDIO_SPEAKER_STEREO: u32 = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+/// acxpin.h `AcxPinIdDefault` / `AcxJackPropertiesIdDefault`.
+const ACX_ID_DEFAULT: ULONG = u32::MAX;
+/// acxpin.h `AcxInstanceIndeterminate`.
+const ACX_INSTANCE_INDETERMINATE: ULONG = u32::MAX;
+
+const fn utf16<const N: usize>(s: &str) -> [u16; N] {
+    let b = s.as_bytes();
+    assert!(b.len() == N);
+    let mut out = [0u16; N];
+    let mut i = 0;
+    while i < N {
+        assert!(b[i] < 0x80);
+        out[i] = b[i] as u16;
+        i += 1;
+    }
+    out
+}
+
+/// Circuit name. MUST equal the `AddInterface` reference string
+/// (`KSNAME_Headphones`) in crossc_bth.inx.
+static CIRCUIT_NAME: [u16; 11] = utf16("Headphones0");
+/// Static like the sample's `DECLARE_CONST_UNICODE_STRING`, so it does not
+/// matter whether ACX copies the string or keeps the pointer.
+#[repr(transparent)]
+struct StaticUnicode(UNICODE_STRING);
+// SAFETY: immutable, points at an immutable static.
+unsafe impl Sync for StaticUnicode {}
+static CIRCUIT_NAME_US: StaticUnicode = StaticUnicode(UNICODE_STRING {
+    Length: (CIRCUIT_NAME.len() * 2) as u16,
+    MaximumLength: (CIRCUIT_NAME.len() * 2) as u16,
+    Buffer: CIRCUIT_NAME.as_ptr().cast_mut(),
+});
+static DISABLE_ACX_VALUE: [u16; 10] = utf16("DisableAcx");
+
+fn unicode(s: &'static [u16]) -> UNICODE_STRING {
+    UNICODE_STRING {
+        Length: (s.len() * 2) as u16,
+        MaximumLength: (s.len() * 2) as u16,
+        Buffer: s.as_ptr().cast_mut(),
+    }
+}
+
+/// ksmedia.h `KSDATAFORMAT_WAVEFORMATEXTENSIBLE`, flattened: `KSDATAFORMAT`
+/// (64 bytes) followed by `WAVEFORMATEXTENSIBLE` (40 bytes, 1-packed in C;
+/// every field sits on its natural alignment at these offsets, so plain
+/// `repr(C)` gives the identical layout).
+#[repr(C)]
+struct KsWaveFormatExtensible {
+    // KSDATAFORMAT
+    format_size: u32,
+    flags: u32,
+    sample_size: u32,
+    reserved: u32,
+    major_format: GUID,
+    sub_format: GUID,
+    specifier: GUID,
+    // WAVEFORMATEX
+    format_tag: u16,
+    channels: u16,
+    samples_per_sec: u32,
+    avg_bytes_per_sec: u32,
+    block_align: u16,
+    bits_per_sample: u16,
+    cb_size: u16,
+    // WAVEFORMATEXTENSIBLE
+    valid_bits_per_sample: u16,
+    channel_mask: u32,
+    wave_sub_format: GUID,
+}
+
+/// Stereo PCM, same initialiser as the sample's `Inc/AudioFormats.h`.
+const fn pcm_stereo(rate: u32, container_bits: u16, valid_bits: u16) -> KsWaveFormatExtensible {
+    let block_align = 2 * container_bits / 8;
+    KsWaveFormatExtensible {
+        format_size: size_of::<KsWaveFormatExtensible>() as u32,
+        flags: 0,
+        sample_size: 0,
+        reserved: 0,
+        major_format: KSDATAFORMAT_TYPE_AUDIO,
+        sub_format: KSDATAFORMAT_SUBTYPE_PCM,
+        specifier: KSDATAFORMAT_SPECIFIER_WAVEFORMATEX,
+        format_tag: WAVE_FORMAT_EXTENSIBLE,
+        channels: 2,
+        samples_per_sec: rate,
+        avg_bytes_per_sec: rate * block_align as u32,
+        block_align,
+        bits_per_sample: container_bits,
+        cb_size: 22, // sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
+        valid_bits_per_sample: valid_bits,
+        channel_mask: KSAUDIO_SPEAKER_STEREO,
+        wave_sub_format: KSDATAFORMAT_SUBTYPE_PCM,
+    }
+}
+
+/// Formats offered on the host pin (RAW mode list). Index 0 is the default.
+/// 24-bit is offered as 24 valid bits in a 32-bit container, the layout the
+/// sample (`Pcm48000c2_24in32`) and HD Audio use; packed 3-byte samples are
+/// not offered.
+static FORMATS: [KsWaveFormatExtensible; 3] = [
+    pcm_stereo(48_000, 32, 24), // HiFi
+    pcm_stereo(96_000, 32, 24), // UHQ
+    pcm_stereo(48_000, 16, 16), // fallback
+];
+
+// ---- layout / constants, mirrored from tools/acxcheck/msvc-layout.txt ------
+const _: () = {
+    assert!(_ACXFUNCENUM::AcxFunctionTableNumEntries == 221);
+    assert!(_ACXFUNCENUM::AcxCircuitInitAllocateTableIndex == 0);
+    assert!(_ACXFUNCENUM::AcxCircuitInitFreeTableIndex == 1);
+    assert!(_ACXFUNCENUM::AcxCircuitInitSetComponentIdTableIndex == 2);
+    assert!(_ACXFUNCENUM::AcxCircuitInitAssignNameTableIndex == 4);
+    assert!(_ACXFUNCENUM::AcxCircuitInitSetCircuitTypeTableIndex == 6);
+    assert!(_ACXFUNCENUM::AcxCircuitInitSetAcxCircuitPnpPowerCallbacksTableIndex == 9);
+    assert!(_ACXFUNCENUM::AcxCircuitInitAssignAcxCreateStreamCallbackTableIndex == 12);
+    assert!(_ACXFUNCENUM::AcxCircuitCreateTableIndex == 14);
+    assert!(_ACXFUNCENUM::AcxCircuitAddPinsTableIndex == 20);
+    assert!(_ACXFUNCENUM::AcxDataFormatCreateTableIndex == 39);
+    assert!(_ACXFUNCENUM::AcxDataFormatGetChannelsCountTableIndex == 43);
+    assert!(_ACXFUNCENUM::AcxDataFormatGetSampleRateTableIndex == 50);
+    assert!(_ACXFUNCENUM::AcxDataFormatGetBitsPerSampleTableIndex == 46);
+    assert!(_ACXFUNCENUM::AcxDataFormatGetBlockAlignTableIndex == 49);
+    assert!(_ACXFUNCENUM::AcxDataFormatGetAverageBytesPerSecTableIndex == 51);
+    assert!(_ACXFUNCENUM::AcxDataFormatListAddDataFormatTableIndex == 61);
+    assert!(_ACXFUNCENUM::AcxDataFormatListAssignDefaultDataFormatTableIndex == 63);
+    assert!(_ACXFUNCENUM::AcxDeviceInitInitializeTableIndex == 68);
+    assert!(_ACXFUNCENUM::AcxDeviceInitializeTableIndex == 69);
+    assert!(_ACXFUNCENUM::AcxDeviceAddCircuitTableIndex == 70);
+    assert!(_ACXFUNCENUM::AcxDeviceRemoveCircuitTableIndex == 71);
+    assert!(_ACXFUNCENUM::AcxDriverInitializeTableIndex == 78);
+    assert!(_ACXFUNCENUM::AcxPinCreateTableIndex == 137);
+    assert!(_ACXFUNCENUM::AcxPinAddJacksTableIndex == 139);
+    assert!(_ACXFUNCENUM::AcxPinGetRawDataFormatListTableIndex == 142);
+    assert!(_ACXFUNCENUM::AcxJackCreateTableIndex == 149);
+    assert!(_ACXFUNCENUM::AcxJackChangeStateNotificationTableIndex == 150);
+    assert!(_ACXFUNCENUM::AcxDataFormatGetValidBitsPerSampleTableIndex == 47);
+    assert!(_ACXFUNCENUM::AcxStreamInitAssignAcxStreamCallbacksTableIndex == 157);
+    assert!(_ACXFUNCENUM::AcxStreamInitAssignAcxRtStreamCallbacksTableIndex == 158);
+    assert!(_ACXFUNCENUM::AcxStreamInitSetAcxRtStreamSupportsNotificationsTableIndex == 159);
+    assert!(_ACXFUNCENUM::AcxRtStreamCreateTableIndex == 169);
+    assert!(_ACXFUNCENUM::AcxRtStreamNotifyPacketCompleteTableIndex == 170);
+
+    assert!(size_of::<ACXFUNC>() == 8);
+    assert!(size_of::<ACX_DRIVER_CONFIG>() == 8);
+    assert!(size_of::<ACX_DEVICEINIT_CONFIG>() == 48);
+    assert!(offset_of!(ACX_DEVICEINIT_CONFIG, SynchronizationScope) == 8);
+    assert!(offset_of!(ACX_DEVICEINIT_CONFIG, ExecutionLevel) == 12);
+    assert!(size_of::<ACX_DEVICE_CONFIG>() == 40);
+    assert!(size_of::<ACX_CIRCUIT_PNPPOWER_CALLBACKS>() == 40);
+    assert!(offset_of!(ACX_CIRCUIT_PNPPOWER_CALLBACKS, EvtAcxCircuitPowerUp) == 24);
+    assert!(offset_of!(ACX_CIRCUIT_PNPPOWER_CALLBACKS, EvtAcxCircuitPowerDown) == 32);
+    assert!(size_of::<ACX_PIN_CALLBACKS>() == 64);
+    assert!(offset_of!(ACX_PIN_CALLBACKS, EvtAcxPinSetDataFormat) == 8);
+    assert!(size_of::<ACX_PIN_CONFIG>() == 88);
+    assert!(offset_of!(ACX_PIN_CONFIG, Flags) == 4);
+    assert!(offset_of!(ACX_PIN_CONFIG, Id) == 8);
+    assert!(offset_of!(ACX_PIN_CONFIG, Type) == 12);
+    assert!(offset_of!(ACX_PIN_CONFIG, Communication) == 16);
+    assert!(offset_of!(ACX_PIN_CONFIG, Category) == 24);
+    assert!(offset_of!(ACX_PIN_CONFIG, PinCallbacks) == 40);
+    assert!(offset_of!(ACX_PIN_CONFIG, MaxStreams) == 80);
+    assert!(size_of::<ACX_JACK_CONFIG>() == 48);
+    assert!(offset_of!(ACX_JACK_CONFIG, Id) == 4);
+    assert!(offset_of!(ACX_JACK_CONFIG, Flags) == 8);
+    assert!(offset_of!(ACX_JACK_CONFIG, Callbacks) == 16);
+    assert!(offset_of!(ACX_JACK_CONFIG, Description) == 24);
+    assert!(size_of::<ACX_JACK_CALLBACKS>() == 16);
+    assert!(offset_of!(ACX_JACK_CALLBACKS, EvtAcxJackRetrievePresenceState) == 8);
+    assert!(_ACX_JACK_CONFIG_FLAGS::AcxJackConfigJackDetection == 1);
+    assert!(size_of::<ACX_JACK_DESCRIPTION>() == 24);
+    assert!(offset_of!(ACX_JACK_DESCRIPTION, ConnectionType) == 8);
+    assert!(offset_of!(ACX_JACK_DESCRIPTION, PortConnection) == 20);
+    assert!(size_of::<ACX_DATAFORMAT_CONFIG>() == 24);
+    assert!(offset_of!(ACX_DATAFORMAT_CONFIG, Type) == 8);
+    assert!(offset_of!(ACX_DATAFORMAT_CONFIG, u) == 16);
+    assert!(size_of::<ACX_STREAM_CALLBACKS>() == 48);
+    assert!(offset_of!(ACX_STREAM_CALLBACKS, EvtAcxStreamPrepareHardware) == 8);
+    assert!(offset_of!(ACX_STREAM_CALLBACKS, EvtAcxStreamReleaseHardware) == 16);
+    assert!(offset_of!(ACX_STREAM_CALLBACKS, EvtAcxStreamRun) == 24);
+    assert!(offset_of!(ACX_STREAM_CALLBACKS, EvtAcxStreamPause) == 32);
+    assert!(size_of::<ACX_RT_STREAM_CALLBACKS>() == 64);
+    assert!(offset_of!(ACX_RT_STREAM_CALLBACKS, EvtAcxStreamGetHwLatency) == 8);
+    assert!(offset_of!(ACX_RT_STREAM_CALLBACKS, EvtAcxStreamAllocateRtPackets) == 16);
+    assert!(offset_of!(ACX_RT_STREAM_CALLBACKS, EvtAcxStreamFreeRtPackets) == 24);
+    assert!(offset_of!(ACX_RT_STREAM_CALLBACKS, EvtAcxStreamSetRenderPacket) == 32);
+    assert!(offset_of!(ACX_RT_STREAM_CALLBACKS, EvtAcxStreamGetCurrentPacket) == 40);
+    assert!(offset_of!(ACX_RT_STREAM_CALLBACKS, EvtAcxStreamGetCapturePacket) == 48);
+    assert!(offset_of!(ACX_RT_STREAM_CALLBACKS, EvtAcxStreamGetPresentationPosition) == 56);
+    assert!(size_of::<ACX_RTPACKET>() == 40);
+    assert!(offset_of!(ACX_RTPACKET, RtPacketBuffer) == 8);
+    assert!(offset_of!(ACX_RTPACKET, RtPacketOffset) == 32);
+    assert!(offset_of!(ACX_RTPACKET, RtPacketSize) == 36);
+    assert!(size_of::<WDF_MEMORY_DESCRIPTOR>() == 24);
+    assert!(offset_of!(WDF_MEMORY_DESCRIPTOR, u) == 8);
+    assert!(size_of::<WDF_TIMER_CONFIG>() == 40);
+    assert!(offset_of!(WDF_TIMER_CONFIG, UseHighResolutionTimer) == 32);
+    assert!(size_of::<WDF_WORKITEM_CONFIG>() == 24);
+    assert!(offset_of!(WDF_WORKITEM_CONFIG, EvtWorkItemFunc) == 8);
+    assert!(offset_of!(WDF_WORKITEM_CONFIG, AutomaticSerialization) == 16);
+    // Used by audio.rs / lib.rs for the audio path.
+    assert!(size_of::<WDF_IO_QUEUE_CONFIG>() == 96);
+    assert!(offset_of!(WDF_IO_QUEUE_CONFIG, DispatchType) == 4);
+    assert!(offset_of!(WDF_IO_QUEUE_CONFIG, PowerManaged) == 8);
+    assert!(offset_of!(WDF_IO_QUEUE_CONFIG, DefaultQueue) == 13);
+    assert!(offset_of!(WDF_IO_QUEUE_CONFIG, EvtIoCanceledOnQueue) == 72);
+    assert!(_WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchManual == 3);
+    assert!(_WDF_TRI_STATE::WdfFalse == 0);
+    assert!(_WDF_EXECUTION_LEVEL::WdfExecutionLevelDispatch == 3);
+    assert!(size_of::<WDF_DEVICE_PROPERTY_DATA>() == 24);
+    assert!(offset_of!(WDF_DEVICE_PROPERTY_DATA, PropertyKey) == 8);
+    assert!(offset_of!(WDF_DEVICE_PROPERTY_DATA, Lcid) == 16);
+    assert!(offset_of!(WDF_DEVICE_PROPERTY_DATA, Flags) == 20);
+    assert!(size_of::<DEVPROPKEY>() == 20);
+    assert!(offset_of!(DEVPROPKEY, pid) == 16);
+    assert!(DEVPROP_TYPE_STRING == 0x12);
+    assert!(PLUGPLAY_PROPERTY_PERSISTENT == 1);
+    assert!(_MODE::KernelMode == 0);
+    assert!(STATUS_DEVICE_BUSY as u32 == 0x8000_0011);
+    assert!(STATUS_ACCESS_DENIED as u32 == 0xC000_0022);
+    assert!(STATUS_NOT_SUPPORTED as u32 == 0xC000_00BB);
+    assert!(STATUS_BUFFER_TOO_SMALL as u32 == 0xC000_0023);
+    assert!(STATUS_CANCELLED as u32 == 0xC000_0120);
+    assert!(STATUS_NO_MORE_ENTRIES as u32 == 0x8000_001A);
+    // DEVPKEY_Device_FriendlyName (bth.rs)
+    assert!(crate::bth::DEVPKEY_DEVICE_FRIENDLY_NAME.fmtid.Data1 == 0xA45C_254E);
+    assert!(crate::bth::DEVPKEY_DEVICE_FRIENDLY_NAME.fmtid.Data4[7] == 0xE0);
+    assert!(crate::bth::DEVPKEY_DEVICE_FRIENDLY_NAME.pid == 14);
+
+    assert!(_ACX_CIRCUIT_TYPE::AcxCircuitTypeRender == 1);
+    assert!(_ACX_PIN_TYPE::AcxPinTypeSink == 1);
+    assert!(_ACX_PIN_TYPE::AcxPinTypeSource == 2);
+    assert!(_ACX_PIN_COMMUNICATION::AcxPinCommunicationNone == 0);
+    assert!(_ACX_PIN_COMMUNICATION::AcxPinCommunicationSink == 1);
+    assert!(_ACX_DATAFORMAT_TYPE::AcxDataFormatKsFormat == 0);
+    assert!(_ACX_JACK_CONNECTION_TYPE::AcxConnTypeOtherDigital == 6);
+    assert!(_ACX_JACK_GEO_LOCATION::AcxGeoLocNotApplicable == 14);
+    assert!(_ACX_JACK_GEN_LOCATION::AcxGenLocSeparate == 2);
+    assert!(_ACX_JACK_PORT_CONNECTION::AcxPortConnJack == 0);
+    assert!(_ACX_STREAM_STATE::AcxStreamStateStop == 0);
+    assert!(_ACX_STREAM_STATE::AcxStreamStatePause == 2);
+    assert!(_ACX_STREAM_STATE::AcxStreamStateRun == 3);
+    assert!(_WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeNone == 4);
+    assert!(_WDF_EXECUTION_LEVEL::WdfExecutionLevelPassive == 2);
+    assert!(_WDF_MEMORY_DESCRIPTOR_TYPE::WdfMemoryDescriptorTypeMdl == 2);
+
+    // KSDATAFORMAT_WAVEFORMATEXTENSIBLE
+    assert!(size_of::<KsWaveFormatExtensible>() == 104);
+    assert!(offset_of!(KsWaveFormatExtensible, major_format) == 16);
+    assert!(offset_of!(KsWaveFormatExtensible, sub_format) == 32);
+    assert!(offset_of!(KsWaveFormatExtensible, specifier) == 48);
+    assert!(offset_of!(KsWaveFormatExtensible, format_tag) == 64);
+    assert!(offset_of!(KsWaveFormatExtensible, channels) == 66);
+    assert!(offset_of!(KsWaveFormatExtensible, samples_per_sec) == 68);
+    assert!(offset_of!(KsWaveFormatExtensible, avg_bytes_per_sec) == 72);
+    assert!(offset_of!(KsWaveFormatExtensible, block_align) == 76);
+    assert!(offset_of!(KsWaveFormatExtensible, bits_per_sample) == 78);
+    assert!(offset_of!(KsWaveFormatExtensible, cb_size) == 80);
+    assert!(offset_of!(KsWaveFormatExtensible, valid_bits_per_sample) == 82);
+    assert!(offset_of!(KsWaveFormatExtensible, channel_mask) == 84);
+    assert!(offset_of!(KsWaveFormatExtensible, wave_sub_format) == 88);
+    assert!(FORMATS[0].avg_bytes_per_sec == 384_000 && FORMATS[0].block_align == 8);
+    assert!(FORMATS[1].avg_bytes_per_sec == 768_000 && FORMATS[1].block_align == 8);
+    assert!(FORMATS[2].avg_bytes_per_sec == 192_000 && FORMATS[2].block_align == 4);
+    assert!(PAGE_SIZE == 0x1000);
+    assert!(POOL_FLAG_NON_PAGED == 0x40);
+    assert!(PLUGPLAY_REGKEY_DEVICE == 1);
+    assert!(KEY_READ == 0x20019);
+    assert!(STATUS_DATA_LATE_ERROR as u32 == 0xC000_003D);
+    assert!(STATUS_DATA_OVERRUN as u32 == 0xC000_003C);
+    assert!(STATUS_INVALID_STATE_TRANSITION as u32 == 0xC000_A003);
+    // AcxPinIdDefault / AcxJackPropertiesIdDefault / AcxInstanceIndeterminate
+    assert!(ACX_ID_DEFAULT == 0xFFFF_FFFF && ACX_INSTANCE_INDETERMINATE == 0xFFFF_FFFF);
+    assert!(WAVE_FORMAT_EXTENSIBLE == 0xFFFE && KSAUDIO_SPEAKER_STEREO == 3);
+    assert!(FORMATS[0].cb_size == 22 && FORMATS[0].format_size == 104);
+};
+
+// ---------------------------------------------------------------------------
+// Contexts
+// ---------------------------------------------------------------------------
+
+macro_rules! acx_context_type {
+    ($info:ident, $ty:ty, $name:literal, $getter:ident) => {
+        static $info: CtxInfo = CtxInfo(WDF_OBJECT_CONTEXT_TYPE_INFO {
+            Size: size_of::<WDF_OBJECT_CONTEXT_TYPE_INFO>() as ULONG,
+            ContextName: $name.as_ptr().cast(),
+            ContextSize: size_of::<$ty>(),
+            UniqueType: &raw const $info.0,
+            EvtDriverGetUniqueContextType: None,
+        });
+        /// Null if the object has no context of this type.
+        /// SAFETY: `h` must be a live WDF object.
+        unsafe fn $getter(h: WDFOBJECT) -> *mut $ty {
+            unsafe { call_unsafe_wdf_function_binding!(WdfObjectGetTypedContextWorker, h, &raw const $info.0) }
+                .cast::<$ty>()
+        }
+    };
+}
+
+/// Second context on the WDFDEVICE (the pipe's `DeviceContext` is untouched).
+/// `render` and `failed` are only touched from PnP callbacks, which WDF
+/// serialises.
+#[repr(C)]
+struct AcxDeviceCtx {
+    /// Render circuit, between AcxDeviceAddCircuit and AcxDeviceRemoveCircuit.
+    render: ACXCIRCUIT,
+    /// Circuit creation failed once; do not retry on a later PrepareHardware
+    /// (the half-built circuit object stays parented to the device).
+    failed: bool,
+    /// The bridge pin's ACXJACK while its circuit is added, else 0. Read by
+    /// the work item.
+    jack: AtomicUsize,
+    /// Runs [`evt_jack_work`] at PASSIVE. Created once in [`device_created`].
+    jack_work: WDFWORKITEM,
+}
+acx_context_type!(ACX_DEVICE_CTX_INFO, AcxDeviceCtx, c"CrossCAcxDeviceContext", acx_device_ctx);
+
+/// Context of the ACXJACK: the way from the presence callback to the device.
+#[repr(C)]
+struct JackCtx {
+    dev: *mut DeviceContext,
+}
+acx_context_type!(JACK_CTX_INFO, JackCtx, c"CrossCAcxJackContext", jack_ctx);
+
+/// Per-stream engine (context of the ACXSTREAM, zero-initialised by WDF).
+/// Plain fields are written only by the PASSIVE stream callbacks while the
+/// timer is stopped; everything the timer DPC shares is atomic.
+#[repr(C)]
+struct StreamCtx {
+    stream: ACXSTREAM,
+    timer: WDFTIMER,
+    /// The pipe's device context (owner of the PCM tap). Set at creation.
+    dev: *mut DeviceContext,
+    /// This stream's format is one the audio contract can describe and it
+    /// was registered with the tap ([`audio::stream_created`]).
+    tap: bool,
+    /// Ring storage for the tap: nonpaged pool, allocated in PrepareHardware,
+    /// freed in ReleaseHardware (or at destroy) after the tap let go of it.
+    ring: *mut u8,
+    ring_bytes: usize,
+    /// ACX_STREAM_STATE as tracked by our callbacks.
+    state: AtomicU32,
+    qpc_freq: u64,
+    sample_rate: u32,
+    bits: u32,
+    channels: u32,
+    block_align: u32,
+    bytes_per_sec: u32,
+    packet_count: u32,
+    packet_size: u32,
+    first_packet_offset: u32,
+    packets: [*mut u8; MAX_PACKETS],
+
+    /// Timer may re-arm itself.
+    running: AtomicBool,
+    /// Packets completed since PrepareHardware (the packet being played).
+    current_packet: AtomicU32,
+    /// Timeline of the current Run: packet `run_base_packet + n` completes at
+    /// `run_start_hns + shift_hns + n * packet duration`.
+    run_start_hns: AtomicU64,
+    run_base_packet: AtomicU32,
+    shift_hns: AtomicU64,
+    /// Highest position (bytes) reported so far; keeps it monotonic.
+    reported_bytes: AtomicU64,
+
+    // stats
+    runs: AtomicU32,
+    packets_done: AtomicU64,
+    nonsilent_packets: AtomicU64,
+    late_passes: AtomicU64,
+    timeline_shifts: AtomicU64,
+    max_late_hns: AtomicU64,
+    set_packet_late: AtomicU32,
+    set_packet_overrun: AtomicU32,
+    /// Packets replaced by silence in the tap (see [`FRESH_PACKETS_PER_PASS`]).
+    stale_packets: AtomicU64,
+}
+acx_context_type!(STREAM_CTX_INFO, StreamCtx, c"CrossCAcxStreamContext", stream_ctx);
+
+// ---------------------------------------------------------------------------
+// Kill switch
+// ---------------------------------------------------------------------------
+
+/// Reads `DisableAcx` from an open key and closes the key.
+unsafe fn disable_acx_value(key: WDFKEY) -> bool {
+    unsafe {
+        let name = unicode(&DISABLE_ACX_VALUE);
+        let mut value: ULONG = 0;
+        let status = call_unsafe_wdf_function_binding!(WdfRegistryQueryULong, key, &raw const name, &raw mut value);
+        call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
+        nt_success(status) && value != 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Driver / device hooks (called from lib.rs)
+// ---------------------------------------------------------------------------
+
+/// The loader filled `AcxFunctions` / `AcxDriverGlobals` (class binding ran).
+unsafe fn table_bound() -> bool {
+    unsafe {
+        let first = (&raw const AcxFunctions).cast::<ACXFUNC>();
+        !AcxDriverGlobals.is_null()
+            && first.add(_ACXFUNCENUM::AcxDriverInitializeTableIndex as usize).read().is_some()
+            && first.add(_ACXFUNCENUM::AcxRtStreamNotifyPacketCompleteTableIndex as usize).read().is_some()
+    }
+}
+
+/// DriverEntry hook, after WdfDriverCreate. Never fails the driver: on any
+/// problem ACX simply stays off and the driver is the plain L2CAP pipe.
+pub unsafe fn driver_init(driver: WDFDRIVER) {
+    unsafe {
+        let mut key: WDFKEY = null_mut();
+        let status = call_unsafe_wdf_function_binding!(
+            WdfDriverOpenParametersRegistryKey,
+            driver,
+            KEY_READ,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &raw mut key
+        );
+        if nt_success(status) && disable_acx_value(key) {
+            trace!("acx: DisableAcx set in the service Parameters key - ACX off");
+            return;
+        }
+        if !table_bound() {
+            let globals = (&raw const AcxDriverGlobals).read();
+            trace!("acx: function table not bound (globals {:p}) - ACX off", globals);
+            return;
+        }
+        let mut cfg = ACX_DRIVER_CONFIG { Size: size_of::<ACX_DRIVER_CONFIG>() as ULONG, Flags: 0 };
+        let status = acx!(AcxDriverInitializeTableIndex, PFN_ACXDRIVERINITIALIZE, driver, &raw mut cfg);
+        if !nt_success(status) {
+            trace!("acx: AcxDriverInitialize failed {:#x} - ACX off", status);
+            return;
+        }
+        ACX_READY.store(true, Ordering::SeqCst);
+        trace!("acx: driver initialized (ACX 1.{})", (&raw const AcxMinimumVersionRequired).read());
+    }
+}
+
+/// EvtDriverDeviceAdd hook; must be the first thing done with `init`.
+/// `Ok(true)`: ACX is on for this device - register [`evt_prepare_hardware`] /
+/// [`evt_release_hardware`] and call [`device_created`] after WdfDeviceCreate.
+/// `Ok(false)`: ACX is off, `init` untouched.
+pub unsafe fn device_init(init: PWDFDEVICE_INIT) -> Result<bool, NTSTATUS> {
+    unsafe {
+        if !ACX_READY.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let mut key: WDFKEY = null_mut();
+        let status = call_unsafe_wdf_function_binding!(
+            WdfFdoInitOpenRegistryKey,
+            init,
+            PLUGPLAY_REGKEY_DEVICE,
+            KEY_READ,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &raw mut key
+        );
+        if nt_success(status) && disable_acx_value(key) {
+            trace!("acx: DisableAcx set in the device key - ACX off for this device");
+            return Ok(false);
+        }
+        // ACX_DEVICEINIT_CONFIG_INIT
+        let mut cfg = ACX_DEVICEINIT_CONFIG {
+            Size: size_of::<ACX_DEVICEINIT_CONFIG>() as ULONG,
+            Flags: 0,
+            SynchronizationScope: _WDF_SYNCHRONIZATION_SCOPE::WdfSynchronizationScopeNone,
+            ExecutionLevel: _WDF_EXECUTION_LEVEL::WdfExecutionLevelPassive,
+            Context: [null_mut(); 4],
+        };
+        let status = acx!(AcxDeviceInitInitializeTableIndex, PFN_ACXDEVICEINITINITIALIZE, init, &raw mut cfg);
+        if !nt_success(status) {
+            trace!("acx: AcxDeviceInitInitialize failed {:#x}", status);
+            return Err(status);
+        }
+        Ok(true)
+    }
+}
+
+/// EvtDriverDeviceAdd hook, right after WdfDeviceCreate, when [`device_init`]
+/// returned `Ok(true)`. A failure must fail DeviceAdd.
+pub unsafe fn device_created(device: WDFDEVICE) -> NTSTATUS {
+    unsafe {
+        let mut attr = attributes();
+        attr.ContextTypeInfo = &raw const ACX_DEVICE_CTX_INFO.0;
+        let status =
+            call_unsafe_wdf_function_binding!(WdfObjectAllocateContext, device.cast(), &raw mut attr, null_mut());
+        if !nt_success(status) {
+            trace!("acx: device context allocation failed {:#x}", status);
+            return status;
+        }
+        // ACX_DEVICE_CONFIG_INIT
+        let mut cfg =
+            ACX_DEVICE_CONFIG { Size: size_of::<ACX_DEVICE_CONFIG>() as ULONG, Flags: 0, Context: [null_mut(); 4] };
+        let status = acx!(AcxDeviceInitializeTableIndex, PFN_ACXDEVICEINITIALIZE, device, &raw mut cfg);
+        if !nt_success(status) {
+            trace!("acx: AcxDeviceInitialize failed {:#x}", status);
+            return status;
+        }
+        // Work item for jack state notifications (see jack_changed). Not
+        // serialised: WDF_WORKITEM_CONFIG_INIT's AutomaticSerialization = TRUE
+        // would require a passive-level parent and nothing here needs it.
+        let ctx = acx_device_ctx(device.cast());
+        let mut wcfg = WDF_WORKITEM_CONFIG {
+            Size: size_of::<WDF_WORKITEM_CONFIG>() as ULONG,
+            EvtWorkItemFunc: Some(evt_jack_work),
+            AutomaticSerialization: 0,
+        };
+        let mut attr = attributes();
+        attr.ParentObject = device.cast();
+        let status =
+            call_unsafe_wdf_function_binding!(WdfWorkItemCreate, &raw mut wcfg, &raw mut attr, addr_of_mut!((*ctx).jack_work));
+        if !nt_success(status) {
+            trace!("acx: WdfWorkItemCreate failed {:#x}", status);
+            (*ctx).jack_work = null_mut();
+            return status;
+        }
+        trace!("acx: device initialized");
+        STATUS_SUCCESS
+    }
+}
+
+/// EvtDevicePrepareHardware: create the render circuit and add it to the
+/// device (visible once the device is in D0). The circuit is re-created on
+/// every PrepareHardware because AcxDeviceRemoveCircuit deletes it. Never
+/// fails device start: without the circuit the driver is still the pipe.
+pub unsafe extern "C" fn evt_prepare_hardware(device: WDFDEVICE, _raw: WDFCMRESLIST, _translated: WDFCMRESLIST) -> NTSTATUS {
+    unsafe {
+        let ctx = acx_device_ctx(device.cast());
+        if ctx.is_null() || !(*ctx).render.is_null() || (*ctx).failed {
+            return STATUS_SUCCESS;
+        }
+        let (circuit, jack) = match create_render_circuit(device) {
+            Ok(c) => c,
+            Err(status) => {
+                trace!("acx: render circuit creation failed {:#x} - no endpoint", status);
+                (*ctx).failed = true;
+                return STATUS_SUCCESS;
+            }
+        };
+        let status = acx!(AcxDeviceAddCircuitTableIndex, PFN_ACXDEVICEADDCIRCUIT, device, circuit);
+        if !nt_success(status) {
+            trace!("acx: AcxDeviceAddCircuit failed {:#x} - no endpoint", status);
+            (*ctx).failed = true;
+            return STATUS_SUCCESS;
+        }
+        (*ctx).render = circuit;
+        (*ctx).jack.store(jack as usize, Ordering::SeqCst);
+        // From here on the audio IOCTLs work (AUDIO_FLAG_ACX).
+        audio::set_endpoint(crate::device_ctx(device.cast()), true);
+        trace!("acx: render circuit added (jack: unplugged until a service sets the link)");
+        STATUS_SUCCESS
+    }
+}
+
+/// EvtDeviceReleaseHardware: the only place AcxDeviceRemoveCircuit may be
+/// called. It also deletes the circuit object.
+pub unsafe extern "C" fn evt_release_hardware(device: WDFDEVICE, _translated: WDFCMRESLIST) -> NTSTATUS {
+    unsafe {
+        let ctx = acx_device_ctx(device.cast());
+        if ctx.is_null() || (*ctx).render.is_null() {
+            return STATUS_SUCCESS;
+        }
+        // The jack goes away with the circuit: stop notifying it, and wait
+        // out a notification that is running (the work item reads the handle
+        // once; one that starts after the store sees 0).
+        (*ctx).jack.store(0, Ordering::SeqCst);
+        if !(*ctx).jack_work.is_null() {
+            call_unsafe_wdf_function_binding!(WdfWorkItemFlush, (*ctx).jack_work);
+        }
+        audio::set_endpoint(crate::device_ctx(device.cast()), false);
+        let status = acx!(AcxDeviceRemoveCircuitTableIndex, PFN_ACXDEVICEREMOVECIRCUIT, device, (*ctx).render);
+        (*ctx).render = null_mut();
+        trace!("acx: render circuit removed ({:#x})", status);
+        STATUS_SUCCESS
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Render circuit (RenderCircuit.cpp: CodecR_CreateRenderCircuit)
+// ---------------------------------------------------------------------------
+
+fn check(status: NTSTATUS, what: &str) -> Result<(), NTSTATUS> {
+    if nt_success(status) {
+        Ok(())
+    } else {
+        trace!("acx: {} failed {:#x}", what, status);
+        Err(status)
+    }
+}
+
+unsafe fn create_render_circuit(device: WDFDEVICE) -> Result<(ACXCIRCUIT, ACXJACK), NTSTATUS> {
+    unsafe {
+        // ---- circuit -------------------------------------------------------
+        let mut init = acx!(AcxCircuitInitAllocateTableIndex, PFN_ACXCIRCUITINITALLOCATE, device);
+        if init.is_null() {
+            trace!("acx: AcxCircuitInitAllocate failed");
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        acx!(AcxCircuitInitSetComponentIdTableIndex, PFN_ACXCIRCUITINITSETCOMPONENTID, init, &raw const RENDER_COMPONENT_ID);
+        let status =
+            acx!(AcxCircuitInitAssignNameTableIndex, PFN_ACXCIRCUITINITASSIGNNAME, init, &raw const CIRCUIT_NAME_US.0);
+        if !nt_success(status) {
+            // The sample ignores this status; without the name the INF
+            // interfaces cannot match, so treat it as fatal for the circuit.
+            trace!("acx: AcxCircuitInitAssignName failed {:#x}", status);
+            acx!(AcxCircuitInitFreeTableIndex, PFN_ACXCIRCUITINITFREE, init);
+            return Err(status);
+        }
+        acx!(
+            AcxCircuitInitSetCircuitTypeTableIndex,
+            PFN_ACXCIRCUITINITSETCIRCUITTYPE,
+            init,
+            _ACX_CIRCUIT_TYPE::AcxCircuitTypeRender
+        );
+        // ACX_CIRCUIT_PNPPOWER_CALLBACKS_INIT
+        let mut power = ACX_CIRCUIT_PNPPOWER_CALLBACKS {
+            Size: size_of::<ACX_CIRCUIT_PNPPOWER_CALLBACKS>() as ULONG,
+            EvtAcxCircuitPrepareHardware: None,
+            EvtAcxCircuitReleaseHardware: None,
+            EvtAcxCircuitPowerUp: Some(evt_circuit_power_up),
+            EvtAcxCircuitPowerDown: Some(evt_circuit_power_down),
+        };
+        acx!(
+            AcxCircuitInitSetAcxCircuitPnpPowerCallbacksTableIndex,
+            PFN_ACXCIRCUITINITSETACXCIRCUITPNPPOWERCALLBACKS,
+            init,
+            &raw mut power
+        );
+        let status = acx!(
+            AcxCircuitInitAssignAcxCreateStreamCallbackTableIndex,
+            PFN_ACXCIRCUITINITASSIGNACXCREATESTREAMCALLBACK,
+            init,
+            Some(evt_circuit_create_stream)
+        );
+        if !nt_success(status) {
+            trace!("acx: AcxCircuitInitAssignAcxCreateStreamCallback failed {:#x}", status);
+            acx!(AcxCircuitInitFreeTableIndex, PFN_ACXCIRCUITINITFREE, init);
+            return Err(status);
+        }
+        let mut attr = attributes();
+        let mut circuit: ACXCIRCUIT = null_mut();
+        let status =
+            acx!(AcxCircuitCreateTableIndex, PFN_ACXCIRCUITCREATE, device, &raw mut attr, &raw mut init, &raw mut circuit);
+        if !nt_success(status) {
+            trace!("acx: AcxCircuitCreate failed {:#x}", status);
+            // On failure the init is still ours (the sample frees it when the
+            // pointer was not consumed, i.e. not nulled).
+            if !init.is_null() {
+                acx!(AcxCircuitInitFreeTableIndex, PFN_ACXCIRCUITINITFREE, init);
+            }
+            return Err(status);
+        }
+        // From here on a failure leaves `circuit` parented to the device; it
+        // is never added and goes away with the device.
+
+        // ---- pins: [0] host (sink, streaming), [1] bridge (source) ---------
+        let mut pins: [ACXPIN; 2] = [null_mut(); 2];
+
+        // ACX_PIN_CALLBACKS_INIT
+        let mut pin_callbacks = ACX_PIN_CALLBACKS {
+            Size: size_of::<ACX_PIN_CALLBACKS>() as ULONG,
+            EvtAcxPinSetDataFormat: Some(evt_pin_set_data_format),
+            ..zeroed()
+        };
+        // ACX_PIN_CONFIG_INIT
+        let mut pin_cfg = ACX_PIN_CONFIG {
+            Size: size_of::<ACX_PIN_CONFIG>() as ULONG,
+            Flags: 0,
+            Id: ACX_ID_DEFAULT,
+            Type: _ACX_PIN_TYPE::AcxPinTypeSink,
+            Communication: _ACX_PIN_COMMUNICATION::AcxPinCommunicationSink,
+            Category: &raw const KSCATEGORY_AUDIO,
+            PinCallbacks: &raw mut pin_callbacks,
+            MaxStreams: ACX_INSTANCE_INDETERMINATE,
+            ..zeroed()
+        };
+        let mut attr = attributes();
+        attr.ParentObject = circuit.cast();
+        check(
+            acx!(AcxPinCreateTableIndex, PFN_ACXPINCREATE, circuit, &raw mut attr, &raw mut pin_cfg, &raw mut pins[0]),
+            "AcxPinCreate(host)",
+        )?;
+
+        let mut pin_cfg = ACX_PIN_CONFIG {
+            Size: size_of::<ACX_PIN_CONFIG>() as ULONG,
+            Flags: 0,
+            Id: ACX_ID_DEFAULT,
+            Type: _ACX_PIN_TYPE::AcxPinTypeSource,
+            Communication: _ACX_PIN_COMMUNICATION::AcxPinCommunicationNone,
+            Category: &raw const KSNODETYPE_HEADPHONES,
+            MaxStreams: ACX_INSTANCE_INDETERMINATE,
+            ..zeroed()
+        };
+        let mut attr = attributes();
+        attr.ParentObject = circuit.cast();
+        check(
+            acx!(AcxPinCreateTableIndex, PFN_ACXPINCREATE, circuit, &raw mut attr, &raw mut pin_cfg, &raw mut pins[1]),
+            "AcxPinCreate(bridge)",
+        )?;
+
+        // ---- jack on the bridge pin ----------------------------------------
+        // With presence detection (target/acx-research.md 4.7; the ACX
+        // sample's CircuitHelper.cpp `CreateAudioJack` passes its callbacks
+        // the same way, from the stack): ACX asks evt_jack_retrieve_presence
+        // for the state and is told about changes with
+        // AcxJackChangeStateNotification.
+        // ACX_JACK_CALLBACKS_INIT
+        let mut jack_callbacks = ACX_JACK_CALLBACKS {
+            Size: size_of::<ACX_JACK_CALLBACKS>() as ULONG,
+            EvtAcxJackRetrievePresenceState: Some(evt_jack_retrieve_presence),
+        };
+        // ACX_JACK_CONFIG_INIT
+        let mut jack_cfg = ACX_JACK_CONFIG {
+            Size: size_of::<ACX_JACK_CONFIG>() as ULONG,
+            Id: ACX_ID_DEFAULT,
+            Flags: _ACX_JACK_CONFIG_FLAGS::AcxJackConfigJackDetection as ULONG,
+            Callbacks: &raw mut jack_callbacks,
+            Description: ACX_JACK_DESCRIPTION {
+                ChannelMapping: KSAUDIO_SPEAKER_STEREO,
+                Color: 0,
+                ConnectionType: _ACX_JACK_CONNECTION_TYPE::AcxConnTypeOtherDigital,
+                GeoLocation: _ACX_JACK_GEO_LOCATION::AcxGeoLocNotApplicable,
+                GenLocation: _ACX_JACK_GEN_LOCATION::AcxGenLocSeparate,
+                // A jack, not an integrated device: something that can be
+                // absent. Same as the jack of Microsoft's Bluetooth A2DP
+                // sample (sysvad a2dphpspeakertoptable.h: OtherDigital,
+                // ePortConnJack, IsConnected set at run time).
+                PortConnection: _ACX_JACK_PORT_CONNECTION::AcxPortConnJack,
+            },
+        };
+        let mut attr = attributes();
+        attr.ParentObject = pins[1].cast();
+        attr.ContextTypeInfo = &raw const JACK_CTX_INFO.0;
+        let mut jack: ACXJACK = null_mut();
+        check(
+            acx!(AcxJackCreateTableIndex, PFN_ACXJACKCREATE, pins[1], &raw mut attr, &raw mut jack_cfg, &raw mut jack),
+            "AcxJackCreate",
+        )?;
+        let jc = jack_ctx(jack.cast());
+        if jc.is_null() {
+            trace!("acx: jack has no context");
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+        (*jc).dev = crate::device_ctx(device.cast());
+        check(acx!(AcxPinAddJacksTableIndex, PFN_ACXPINADDJACKS, pins[1], &raw mut jack, 1), "AcxPinAddJacks")?;
+
+        // ---- formats on the host pin (RAW mode list) ------------------------
+        let list = acx!(AcxPinGetRawDataFormatListTableIndex, PFN_ACXPINGETRAWDATAFORMATLIST, pins[0]);
+        if list.is_null() {
+            trace!("acx: AcxPinGetRawDataFormatList returned null");
+            return Err(STATUS_INSUFFICIENT_RESOURCES);
+        }
+        for (i, ks) in FORMATS.iter().enumerate() {
+            // ACX_DATAFORMAT_CONFIG_INIT_KS; ACX copies the KS format.
+            let mut cfg: ACX_DATAFORMAT_CONFIG = zeroed();
+            cfg.Size = size_of::<ACX_DATAFORMAT_CONFIG>() as ULONG;
+            cfg.Flags = 0;
+            cfg.Type = _ACX_DATAFORMAT_TYPE::AcxDataFormatKsFormat;
+            *cfg.u.KsFormat.as_mut() = core::ptr::from_ref(ks).cast_mut().cast();
+            let mut attr = attributes();
+            attr.ParentObject = circuit.cast();
+            let mut format: ACXDATAFORMAT = null_mut();
+            check(
+                acx!(AcxDataFormatCreateTableIndex, PFN_ACXDATAFORMATCREATE, device, &raw mut attr, &raw mut cfg, &raw mut format),
+                "AcxDataFormatCreate",
+            )?;
+            check(
+                acx!(AcxDataFormatListAddDataFormatTableIndex, PFN_ACXDATAFORMATLISTADDDATAFORMAT, list, format),
+                "AcxDataFormatListAddDataFormat",
+            )?;
+            if i == 0 {
+                check(
+                    acx!(
+                        AcxDataFormatListAssignDefaultDataFormatTableIndex,
+                        PFN_ACXDATAFORMATLISTASSIGNDEFAULTDATAFORMAT,
+                        list,
+                        format
+                    ),
+                    "AcxDataFormatListAssignDefaultDataFormat",
+                )?;
+            }
+        }
+
+        // No elements: ACX connects host pin -> bridge pin by default.
+        check(acx!(AcxCircuitAddPinsTableIndex, PFN_ACXCIRCUITADDPINS, circuit, pins.as_mut_ptr(), 2), "AcxCircuitAddPins")?;
+        Ok((circuit, jack))
+    }
+}
+
+/// EvtAcxJackRetrievePresenceState (PASSIVE): the jack is "plugged in" while
+/// the attached service says the buds have an open, configured stream.
+/// Unplugged initially and whenever no service is attached (detach clears
+/// the flag).
+unsafe extern "C" fn evt_jack_retrieve_presence(jack: ACXJACK, is_connected: PBOOLEAN) -> NTSTATUS {
+    unsafe {
+        let jc = jack_ctx(jack.cast());
+        let connected = !jc.is_null() && !(*jc).dev.is_null() && audio::link((*jc).dev);
+        if !is_connected.is_null() {
+            *is_connected = BOOLEAN::from(connected);
+        }
+    }
+    STATUS_SUCCESS
+}
+
+/// The link flag changed: have ACX re-read the jack state. Any IRQL <=
+/// DISPATCH (it is called from request cancellation paths).
+///
+/// `AcxJackChangeStateNotification` carries no IRQL annotation in acxpin.h
+/// and its documentation states none, while almost every other ACX DDI is
+/// PASSIVE-only. So it is never called directly: a work item does it at
+/// PASSIVE. Enqueueing an already queued work item is a no-op, which is
+/// fine: the callback reports "changed", ACX then asks for the state.
+pub unsafe fn jack_changed(device: WDFDEVICE) {
+    unsafe {
+        let ctx = acx_device_ctx(device.cast());
+        if ctx.is_null() || (*ctx).jack_work.is_null() || (*ctx).jack.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        call_unsafe_wdf_function_binding!(WdfWorkItemEnqueue, (*ctx).jack_work);
+    }
+}
+
+/// Work item (PASSIVE). `evt_release_hardware` clears `jack` and flushes
+/// this work item before the circuit (and with it the jack) is deleted.
+unsafe extern "C" fn evt_jack_work(item: WDFWORKITEM) {
+    unsafe {
+        let device = call_unsafe_wdf_function_binding!(WdfWorkItemGetParentObject, item);
+        let ctx = acx_device_ctx(device);
+        if ctx.is_null() {
+            return;
+        }
+        let jack = (*ctx).jack.load(Ordering::SeqCst) as ACXJACK;
+        if jack.is_null() {
+            return;
+        }
+        acx!(AcxJackChangeStateNotificationTableIndex, PFN_ACXJACKCHANGESTATENOTIFICATION, jack);
+    }
+}
+
+unsafe extern "C" fn evt_circuit_power_up(_device: WDFDEVICE, _circuit: ACXCIRCUIT, previous: WDF_POWER_DEVICE_STATE) -> NTSTATUS {
+    trace!("acx: circuit power up (from {})", previous);
+    STATUS_SUCCESS
+}
+
+unsafe extern "C" fn evt_circuit_power_down(_device: WDFDEVICE, _circuit: ACXCIRCUIT, target: WDF_POWER_DEVICE_STATE) -> NTSTATUS {
+    trace!("acx: circuit power down (to {})", target);
+    STATUS_SUCCESS
+}
+
+/// Same as the sample: the device/mixed format cannot be set on the pin.
+unsafe extern "C" fn evt_pin_set_data_format(_pin: ACXPIN, _format: ACXDATAFORMAT) -> NTSTATUS {
+    STATUS_NOT_SUPPORTED
+}
+
+// ---------------------------------------------------------------------------
+// Stream (RenderCircuit.cpp: CodecR_EvtCircuitCreateStream, StreamEngine.cpp)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" fn evt_circuit_create_stream(
+    device: WDFDEVICE,
+    circuit: ACXCIRCUIT,
+    _pin: ACXPIN,
+    mut stream_init: PACXSTREAM_INIT,
+    format: ACXDATAFORMAT,
+    _signal_processing_mode: *const GUID,
+    _var_arguments: ACXOBJECTBAG,
+) -> NTSTATUS {
+    unsafe {
+        // ACX_STREAM_CALLBACKS_INIT
+        let mut callbacks = ACX_STREAM_CALLBACKS {
+            Size: size_of::<ACX_STREAM_CALLBACKS>() as ULONG,
+            EvtAcxStreamPrepareHardware: Some(evt_stream_prepare_hardware),
+            EvtAcxStreamReleaseHardware: Some(evt_stream_release_hardware),
+            EvtAcxStreamRun: Some(evt_stream_run),
+            EvtAcxStreamPause: Some(evt_stream_pause),
+            EvtAcxStreamAssignDrmContentId: None,
+        };
+        let status = acx!(
+            AcxStreamInitAssignAcxStreamCallbacksTableIndex,
+            PFN_ACXSTREAMINITASSIGNACXSTREAMCALLBACKS,
+            stream_init,
+            &raw mut callbacks
+        );
+        if !nt_success(status) {
+            trace!("acx: AcxStreamInitAssignAcxStreamCallbacks failed {:#x}", status);
+            return status;
+        }
+        // ACX_RT_STREAM_CALLBACKS_INIT
+        let mut rt = ACX_RT_STREAM_CALLBACKS {
+            Size: size_of::<ACX_RT_STREAM_CALLBACKS>() as ULONG,
+            EvtAcxStreamGetHwLatency: Some(evt_stream_get_hw_latency),
+            EvtAcxStreamAllocateRtPackets: Some(evt_stream_allocate_rt_packets),
+            EvtAcxStreamFreeRtPackets: Some(evt_stream_free_rt_packets),
+            EvtAcxStreamSetRenderPacket: Some(evt_stream_set_render_packet),
+            EvtAcxStreamGetCurrentPacket: Some(evt_stream_get_current_packet),
+            EvtAcxStreamGetCapturePacket: None,
+            EvtAcxStreamGetPresentationPosition: Some(evt_stream_get_presentation_position),
+        };
+        let status = acx!(
+            AcxStreamInitAssignAcxRtStreamCallbacksTableIndex,
+            PFN_ACXSTREAMINITASSIGNACXRTSTREAMCALLBACKS,
+            stream_init,
+            &raw mut rt
+        );
+        if !nt_success(status) {
+            trace!("acx: AcxStreamInitAssignAcxRtStreamCallbacks failed {:#x}", status);
+            return status;
+        }
+        acx!(
+            AcxStreamInitSetAcxRtStreamSupportsNotificationsTableIndex,
+            PFN_ACXSTREAMINITSETACXRTSTREAMSUPPORTSNOTIFICATIONS,
+            stream_init
+        );
+
+        let mut attr = attributes();
+        attr.ContextTypeInfo = &raw const STREAM_CTX_INFO.0;
+        attr.EvtCleanupCallback = Some(evt_stream_cleanup);
+        attr.EvtDestroyCallback = Some(evt_stream_destroy);
+        let mut stream: ACXSTREAM = null_mut();
+        let status = acx!(
+            AcxRtStreamCreateTableIndex,
+            PFN_ACXRTSTREAMCREATE,
+            device,
+            circuit,
+            &raw mut attr,
+            &raw mut stream_init,
+            &raw mut stream
+        );
+        if !nt_success(status) {
+            trace!("acx: AcxRtStreamCreate failed {:#x}", status);
+            return status;
+        }
+
+        let s = stream_ctx(stream.cast());
+        (*s).stream = stream;
+        let mut freq: LARGE_INTEGER = zeroed();
+        KeQueryPerformanceCounter(&raw mut freq);
+        (*s).qpc_freq = (freq.QuadPart as u64).max(1);
+        (*s).sample_rate = acx!(AcxDataFormatGetSampleRateTableIndex, PFN_ACXDATAFORMATGETSAMPLERATE, format);
+        (*s).bits = acx!(AcxDataFormatGetBitsPerSampleTableIndex, PFN_ACXDATAFORMATGETBITSPERSAMPLE, format);
+        (*s).channels = acx!(AcxDataFormatGetChannelsCountTableIndex, PFN_ACXDATAFORMATGETCHANNELSCOUNT, format) as u32;
+        (*s).block_align = acx!(AcxDataFormatGetBlockAlignTableIndex, PFN_ACXDATAFORMATGETBLOCKALIGN, format).max(1);
+        (*s).bytes_per_sec =
+            acx!(AcxDataFormatGetAverageBytesPerSecTableIndex, PFN_ACXDATAFORMATGETAVERAGEBYTESPERSEC, format).max(1);
+        let valid_bits =
+            acx!(AcxDataFormatGetValidBitsPerSampleTableIndex, PFN_ACXDATAFORMATGETVALIDBITSPERSAMPLE, format);
+        // The stream format in the audio contract's terms. A field that does
+        // not fit becomes 0, which makes the format invalid: such a stream
+        // (none is offered) still plays, into nothing.
+        let fmt = PcmFormat {
+            sample_rate: (*s).sample_rate,
+            channels: u8::try_from((*s).channels).unwrap_or(0),
+            container_bits: u8::try_from((*s).bits).unwrap_or(0),
+            valid_bits: u8::try_from(valid_bits).unwrap_or(0),
+        };
+        (*s).dev = crate::device_ctx(device.cast());
+        (*s).ring_bytes = ring_bytes(&fmt);
+        (*s).tap = fmt.is_valid()
+            && fmt.frame_bytes() == (*s).block_align as usize
+            && audio::stream_created((*s).dev, s as usize, fmt);
+        trace!(
+            "acx: stream created: {} Hz, {} ch, {} valid bits in {}-bit containers, block {} bytes, tap {}",
+            (*s).sample_rate,
+            (*s).channels,
+            valid_bits,
+            (*s).bits,
+            (*s).block_align,
+            (*s).tap
+        );
+        STATUS_SUCCESS
+    }
+}
+
+/// The ACXSTREAM is being deleted (IRQL <= DISPATCH): the endpoint has no
+/// stream any more, as far as the audio contract is concerned.
+unsafe extern "C" fn evt_stream_cleanup(obj: WDFOBJECT) {
+    unsafe {
+        let s = stream_ctx(obj);
+        if !s.is_null() && !(*s).dev.is_null() && (*s).tap {
+            audio::stream_destroyed((*s).dev, s as usize);
+        }
+    }
+}
+
+/// Last reference to the ACXSTREAM is gone (IRQL <= DISPATCH); its children,
+/// the timer included, are deleted. Normally ReleaseHardware has freed the
+/// ring already; this covers a stream that is torn down without it.
+unsafe extern "C" fn evt_stream_destroy(obj: WDFOBJECT) {
+    unsafe {
+        let s = stream_ctx(obj);
+        if !s.is_null() {
+            free_ring(s);
+        }
+    }
+}
+
+/// Take the ring storage away from the tap and free it. After
+/// [`audio::ring_remove`] returns, no timer pass and no reader touches the
+/// memory any more (both only reach it under the audio lock, through the
+/// pointer `ring_remove` clears), so the free is safe even if a pass is
+/// still running. IRQL <= DISPATCH.
+unsafe fn free_ring(s: *mut StreamCtx) {
+    unsafe {
+        let ring = (*s).ring;
+        if ring.is_null() {
+            return;
+        }
+        (*s).ring = null_mut();
+        if !(*s).dev.is_null() {
+            audio::ring_remove((*s).dev, ring);
+        }
+        ExFreePool(ring.cast());
+    }
+}
+
+/// QPC -> 100 ns units (KSCONVERT_PERFORMANCE_TIME).
+unsafe fn now_hns(s: *const StreamCtx) -> u64 {
+    unsafe {
+        let t = KeQueryPerformanceCounter(null_mut()).QuadPart as u64;
+        let f = (*s).qpc_freq;
+        (t / f) * HNS_PER_SEC + ((t % f) * HNS_PER_SEC) / f
+    }
+}
+
+/// Duration of `packets` packets in 100 ns units.
+unsafe fn packets_hns(s: *const StreamCtx, packets: u64) -> u64 {
+    unsafe {
+        // Split so the product cannot overflow on a long-running stream.
+        let one = (*s).packet_size as u64 * HNS_PER_SEC;
+        let bps = (*s).bytes_per_sec as u64;
+        packets * (one / bps) + packets * (one % bps) / bps
+    }
+}
+
+unsafe extern "C" fn evt_stream_get_hw_latency(_stream: ACXSTREAM, fifo_size: *mut ULONG, delay: *mut ULONG) -> NTSTATUS {
+    unsafe {
+        *fifo_size = 128;
+        *delay = 0;
+    }
+    STATUS_SUCCESS
+}
+
+/// ACX picks count and size. Each packet is its own page-rounded nonpaged
+/// allocation described by an MDL (ACX maps it into the audio engine, hence
+/// whole pages: nothing else may share them). Packet 0 is placed at the *end*
+/// of its allocation, as in the sample.
+unsafe extern "C" fn evt_stream_allocate_rt_packets(
+    stream: ACXSTREAM,
+    packet_count: ULONG,
+    packet_size: ULONG,
+    packets_out: *mut PACX_RTPACKET,
+) -> NTSTATUS {
+    unsafe {
+        let s = stream_ctx(stream.cast());
+        if packet_count == 0 || packet_count as usize > MAX_PACKETS || packet_size == 0 || packet_size > 0x4000_0000 {
+            trace!("acx: AllocateRtPackets({}, {}) rejected", packet_count, packet_size);
+            return STATUS_INVALID_PARAMETER;
+        }
+        let page = PAGE_SIZE as usize;
+        let alloc_size = (packet_size as usize).div_ceil(page) * page;
+        // Two packets (event-driven client): packet 0 ends on a page boundary.
+        // One packet (timer-driven client): ACX maps it twice back to back, so
+        // Microsoft requires a page-aligned, page-divisible buffer (pool
+        // allocations of a page or more are page-aligned) and offset 0. The
+        // sample has no such case.
+        let first_offset = if packet_count == 1 { 0 } else { (alloc_size - packet_size as usize) as u32 };
+        if packet_count == 1 && !(packet_size as usize).is_multiple_of(page) {
+            trace!("acx: single RT packet of {} bytes is not a page multiple (offset 0 used)", packet_size);
+        }
+
+        // ExAllocatePool2 zeroes the memory.
+        let array = ExAllocatePool2(
+            POOL_FLAG_NON_PAGED as POOL_FLAGS,
+            (packet_count as usize * size_of::<ACX_RTPACKET>()) as SIZE_T,
+            POOL_TAG,
+        )
+        .cast::<ACX_RTPACKET>();
+        if array.is_null() {
+            return STATUS_NO_MEMORY;
+        }
+        for i in 0..packet_count as usize {
+            let p = array.add(i);
+            // ACX_RTPACKET_INIT (the array is already zeroed)
+            (*p).Size = size_of::<ACX_RTPACKET>() as ULONG;
+            let buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED as POOL_FLAGS, alloc_size as SIZE_T, POOL_TAG);
+            let mdl = if buffer.is_null() { null_mut() } else { IoAllocateMdl(buffer, alloc_size as ULONG, 0, 1, null_mut()) };
+            if mdl.is_null() {
+                if !buffer.is_null() {
+                    ExFreePool(buffer);
+                }
+                // Entries >= i have a null MDL and are skipped by the free.
+                free_rt_packets(array, packet_count);
+                (*s).packets = [null_mut(); MAX_PACKETS];
+                return STATUS_NO_MEMORY;
+            }
+            MmBuildMdlForNonPagedPool(mdl);
+            // WDF_MEMORY_DESCRIPTOR_INIT_MDL
+            (*p).RtPacketBuffer.Type = _WDF_MEMORY_DESCRIPTOR_TYPE::WdfMemoryDescriptorTypeMdl;
+            (*p).RtPacketBuffer.u.MdlType.Mdl = mdl;
+            (*p).RtPacketBuffer.u.MdlType.BufferLength = alloc_size as ULONG;
+            (*p).RtPacketSize = packet_size;
+            (*p).RtPacketOffset = if i == 0 { first_offset } else { 0 };
+            (*s).packets[i] = buffer.cast();
+        }
+        (*s).packet_count = packet_count;
+        (*s).packet_size = packet_size;
+        (*s).first_packet_offset = first_offset;
+        *packets_out = array;
+        trace!("acx: {} RT packet(s) of {} bytes ({} bytes allocated each)", packet_count, packet_size, alloc_size);
+        STATUS_SUCCESS
+    }
+}
+
+unsafe fn free_rt_packets(array: PACX_RTPACKET, count: ULONG) {
+    unsafe {
+        for i in 0..count as usize {
+            let mdl = (*array.add(i)).RtPacketBuffer.u.MdlType.Mdl;
+            if !mdl.is_null() {
+                // MmGetMdlVirtualAddress
+                let buffer = (*mdl).StartVa.cast::<u8>().add((*mdl).ByteOffset as usize);
+                IoFreeMdl(mdl);
+                ExFreePool(buffer.cast());
+            }
+        }
+        ExFreePool(array.cast());
+    }
+}
+
+unsafe extern "C" fn evt_stream_free_rt_packets(stream: ACXSTREAM, packets: PACX_RTPACKET, packet_count: ULONG) {
+    unsafe {
+        let s = stream_ctx(stream.cast());
+        // Normally the timer is gone by now (ReleaseHardware), but Microsoft
+        // documents that this ordering is not guaranteed. Stop the timer and
+        // wait out a running pass before the buffers it reads go away (no-op
+        // when the timer is deleted or idle; this callback is PASSIVE).
+        stop_timer(s);
+        (*s).packets = [null_mut(); MAX_PACKETS];
+        (*s).packet_count = 0;
+        if !packets.is_null() {
+            free_rt_packets(packets, packet_count);
+        }
+        trace!("acx: RT packets freed");
+    }
+}
+
+unsafe extern "C" fn evt_stream_prepare_hardware(stream: ACXSTREAM) -> NTSTATUS {
+    unsafe {
+        let s = stream_ctx(stream.cast());
+        match (*s).state.load(Ordering::SeqCst) as i32 {
+            _ACX_STREAM_STATE::AcxStreamStatePause => return STATUS_SUCCESS,
+            _ACX_STREAM_STATE::AcxStreamStateStop => {}
+            _ => return STATUS_INVALID_STATE_TRANSITION,
+        }
+        // One-shot timer, re-armed by every pass. No automatic serialisation:
+        // the DPC only touches atomics and is fenced by `running`.
+        let mut cfg = WDF_TIMER_CONFIG {
+            Size: size_of::<WDF_TIMER_CONFIG>() as ULONG,
+            EvtTimerFunc: Some(evt_stream_timer),
+            Period: 0,
+            AutomaticSerialization: 0,
+            TolerableDelay: 0,
+            UseHighResolutionTimer: 1,
+            ..zeroed()
+        };
+        let mut attr = attributes();
+        attr.ParentObject = stream.cast();
+        let status = call_unsafe_wdf_function_binding!(WdfTimerCreate, &raw mut cfg, &raw mut attr, addr_of_mut!((*s).timer));
+        if !nt_success(status) {
+            trace!("acx: WdfTimerCreate failed {:#x}", status);
+            (*s).timer = null_mut();
+            return status;
+        }
+        // Ring for the PCM tap: RING_MS of this stream's format, nonpaged
+        // (it is written by the timer DPC). Without it the stream still
+        // plays; its audio is counted as dropped.
+        if (*s).tap && (*s).ring.is_null() && (*s).ring_bytes > 0 {
+            let ring = ExAllocatePool2(POOL_FLAG_NON_PAGED as POOL_FLAGS, (*s).ring_bytes as SIZE_T, POOL_TAG).cast::<u8>();
+            if ring.is_null() {
+                trace!("acx: no memory for the {}-byte tap ring; this stream's audio is dropped", (*s).ring_bytes);
+            } else if audio::ring_install((*s).dev, s as usize, ring, (*s).ring_bytes) {
+                (*s).ring = ring;
+            } else {
+                // A newer stream took the tap in the meantime.
+                ExFreePool(ring.cast());
+            }
+        }
+        (*s).state.store(_ACX_STREAM_STATE::AcxStreamStatePause as u32, Ordering::SeqCst);
+        trace!("acx: stream prepared (tap ring {} bytes)", if (*s).ring.is_null() { 0 } else { (*s).ring_bytes });
+        STATUS_SUCCESS
+    }
+}
+
+/// Stops the timer and waits for a running pass. PASSIVE only.
+unsafe fn stop_timer(s: *mut StreamCtx) {
+    unsafe {
+        (*s).running.store(false, Ordering::SeqCst);
+        if !(*s).timer.is_null() {
+            let _ = call_unsafe_wdf_function_binding!(WdfTimerStop, (*s).timer, 1);
+            // A pass that was already past its `running` check may have
+            // re-armed the timer; the next pass would see `running == false`
+            // and do nothing, but cancel it anyway.
+            let _ = call_unsafe_wdf_function_binding!(WdfTimerStop, (*s).timer, 1);
+        }
+    }
+}
+
+unsafe extern "C" fn evt_stream_release_hardware(stream: ACXSTREAM) -> NTSTATUS {
+    unsafe {
+        let s = stream_ctx(stream.cast());
+        if (*s).state.load(Ordering::SeqCst) as i32 == _ACX_STREAM_STATE::AcxStreamStateStop {
+            return STATUS_SUCCESS;
+        }
+        stop_timer(s);
+        if !(*s).timer.is_null() {
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, (*s).timer.cast());
+            (*s).timer = null_mut();
+        }
+        KeFlushQueuedDpcs();
+        // The timer is stopped and deleted and no DPC is left: the ring can
+        // go. What the reader had not taken yet is lost with it.
+        free_ring(s);
+        print_stats(s, "stopped");
+        (*s).current_packet.store(0, Ordering::SeqCst);
+        (*s).reported_bytes.store(0, Ordering::SeqCst);
+        (*s).shift_hns.store(0, Ordering::SeqCst);
+        (*s).state.store(_ACX_STREAM_STATE::AcxStreamStateStop as u32, Ordering::SeqCst);
+        STATUS_SUCCESS
+    }
+}
+
+unsafe extern "C" fn evt_stream_run(stream: ACXSTREAM) -> NTSTATUS {
+    unsafe {
+        let s = stream_ctx(stream.cast());
+        match (*s).state.load(Ordering::SeqCst) as i32 {
+            _ACX_STREAM_STATE::AcxStreamStateRun => return STATUS_SUCCESS,
+            _ACX_STREAM_STATE::AcxStreamStatePause => {}
+            _ => return STATUS_INVALID_STATE_TRANSITION,
+        }
+        if (*s).timer.is_null() || (*s).packet_count == 0 || (*s).packet_size == 0 {
+            trace!("acx: Run without timer/packets");
+            return STATUS_INVALID_DEVICE_STATE;
+        }
+        // Resume where Pause stopped (the sample's m_StartPosition): the part
+        // of the current packet that was already played before the pause is
+        // not played again. The timer is stopped, so nothing else moves these.
+        let size = (*s).packet_size as u64;
+        let current = (*s).current_packet.load(Ordering::SeqCst);
+        // Saturating: `reported_bytes` is 0 on the first Run.
+        let played = (*s).reported_bytes.load(Ordering::SeqCst).saturating_sub(current as u64 * size).min(size);
+        let one = packets_hns(s, 1).max(1);
+        // played <= packet_size <= 1 GiB, so the product fits.
+        let played_hns = (played * HNS_PER_SEC / (*s).bytes_per_sec as u64).min(one);
+        (*s).run_base_packet.store(current, Ordering::SeqCst);
+        (*s).shift_hns.store(0, Ordering::SeqCst);
+        // Backdate the start by the played part: position and packet
+        // boundaries continue from the latched position.
+        (*s).run_start_hns.store(now_hns(s).saturating_sub(played_hns), Ordering::SeqCst);
+        (*s).runs.fetch_add(1, Ordering::Relaxed);
+        (*s).state.store(_ACX_STREAM_STATE::AcxStreamStateRun as u32, Ordering::SeqCst);
+        (*s).running.store(true, Ordering::SeqCst);
+        // The current packet completes after its remaining part. It reaches
+        // the tap then, whole and once: a packet is only ever copied when it
+        // completes, so Pause/Run in the middle of one neither repeats nor
+        // loses frames.
+        let _ = call_unsafe_wdf_function_binding!(WdfTimerStart, (*s).timer, -((one - played_hns).max(1) as i64));
+        if (*s).tap {
+            audio::stream_running((*s).dev, s as usize, true);
+        }
+        trace!("acx: stream running");
+        STATUS_SUCCESS
+    }
+}
+
+unsafe extern "C" fn evt_stream_pause(stream: ACXSTREAM) -> NTSTATUS {
+    unsafe {
+        let s = stream_ctx(stream.cast());
+        match (*s).state.load(Ordering::SeqCst) as i32 {
+            _ACX_STREAM_STATE::AcxStreamStatePause => return STATUS_SUCCESS,
+            _ACX_STREAM_STATE::AcxStreamStateRun => {}
+            _ => return STATUS_INVALID_STATE_TRANSITION,
+        }
+        stop_timer(s);
+        // Latch the position while the timeline is still valid (state is
+        // still Run) and no pass can move `current_packet` any more. Run
+        // resumes from this value.
+        let _ = position_bytes(s);
+        (*s).state.store(_ACX_STREAM_STATE::AcxStreamStatePause as u32, Ordering::SeqCst);
+        // Nothing is flushed: frames already in the tap stay for the reader.
+        if (*s).tap {
+            audio::stream_running((*s).dev, s as usize, false);
+        }
+        print_stats(s, "paused");
+        STATUS_SUCCESS
+    }
+}
+
+/// Bytes played so far: time-based inside the current packet, never past the
+/// packet that is being played, never backwards.
+unsafe fn position_bytes(s: *const StreamCtx) -> u64 {
+    unsafe {
+        let size = (*s).packet_size as u64;
+        let done = (*s).current_packet.load(Ordering::SeqCst) as u64 * size;
+        let mut pos = done;
+        if (*s).state.load(Ordering::SeqCst) as i32 == _ACX_STREAM_STATE::AcxStreamStateRun {
+            let start = (*s).run_start_hns.load(Ordering::SeqCst) + (*s).shift_hns.load(Ordering::SeqCst);
+            let elapsed = now_hns(s).saturating_sub(start);
+            let base = (*s).run_base_packet.load(Ordering::SeqCst) as u64 * size;
+            let timed = base + elapsed.min(u64::MAX / (*s).bytes_per_sec as u64) * (*s).bytes_per_sec as u64 / HNS_PER_SEC;
+            pos = timed.clamp(done, done + size);
+        }
+        pos -= pos % (*s).block_align as u64;
+        (*s).reported_bytes.fetch_max(pos, Ordering::SeqCst).max(pos)
+    }
+}
+
+unsafe extern "C" fn evt_stream_get_presentation_position(
+    stream: ACXSTREAM,
+    position_in_blocks: PULONGLONG,
+    qpc_position: PULONGLONG,
+) -> NTSTATUS {
+    unsafe {
+        let s = stream_ctx(stream.cast());
+        *position_in_blocks = position_bytes(s) / (*s).block_align as u64;
+        *qpc_position = KeQueryPerformanceCounter(null_mut()).QuadPart as u64;
+    }
+    STATUS_SUCCESS
+}
+
+unsafe extern "C" fn evt_stream_get_current_packet(stream: ACXSTREAM, current_packet: PULONG) -> NTSTATUS {
+    unsafe {
+        *current_packet = (*stream_ctx(stream.cast())).current_packet.load(Ordering::SeqCst);
+    }
+    STATUS_SUCCESS
+}
+
+/// The audio engine announces that it finished writing `packet`. It must be
+/// the one after the packet being played (same checks as the sample).
+unsafe extern "C" fn evt_stream_set_render_packet(stream: ACXSTREAM, packet: ULONG, _flags: ULONG, _eos_packet_length: ULONG) -> NTSTATUS {
+    unsafe {
+        let s = stream_ctx(stream.cast());
+        let current = (*s).current_packet.load(Ordering::SeqCst);
+        if packet <= current {
+            (*s).set_packet_late.fetch_add(1, Ordering::Relaxed);
+            STATUS_DATA_LATE_ERROR
+        } else if packet > current.wrapping_add(1) {
+            (*s).set_packet_overrun.fetch_add(1, Ordering::Relaxed);
+            STATUS_DATA_OVERRUN
+        } else {
+            STATUS_SUCCESS
+        }
+    }
+}
+
+/// Timer DPC (DISPATCH_LEVEL): the packet being played is finished. Consume
+/// it, tell ACX, schedule the next boundary.
+unsafe extern "C" fn evt_stream_timer(timer: WDFTIMER) {
+    unsafe {
+        let stream = call_unsafe_wdf_function_binding!(WdfTimerGetParentObject, timer);
+        let s = stream_ctx(stream);
+        if s.is_null() {
+            return;
+        }
+        let mut burst = 0u32;
+        loop {
+            if !(*s).running.load(Ordering::SeqCst) {
+                return;
+            }
+            // Before the packet counter moves and before ACX is told: once
+            // the audio engine hears that this packet completed it starts
+            // overwriting the same buffer with the packet after next.
+            consume_packet(s, burst >= FRESH_PACKETS_PER_PASS);
+            let completed = (*s).current_packet.fetch_add(1, Ordering::SeqCst);
+            (*s).packets_done.fetch_add(1, Ordering::Relaxed);
+            let qpc = KeQueryPerformanceCounter(null_mut()).QuadPart as u64;
+            let _ = acx!(
+                AcxRtStreamNotifyPacketCompleteTableIndex,
+                PFN_ACXRTSTREAMNOTIFYPACKETCOMPLETE,
+                (*s).stream,
+                completed as u64,
+                qpc
+            );
+
+            // When does the packet that just started end?
+            let since_run = completed.wrapping_add(1).wrapping_sub((*s).run_base_packet.load(Ordering::SeqCst)) as u64;
+            let due = (*s).run_start_hns.load(Ordering::SeqCst)
+                + (*s).shift_hns.load(Ordering::SeqCst)
+                + packets_hns(s, since_run + 1);
+            let now = now_hns(s);
+            if due > now {
+                if (*s).running.load(Ordering::SeqCst) {
+                    let _ = call_unsafe_wdf_function_binding!(WdfTimerStart, timer, -((due - now) as i64));
+                }
+                return;
+            }
+            // Late: that packet is already over too.
+            let late = now - due;
+            (*s).late_passes.fetch_add(1, Ordering::Relaxed);
+            (*s).max_late_hns.fetch_max(late, Ordering::Relaxed);
+            burst += 1;
+            if burst >= MAX_CATCH_UP {
+                // Too far behind (stall, debugger): stop catching up and move
+                // the timeline so the next packet ends one duration from now.
+                let one = packets_hns(s, 1).max(1);
+                (*s).shift_hns.fetch_add(late + one, Ordering::SeqCst);
+                (*s).timeline_shifts.fetch_add(1, Ordering::Relaxed);
+                if (*s).running.load(Ordering::SeqCst) {
+                    let _ = call_unsafe_wdf_function_binding!(WdfTimerStart, timer, -(one as i64));
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// The packet being played has finished: hand it to the PCM tap. DISPATCH.
+///
+/// Which packet holds valid audio now: packet number `current_packet`, in
+/// buffer `current_packet % packet_count`. `current_packet` counts completed
+/// packets, so it is also the number of the packet that was being played up
+/// to this timer pass; the audio engine finished writing it one period
+/// earlier (it writes packet N+1 while N plays and announces it with
+/// SetRenderPacket, which is why that callback only accepts
+/// `current_packet + 1`). This is the same choice as the sample's
+/// `CRenderStreamEngine::ProcessPacket` (StreamEngine.cpp:
+/// `m_Packets[m_CurrentPacket % m_PacketsCount]`, read before
+/// `InterlockedIncrement(&m_CurrentPacket)` and before
+/// `AcxRtStreamNotifyPacketComplete`). Packet 0 starts at
+/// `first_packet_offset` in its allocation.
+///
+/// First packet after the first Run: packet 0, which the audio engine
+/// pre-rolls while the stream is paused; if it did not, the buffer is still
+/// the zeros it was allocated with. End of stream (SetRenderPacket's
+/// EosPacketLength) is not tracked, like in the sample: a last, partly
+/// filled packet is taken whole.
+///
+/// `stale`: this is the third or later packet of one late timer pass. The
+/// audio engine cannot have written it (see [`FRESH_PACKETS_PER_PASS`]);
+/// the buffer still holds the audio of two packets ago. The tap gets
+/// silence of the same length instead, so its frame count keeps following
+/// the endpoint's clock and old audio is not played twice.
+unsafe fn consume_packet(s: *const StreamCtx, stale: bool) {
+    unsafe {
+        let count = (*s).packet_count;
+        if count == 0 {
+            return;
+        }
+        let index = ((*s).current_packet.load(Ordering::SeqCst) % count) as usize;
+        let mut p = (*s).packets[index];
+        if p.is_null() {
+            return;
+        }
+        if index == 0 {
+            p = p.add((*s).first_packet_offset as usize);
+        }
+        let size = (*s).packet_size as usize;
+        if stale {
+            (*s).stale_packets.fetch_add(1, Ordering::Relaxed);
+        } else if core::slice::from_raw_parts(p, size).iter().any(|&b| b != 0) {
+            (*s).nonsilent_packets.fetch_add(1, Ordering::Relaxed);
+        }
+        if (*s).tap {
+            audio::render((*s).dev, s as usize, p, size, stale);
+        }
+    }
+}
+
+unsafe fn print_stats(s: *const StreamCtx, what: &str) {
+    unsafe {
+        let packets = (*s).packets_done.load(Ordering::Relaxed);
+        let frames = packets * ((*s).packet_size / (*s).block_align) as u64;
+        trace!(
+            "acx: stream {}: {} Hz/{}-bit, runs {}, packets {} ({} with signal), frames {}",
+            what,
+            (*s).sample_rate,
+            (*s).bits,
+            (*s).runs.load(Ordering::Relaxed),
+            packets,
+            (*s).nonsilent_packets.load(Ordering::Relaxed),
+            frames
+        );
+        trace!(
+            "acx: stream {}: late passes {} (max {} us), timeline shifts {}, SetRenderPacket late {} / overrun {}",
+            what,
+            (*s).late_passes.load(Ordering::Relaxed),
+            (*s).max_late_hns.load(Ordering::Relaxed) / 10,
+            (*s).timeline_shifts.load(Ordering::Relaxed),
+            (*s).set_packet_late.load(Ordering::Relaxed),
+            (*s).set_packet_overrun.load(Ordering::Relaxed)
+        );
+        if !(*s).dev.is_null() {
+            let (state, silence) = audio::stats((*s).dev);
+            trace!(
+                "acx: tap (device totals): rendered {} frames, dropped {}, silence for stale packets {} ({} packets of this stream), attached {}, link {}",
+                state.frames_rendered,
+                state.frames_dropped,
+                silence,
+                (*s).stale_packets.load(Ordering::Relaxed),
+                state.attached(),
+                state.link()
+            );
+        }
+    }
+}

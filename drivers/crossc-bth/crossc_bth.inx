@@ -1,0 +1,170 @@
+;
+; crossc_bth.inf - crossc driver for the A2DP sink node of Galaxy Buds
+;                  (ACX render endpoint + L2CAP pipe for the user-mode SSC encoder)
+;
+; WHAT THIS BINDS TO
+;   The BTHENUM child PDO that bthport/BthEnum creates for the remote device's
+;   A2DP *Sink* SDP record (UUID 0x110B, "AudioSink"). That PDO normally gets
+;   the inbox BthA2dp.sys via microsoft_bluetooth_a2dp_src.inf, which matches the
+;   compatible ID BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}.
+;
+; HOW IT IS INSTALLED (buds-specific hardware IDs only - NEVER the generic ID)
+;   Every model line is the A2DP hardware ID of one Galaxy Buds model
+;   (VID 0x0075 = Samsung, PID = the model). A hardware-ID match ranks
+;   0x00FF0000, better than the inbox INF's compatible-ID match (0x00FF2000),
+;   so ONCE THIS PACKAGE IS STAGED AND ITS CERT IS TRUSTED, PnP PICKS
+;   crossc_bth FOR THOSE BUDS AUTOMATICALLY on any (re)install of that node
+;   (re-pair, "update driver", reinstall). No other headset matches.
+;
+;   Do NOT add the generic BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}
+;   compatible ID here: a trusted test signature scores the same as the inbox
+;   Microsoft signature (AllSigningEqual, default since Windows 7), the
+;   identifier scores tie, and the newer DriverVer wins - so crossc would take
+;   over EVERY A2DP headset. build.rs fails the build if that line returns.
+;
+;   For another model, take the ..._VID&xxxxxxxx_PID&xxxx hardware ID of its
+;   A2DP node (docs/SETUP.md step 4) and add a line to the MODELS block below.
+;
+; NAMES
+;   The device description is the same for every model. The playback device
+;   reads "Headphones (<Bluetooth name of the buds>)": "Headphones" is the
+;   bridge pin category, the part in parentheses is the device's friendly
+;   name, which the driver sets at start from the Bluetooth device name
+;   (src/lib.rs, assign_friendly_name). If that name is not known and the
+;   device has no friendly name yet, the driver uses "Galaxy Buds", the same
+;   text as CrossC.Headphones.szPname (the KS interface name) below; keep the
+;   two in step.
+;
+; CLASS
+;   MEDIA, same class GUID as BthA2dp, so swapping function drivers on the node
+;   does not change its device class (no class change = no reinstall surprises,
+;   and the ACX render endpoint belongs in MEDIA anyway).
+;   Consequence: the MEDIA class upper filter ksthunk loads ABOVE crossc_bth
+;   (stack: ksthunk -> crossc_bth -> BthEnum, as it is ksthunk -> BthA2dp ->
+;   BthEnum today). Our IOCTLs use device type 0x8C55, not FILE_DEVICE_KS, so
+;   ksthunk should pass them through - but suspect it first if CreateFile or
+;   the IOCTLs misbehave in the first live test.
+;
+; ACX RENDER ENDPOINT
+;   The driver is an ACX audio driver with one render circuit named
+;   "Headphones0" (src/acx.rs). ACX registers and enables the KS device
+;   interfaces for that circuit itself; the AddInterface entries below put the
+;   properties on those interface keys and MUST use the same reference string
+;   as the circuit name (KSNAME_Headphones). KS.Registration /
+;   WDMAUDIO.Registration are what the inbox ACX and A2DP INFs pull in for a
+;   PnP-enumerated audio device. There is no INF directive for the ACX class
+;   extension: the image binds to it at load (acxstub.lib).
+;   Kill switch: DisableAcx=1 (REG_DWORD) under the device's
+;   "Device Parameters" key or under Services\crossc_bth\Parameters makes the
+;   driver skip all ACX calls (docs/SETUP.md section 10).
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = MEDIA
+ClassGuid   = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = crossc_bth.cat
+DriverVer   =
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+crossc_bth.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299
+
+[Standard.NT$ARCH$.10.0...16299]
+; One line per Galaxy Buds product ID (docs/MODELS.md has the model list and
+; sources): the hardware ID of the A2DP sink node
+; (never the generic compatible ID, see above). Keep all model lines between
+; the two markers, and nothing else.
+;; BEGIN MODELS
+; a013: Galaxy Buds4 Pro, Buds3 Pro (both tested), Buds3, Buds3 FE, Buds2 Pro,
+;       Buds2, Buds FE, Buds Pro, Buds Live, Buds Core
+%CrossC.DeviceDesc% = CrossC_Device, BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}_VID&00010075_PID&a013
+; a012: Galaxy Buds+
+%CrossC.DeviceDesc% = CrossC_Device, BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}_VID&00010075_PID&a012
+; a011: Galaxy Buds
+%CrossC.DeviceDesc% = CrossC_Device, BTHENUM\{0000110b-0000-1000-8000-00805f9b34fb}_VID&00010075_PID&a011
+;; END MODELS
+
+[CrossC_Device.NT]
+Include   = ks.inf, wdmaudio.inf
+Needs     = KS.Registration, WDMAUDIO.Registration
+CopyFiles = CrossC_Device_CopyFiles
+
+[CrossC_Device_CopyFiles]
+crossc_bth.sys
+
+[CrossC_Device.NT.HW]
+AddReg = CrossC_Device_Security_AddReg
+
+[CrossC_Device_Security_AddReg]
+; Device object DACL. This is exactly the SDDL that AcxDeviceInitInitialize
+; assigns to an ACX device (decoded from Acx01000.sys): SYSTEM and
+; Administrators full access, LOCAL SERVICE (audio service / audiodg) and
+; interactive users read/write/execute, so the audio stack can open the
+; circuit. A registry Security value overrides what the driver assigns, so a
+; SY/BA-only string would lock the audio stack out.
+; The DACL is per device object, so an interactive non-admin process can open
+; the crossc device interface too. The driver therefore checks the caller
+; itself: every crossc IOCTL except GET_INFO (L2CAP pipe and audio path) fails
+; with STATUS_ACCESS_DENIED unless the requesting process is SYSTEM or an
+; elevated administrator (requestor_is_admin in src/lib.rs).
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGWGX;;;LS)(A;;GRGWGX;;;IU)"
+
+[CrossC_Device.NT.Interfaces]
+AddInterface = %KSCATEGORY_AUDIO%,    %KSNAME_Headphones%, CrossC.I.Headphones
+AddInterface = %KSCATEGORY_RENDER%,   %KSNAME_Headphones%, CrossC.I.Headphones
+AddInterface = %KSCATEGORY_REALTIME%, %KSNAME_Headphones%, CrossC.I.Headphones
+
+[CrossC.I.Headphones]
+AddReg = CrossC.I.Headphones.AddReg
+
+[CrossC.I.Headphones.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%CrossC.Headphones.szPname%
+; Third-party INFs use EP\0 (MSEP\0 is reserved for inbox INFs).
+HKR,EP\0,%PKEY_AudioEndpoint_Association%,,%KSNODETYPE_ANY%
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
+
+[CrossC_Device.NT.Services]
+AddService = crossc_bth, 0x00000002, CrossC_Service_Inst
+
+[CrossC_Service_Inst]
+DisplayName   = %CrossC.SvcDesc%
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\crossc_bth.sys
+
+[CrossC_Device.NT.Wdf]
+KmdfService = crossc_bth, CrossC_wdfsect
+
+[CrossC_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+ProviderName     = "crossc"
+ManufacturerName = "crossc (test)"
+DiskName         = "crossc Installation Disk"
+CrossC.DeviceDesc = "Galaxy Buds (crossc SSC audio)"
+CrossC.SvcDesc    = "crossc Galaxy Buds audio driver"
+
+; ACX render endpoint. KSNAME_Headphones must equal CIRCUIT_NAME in src/acx.rs.
+KSNAME_Headphones         = "Headphones0"
+CrossC.Headphones.szPname = "Galaxy Buds"
+Proxy.CLSID               = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO          = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER         = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME       = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSNODETYPE_ANY            = "{00000000-0000-0000-0000-000000000000}"
+PKEY_AudioEndpoint_Association               = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
+PKEY_AudioEndpoint_Supports_EventDriven_Mode = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"

@@ -1,0 +1,228 @@
+name: Driver build prerequisites
+description: >
+  Installs what the crossc_bth driver build needs on a GitHub-hosted Windows x64 runner, the way
+  microsoft/windows-drivers-rs does it in its own CI: LLVM through WinGet and the WDK from NuGet packages.
+
+# Adapted from microsoft/windows-drivers-rs at commit 9e1d8a368811d8119a2773c473c93839a96ade23
+# (.github/actions/install-winget, install-winget-package, install-llvm and the NuGet path of install-wdk, which
+# is what its build.yaml matrix uses for WDK 10.0.26100). Copyright (c) Microsoft Corporation, licensed
+# MIT OR Apache-2.0. Changes: one action instead of five, x64 host and target only, inputs passed through the
+# environment, LIBCLANG_PATH exported, and a check for the Bluetooth DDI headers this driver binds.
+
+inputs:
+  llvm-version:
+    description: LLVM release to install with WinGet (package LLVM.LLVM). bindgen loads its libclang.
+    required: false
+    default: "17.0.6"
+  wdk-version:
+    description: >
+      WDK NuGet package version (Microsoft.Windows.WDK.x64): 10.0.XXXXX.YYYY, or 10.0.XXXXX for the newest
+      servicing release of that kit.
+    required: false
+    default: "10.0.26100.6584"
+
+runs:
+  using: composite
+  steps:
+    # windows-drivers-rs: .github/actions/install-winget
+    - name: Install the WinGet PowerShell module
+      shell: pwsh
+      run: |
+        Set-StrictMode -Version Latest
+
+        # Install-PSResource (PSResourceGet, built into PowerShell 7.4+) rather than Install-Module: it does not
+        # depend on the legacy PowerShellGet/NuGet provider, which fails intermittently on fresh runners
+        # (https://github.com/actions/runner-images/issues/13758).
+        if (-not (Get-PSResourceRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+          Register-PSResourceRepository -PSGallery -Trusted
+        }
+
+        $cliVersion = [version]((winget --version).Trim() -replace '^v', '')
+        Write-Host "WinGet CLI version: $cliVersion"
+
+        # The module must match the CLI: same major.minor, patch no newer than the CLI.
+        $versionRange = "[$($cliVersion.Major).$($cliVersion.Minor).0, $cliVersion]"
+        $allVersions = Find-PSResource -Name Microsoft.WinGet.Client -Repository PSGallery -Version $versionRange -ErrorAction Stop
+        if (-not $allVersions) {
+          throw "No Microsoft.WinGet.Client module found in range $versionRange on PSGallery."
+        }
+        $best = ($allVersions | Sort-Object Version -Descending | Select-Object -First 1).Version
+        Write-Host "Installing module version: $best"
+        Install-PSResource -Name Microsoft.WinGet.Client -Repository PSGallery -Version $best -TrustRepository -Quiet -ErrorAction Stop
+
+    # windows-drivers-rs: .github/actions/install-llvm + install-winget-package
+    - name: Install LLVM ${{ inputs.llvm-version }}
+      shell: pwsh
+      env:
+        LLVM_VERSION: ${{ inputs.llvm-version }}
+      run: |
+        Set-StrictMode -Version Latest
+        Import-Module Microsoft.WinGet.Client -Force
+
+        $packageId = 'LLVM.LLVM'
+        $version = $env:LLVM_VERSION
+        if ([string]::IsNullOrWhiteSpace($version)) { throw 'llvm-version cannot be empty' }
+        $maxRetries = 5
+        $delaySeconds = 30
+        $timeoutMinutes = 5
+
+        $shouldInstall = $true
+        $existing = Get-WinGetPackage -Id $packageId -Source winget -MatchOption Equals
+        if ($existing) {
+          Write-Host "$packageId is already installed: $($existing.InstalledVersion)"
+          if ($existing.InstalledVersion -eq $version) {
+            Write-Host 'Requested version is already installed. Skipping installation.'
+            $shouldInstall = $false
+          }
+        }
+
+        if ($shouldInstall) {
+          for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+            try {
+              Write-Host "Installing $packageId $version (attempt $attempt of $maxRetries)..."
+              $result = Install-WinGetPackage -Id $packageId -Version $version -Source winget -MatchOption Equals -Mode Silent -Force
+              if ($result.Status -ne 'Ok') {
+                throw "Package installation failed with status: $($result.Status). InstallerErrorCode: $($result.InstallerErrorCode)"
+              }
+              break
+            } catch {
+              Write-Warning "Attempt $attempt failed: $($_.Exception.Message)"
+              if ($attempt -eq $maxRetries) {
+                throw "All $maxRetries installation attempts failed. Last error: $($_.Exception.Message)"
+              }
+              Start-Sleep -Seconds $delaySeconds
+            }
+          }
+        }
+
+        # WinGet can report success before the package is visible; wait for it.
+        $deadline = (Get-Date).AddMinutes($timeoutMinutes)
+        while ($true) {
+          $installed = Get-WinGetPackage -Id $packageId -Source winget -MatchOption Equals
+          if ($installed) {
+            Write-Host "$packageId is installed with version: $($installed.InstalledVersion)"
+            break
+          }
+          if ((Get-Date) -ge $deadline) {
+            throw "$packageId is not visible to WinGet $timeoutMinutes minutes after installation."
+          }
+          Start-Sleep -Seconds 10
+        }
+
+    - name: Verify LLVM and export LIBCLANG_PATH
+      shell: pwsh
+      run: |
+        Set-StrictMode -Version Latest
+
+        $llvmBin = Join-Path $env:ProgramFiles 'LLVM\bin'
+        if (-not (Test-Path (Join-Path $llvmBin 'libclang.dll'))) {
+          throw "libclang.dll not found in $llvmBin"
+        }
+        & (Join-Path $llvmBin 'clang.exe') --version
+        if ($LASTEXITCODE -ne 0) { throw 'clang --version failed' }
+
+        # docs/SETUP.md builds with LIBCLANG_PATH pointing here. Exported so bindgen cannot pick up another
+        # libclang of the runner image (Visual Studio ships one too).
+        "LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV
+
+    # windows-drivers-rs: .github/actions/install-wdk, "Install WDK via NuGet"
+    - name: Install WDK ${{ inputs.wdk-version }} (NuGet)
+      shell: pwsh
+      env:
+        WDK_VERSION: ${{ inputs.wdk-version }}
+      run: |
+        Set-StrictMode -Version Latest
+        $ProgressPreference = 'SilentlyContinue'
+
+        function Select-SinglePackage {
+          param(
+            [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Packages,
+            [Parameter(Mandatory)][string]$PackageType
+          )
+          if ($Packages.Count -eq 1) { return $Packages[0] }
+          if ($Packages.Count -gt 1) {
+            throw "Multiple $PackageType packages found: $($Packages.Name -join ', '). Expected exactly one."
+          }
+          throw "No $PackageType package found."
+        }
+
+        $inputVersion = $env:WDK_VERSION
+        if ($inputVersion -notmatch '^10\.0\.\d{5}(\.\d{1,4})?$') {
+          throw "Invalid WDK version: $inputVersion. Expected 10.0.XXXXX or 10.0.XXXXX.YYYY"
+        }
+        $versionParts = $inputVersion.Split('.')
+        $sdkVersion = $versionParts[0..2] -join '.'
+
+        if ($versionParts.Length -eq 3) {
+          # NuGet WDK packages only exist with 4-part versions: resolve the newest servicing release.
+          $version = $null
+          $retryDelaySec = 5
+          for ($attempt = 1; $attempt -le 3 -and -not $version; $attempt++) {
+            try {
+              $response = Invoke-RestMethod -Uri 'https://api.nuget.org/v3-flatcontainer/microsoft.windows.wdk.x64/index.json' -TimeoutSec 30
+              $matching = @($response.versions | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' -and $_.StartsWith("$inputVersion.") })
+              if ($matching.Count -eq 0) { throw "No WDK NuGet package found for $inputVersion." }
+              $version = $matching | Sort-Object { [System.Version]$_ } | Select-Object -Last 1
+            } catch {
+              if ($_.Exception.Message -like 'No WDK NuGet package found*' -or $attempt -eq 3) { throw }
+              Write-Warning "Attempt $attempt failed: $($_.Exception.Message)"
+              Start-Sleep -Seconds $retryDelaySec
+              $retryDelaySec *= 2
+            }
+          }
+          Write-Host "Resolved WDK version: $version"
+        } else {
+          $version = $inputVersion
+        }
+
+        $packagesRootDir = 'C:\packages'
+        $packageName = 'Microsoft.Windows.WDK.x64'
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+          Write-Host "Installing $packageName $version (attempt $attempt of 3)..."
+          nuget install $packageName -Version $version -OutputDirectory $packagesRootDir -NonInteractive
+          if ($LASTEXITCODE -eq 0) { break }
+          if ($attempt -eq 3) { throw "Failed to install $packageName version $version" }
+          Start-Sleep -Seconds 15
+        }
+
+        $packageDirs = @(Get-ChildItem -Path $packagesRootDir -Directory | Where-Object { $_.Name -like "Microsoft.Windows.*.$sdkVersion.*" })
+        Write-Host 'Installed packages:'
+        $packageDirs | ForEach-Object { Write-Host "  - $($_.Name)" }
+
+        # The SDK comes in as a dependency of the WDK package: an architecture-neutral package plus per-arch ones.
+        $sdkPackageDir = Select-SinglePackage -PackageType 'architecture-neutral SDK' -Packages @(
+          $packageDirs | Where-Object { $_.Name -match "^Microsoft\.Windows\.SDK\.CPP\.$sdkVersion(\.\d+)?$" })
+        $wdkPackageDir = Select-SinglePackage -PackageType 'WDK x64' -Packages @(
+          $packageDirs | Where-Object { $_.Name -match "^Microsoft\.Windows\.WDK\.x64\.$sdkVersion(\.\d+)?$" })
+
+        # The variables wdk-build reads for a WDK that is not installed system-wide (eWDK / NuGet layout).
+        $envVars = [ordered]@{
+          'Version_Number'    = "$sdkVersion.0"
+          'WindowsSdkBinPath' = "$($sdkPackageDir.FullName)\c\bin"
+          'WDKContentRoot'    = "$($wdkPackageDir.FullName)\c\"
+          'WDKBinRoot'        = "$($wdkPackageDir.FullName)\c\bin\$sdkVersion.0"
+          'WDKToolRoot'       = "$($wdkPackageDir.FullName)\c\tools\$sdkVersion.0"
+          'NugetPackagesRoot' = $packagesRootDir
+          'FullVersionNumber' = "$version"
+        }
+        foreach ($key in 'WindowsSdkBinPath', 'WDKContentRoot', 'WDKBinRoot', 'WDKToolRoot') {
+          if (-not (Test-Path $envVars[$key])) { throw "Critical path not found: $key = $($envVars[$key])" }
+        }
+        foreach ($entry in $envVars.GetEnumerator()) {
+          Write-Host "$($entry.Key)=$($entry.Value)"
+          "$($entry.Key)=$($entry.Value)" >> $env:GITHUB_ENV
+        }
+
+        # crossc_bth binds the Bluetooth profile-driver DDI, which the windows-drivers-rs samples never include.
+        # Fail here, with a readable message, rather than deep inside bindgen.
+        foreach ($header in 'bthddi.h', 'bthdef.h', 'bthsdpdef.h', 'bthioctl.h') {
+          $found = @($packageDirs | ForEach-Object { Get-ChildItem -Path (Join-Path $_.FullName 'c\Include') -Recurse -Filter $header -ErrorAction SilentlyContinue })
+          if ($found.Count -eq 0) { throw "$header is not in the WDK/SDK NuGet packages under $packagesRootDir" }
+          Write-Host "$header -> $($found[0].FullName)"
+        }
+        # Informational: the ACX class-extension pieces (not needed by every revision of the driver).
+        foreach ($name in 'acx.h', 'acxstub.lib') {
+          $found = @(Get-ChildItem -Path (Join-Path $wdkPackageDir.FullName 'c') -Recurse -Filter $name -ErrorAction SilentlyContinue)
+          if ($found.Count -eq 0) { Write-Host "$name -> not in this WDK package" }
+          else { $found | Select-Object -First 4 | ForEach-Object { Write-Host "$name -> $($_.FullName)" } }
+        }

@@ -1,0 +1,33 @@
+[package]
+name = "crossc-bth"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[package.metadata.wdk.driver-model]
+driver-type = "KMDF"
+kmdf-version-major = 1
+target-kmdf-version-minor = 33
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+
+[build-dependencies]
+wdk-build = "0.6.0"
+bindgen = "0.73.2"
+
+[dependencies]
+wdk = "0.5.0"
+wdk-alloc = "0.4.2"
+wdk-panic = "0.5.0"
+wdk-sys = "0.5.2"
+crossc-ioctl = { path = "../../crates/crossc-ioctl" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace]

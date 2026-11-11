@@ -1,0 +1,44 @@
+[package]
+name = "ssc-enc"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Encoder for the Samsung Scalable/Seamless Codec (SSC, A2DP vendor 0x0075 codec 0x0103); a port of the BSD-3-Clause C encoder samsung-ssc-encoder"
+license = "BSD-3-Clause"
+publish = false
+readme = "README.md"
+categories = ["multimedia::encoding", "no-std"]
+
+[features]
+default = ["std"]
+# Transcendental functions (log2f, atan2, cos, sin) from the platform C runtime via std, like the C build.
+std = ["alloc"]
+# Encoder::new_boxed (builds the encoder directly on the heap). The encoder itself never allocates.
+alloc = ["dep:bytemuck"]
+# Transcendental functions from the pure-Rust libm crate, for no_std targets. Output is valid SSC but not
+# guaranteed byte-identical to the C reference (libm and the platform CRT may round differently).
+libm = ["dep:libm"]
+# Enables tests/oracle.rs, which compares against the C reference built by oracle/build_oracle.cmd
+# (path in SSC_ORACLE, default <workspace>/target/c-oracle/ssc_oracle.exe). Needs a C toolchain; off by default.
+oracle = []
+
+[dependencies]
+libm = { version = "0.2.16", optional = true }
+# Only for Encoder::new_boxed: bytemuck::zeroed_box allocates the encoder pre-zeroed on the heap (no stack copy).
+bytemuck = { version = "1", optional = true, default-features = false, features = ["derive", "min_const_generics", "extern_crate_alloc"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# The port keeps the C reference's literal constants and loop/branch structure on purpose: changing a float
+# literal or the evaluation order would break bit-exactness with the C encoder.
+approx_constant = "allow"
+excessive_precision = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+manual_clamp = "allow"
+collapsible_else_if = "allow"
+collapsible_if = "allow"
+neg_multiply = "allow"
+assign_op_pattern = "allow"

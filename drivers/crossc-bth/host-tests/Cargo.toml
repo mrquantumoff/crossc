@@ -1,0 +1,22 @@
+# Host-side unit tests for the driver's kernel-free logic.
+#
+# The driver crate itself cannot run `cargo test` (cdylib for the kernel,
+# wdk-sys, panic = abort). The modules that hold the audio path's logic are
+# plain no_std Rust without kernel calls, so this crate compiles the very same
+# source files (`#[path]` in src/lib.rs) for the host and tests them:
+#
+#   cd drivers\crossc-bth\host-tests
+#   cargo test
+#
+# It is its own workspace on purpose: neither the root workspace nor the
+# driver's WDK build picks it up.
+[package]
+name = "crossc-bth-host-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+crossc-ioctl = { path = "../../../crates/crossc-ioctl" }
+
+[workspace]

@@ -1,0 +1,31 @@
+[package]
+name = "crossc-service"
+version = "0.1.0"
+edition = "2024"
+description = "Windows service that turns the crossc endpoint's PCM into an SSC stream to the Galaxy Buds"
+publish = false
+
+[[bin]]
+name = "crossc-service"
+path = "src/main.rs"
+
+[dependencies]
+crossc-core = { path = "../crossc-core" }
+crossc-ioctl = { path = "../crossc-ioctl" }
+
+[dev-dependencies]
+crossc-core = { path = "../crossc-core", features = ["testing"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Console",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+]

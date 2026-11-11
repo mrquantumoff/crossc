@@ -1,0 +1,25 @@
+# cargo-about configuration for THIRD-PARTY-LICENSES.html (tools/package.ps1 runs it once per Cargo workspace:
+# the root workspace and drivers/crossc-bth).
+#
+# `accepted` is the complete list of licenses a dependency may be used under. cargo-about fails, and with it the
+# package job, when a crate offers none of them. Adding a license here is a decision about what crossc
+# redistributes: read the license first. For "A OR B" expressions the first match in this list is the one used.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+]
+
+# Only what ends up in the shipped x64 Windows binaries: no other platforms, no build scripts' or tests' crates.
+targets = ["x86_64-pc-windows-msvc"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# The crates of this repository (publish = false) are not third-party; their license is the repo's LICENSE and,
+# for ssc-enc, crates/ssc-enc/NOTICE and LICENSE-THIRD-PARTY, which package.ps1 copies into the bundle.
+private = { ignore = true }

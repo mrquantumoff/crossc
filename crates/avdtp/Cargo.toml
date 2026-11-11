@@ -1,0 +1,8 @@
+[package]
+name = "avdtp"
+version = "0.1.0"
+edition = "2024"
+description = "no_std AVDTP 1.3 signaling encoder/decoder, A2DP codec elements (SBC, AAC, vendor, Samsung SSC) and RTP header helpers"
+publish = false
+
+[dependencies]
