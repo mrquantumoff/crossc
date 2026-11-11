@@ -178,7 +178,10 @@ pub struct Counters {
     pub packets: u64,
     /// PCM frames taken from the endpoint.
     pub pcm_frames: u64,
-    /// PCM frames the driver dropped because the service was too slow.
+    /// PCM frames the driver dropped from a started stream because the
+    /// service did not read them in time, since the session started. Not
+    /// the driver's own counter, which is never reset and also counts what
+    /// is rendered while no stream reads it.
     pub dropped_frames: u64,
     /// Gaps in the PCM the driver reported.
     pub discontinuities: u64,

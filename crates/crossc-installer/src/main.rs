@@ -28,6 +28,7 @@ mod parse;
 mod release;
 mod service;
 mod system;
+mod tray;
 mod ui;
 mod update;
 
@@ -291,6 +292,30 @@ fn status_report(layout: &Layout, s: &Status) -> String {
                 .display()
                 .to_string())
     );
+    let _ = writeln!(
+        out,
+        "tray              : {}, {}, autostart {}",
+        if s.tray.installed {
+            "installed"
+        } else {
+            "not installed"
+        },
+        if s.tray.running {
+            "running"
+        } else {
+            "not running"
+        },
+        s.tray
+            .autostart
+            .map_or("unknown", |on| if on { "on" } else { "off" })
+    );
+    let _ = writeln!(
+        out,
+        "tray exe          : {}",
+        s.tray_exe
+            .as_ref()
+            .map_or("missing".to_string(), |p| p.display().to_string())
+    );
     let latest = model::latest_item(s).detail;
     let _ = match s.latest.source_text() {
         Some(source) => writeln!(out, "latest release    : {latest}  [{source}]"),
@@ -373,6 +398,9 @@ mod tests {
             "cert",
             "staged",
             "service           : not installed  [-]",
+            "tray              : not installed, not running, autostart unknown",
+            r"tray exe          : C:\x\target\release\crossc-tray.exe",
+            "] Tray app             not installed (Install adds and starts it)",
             "latest release    : unknown: \"Check for update\" asks GitHub for the newest release",
             "installed version : unknown",
             "install record    : certificate -, version -, driver -, pending certificates -",

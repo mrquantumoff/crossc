@@ -32,7 +32,9 @@ and aptX only and has no codec plug-in interface.
 | Protocol | `crates/avdtp` | AVDTP signaling, capability parsing, RTP header (`no_std`). |
 | Encoder | `crates/ssc-enc` | SSC encoder, byte-identical to the BSD reference encoder. |
 | Core | `crates/crossc-core` | Device access, AVDTP session, stream setup, packetiser, pacing, adaptive bitrate. Used by the service and the CLI. |
-| Service | `crates/crossc-service` | Windows service that turns the endpoint's PCM into an SSC stream. |
+| Service | `crates/crossc-service` | Windows service that turns the endpoint's PCM into an SSC stream, and publishes what it is doing on the status pipe. |
+| Status | `crates/crossc-status` | The status feed between the service and its user interfaces: the snapshot, its wire format and the named pipe `\\.\pipe\crossc-status`. |
+| Tray | `crates/crossc-tray` | Notification-area icon and details window of the logged-on user; reads the status pipe, never the driver. |
 | CLI | `crates/crossc-cli` | `probe`, `media`, `play`, `raw`: diagnostics and experiments. |
 | Installer | `crates/crossc-installer` | GPUI app: install / uninstall the driver and the service, status. |
 
@@ -81,7 +83,7 @@ Rules the driver keeps regardless of the service:
   |---|---|---|
   | 96 kHz | UHQ v2 (`0x02`, and not `0x01`) | UHQ, config `0x0A`, 584 kbps, one frame per packet |
   | 96 kHz | no UHQ | resampled to 48 kHz, then as the 48 kHz row |
-  | 48 kHz | HiFi (`0x04`) | HiFi, config `0x0C`, 192 kbps, 24-bit (16-bit input widened) |
+  | 48 kHz | HiFi (`0x04`) | HiFi, config `0x0C`, 229 kbps, 24-bit (16-bit input widened) |
   | 48 kHz | 48 kHz SSC only (`0x10`) | SSC 48 kHz, config `0x10` (+`0x08` if offered), 16-bit (24-bit input dithered down) |
   | any | 44.1 kHz SSC only (`0x20`) | resampled to 44.1 kHz, SSC config `0x20` (+`0x08`) |
 
@@ -105,11 +107,41 @@ Rules the driver keeps regardless of the service:
   sink sends CLOSE / ABORT -> `AUDIO_SET_LINK(disconnected)`, wait for the next
   connection. A sink SUSPEND is honoured and retried while audio is playing.
 * **Settings** (`HKLM\SOFTWARE\crossc`): `UhqConfig` (default `0x0A`),
-  `HifiBitrate` (192; 88, 96, 128, 192 or 229), `UhqBitrate` (584; 152, 291
+  `HifiBitrate` (229; 88, 96, 128, 192 or 229), `UhqBitrate` (584; 152, 291
   or 584), `AdaptiveBitrate` (1), `LogLevel`. A bitrate the buds are not
   known to decode (HiFi 256 or 328, UHQ 250, 308, 442 or 886) is lowered to
   the next one they are, with a warning. Log:
   `%ProgramData%\crossc\service.log`.
+* **Status feed.** The driver's IOCTLs are for SYSTEM and Administrators, so
+  a program of the logged-on user can show nothing it does not get from the
+  service. The service therefore keeps one snapshot of its state (per
+  device: phase and the reason for it, endpoint format, mode, stream rate
+  and depth, bitrate with its ladder and rung, media MTU limit, counters,
+  volume, driver version, last warning or error) and sends it on the named
+  pipe `\\.\pipe\crossc-status` (`crates/crossc-status`; the tray app is its
+  reader). The pipe is outbound only: the service never reads from a client
+  and never impersonates one. Users may read the service's pipe and only
+  SYSTEM and Administrators may add an instance to it. That protects the
+  pipe while the service runs; while it does not, any program could create
+  a pipe of that name, so a client believes only a pipe whose owner is
+  SYSTEM or Administrators.
+
+  The feed must never cost audio. A session thread only replaces its entry
+  in a shared value (a short lock, no I/O, no client involved): at once when
+  its phase, bitrate or stream configuration changes, otherwise at most
+  every 250 ms while audio streams. The entry is built from what the session
+  already holds in memory; no driver call is made for it. Sending is the
+  work of the pipe's own thread, which paces what goes out (a change of
+  substance within 100 ms, running numbers every 500 ms while streaming,
+  every 2 s otherwise). A pipe that cannot be created is retried in the
+  background and said once in the log; the service streams with or without
+  it. Dropped frames are the exception in how they are kept: the driver's
+  counter is never reset and also counts what is rendered while nothing
+  reads it, so the session adds up only what that counter rose by while a
+  stream was started. It reads the counter when the stream starts (the
+  base), with each statistics interval, with every state the driver
+  announces and when the stream stops; the counter itself raises no state
+  event, so that one number can be up to a minute old.
 
 ## Adaptive bitrate
 
@@ -125,7 +157,7 @@ a packet does not fit the media MTU. Below it:
 
 | Mode | Rates, kbps | Packet bytes | Audio per packet |
 |---|---|---|---|
-| HiFi 48 kHz/24 | 192 / 128 / 88 | 496 / 336 / 236 | 18 ms |
+| HiFi 48 kHz/24 | 229 / 192 / 128 / 88 | 588 / 496 / 336 / 236 | 18 ms |
 | SSC 48 or 44.1 kHz/16 | 229 / 128 / 88 | 588 / 336 / 236 | 18 / 19.6 ms |
 | UHQ 96 kHz/24 | 584 / 291 / 152 | 672 / 672 / 360 | 9 / 18 / 18 ms |
 
@@ -135,6 +167,11 @@ size of a 584 kbps packet. A rate change takes effect at a packet boundary,
 so a packet never mixes rates. Only rates the buds are known to decode are
 ever sent (up to 229 kbps at 44.1 / 48 kHz; 152, 291 and 584 kbps in UHQ);
 the settings and the MTU fallback use the same list.
+
+HiFi's top is 229 kbps by default: Buds4 Pro and Buds3 Pro were measured to
+decode both 229 and 192 kbps in HiFi (config `0x0C`, 48 kHz), and 192 kbps,
+the highest rate Samsung phones send, is the first rung below it.
+`HifiBitrate = 192` gives the phones' ladder, 192 / 128 / 88.
 
 **Signals.** What user mode can observe, and what it is worth:
 
@@ -203,8 +240,9 @@ the settings and the MTU fallback use the same list.
   top; a format change within a mode (24 <-> 16 bit) keeps it.
 * Never above the configured rate; `AdaptiveBitrate = 0` gives a one-rung
   ladder: one fixed rate, as 0.2.0 sent. (Which rate can differ from 0.2.0
-  in two cases, adaptive or not: a configured rate the buds are not known
-  to decode is lowered to the next one that is, and so is the fallback
+  in three cases, adaptive or not: HiFi without a `HifiBitrate` setting is
+  229 kbps where 0.2.0 sent 192; a configured rate the buds are not known
+  to decode is lowered to the next one that is; and so is the fallback
   when a packet does not fit the media MTU, 584 -> 291 kbps where 0.2.0
   took 442.)
 

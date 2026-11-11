@@ -5,7 +5,7 @@
 //! | Value | Type | Default | Meaning |
 //! |---|---|---|---|
 //! | `UhqConfig` | DWORD | `0x0A` | SSC configuration octet sent for UHQ. Must contain `0x02` and only bits of `0x0E` (`0x0A`, or `0x0E` as another implementation sends). |
-//! | `HifiBitrate` | DWORD | 192 | HiFi bitrate in kbps, the top of the adaptive ladder: 88, 96, 128, 192 or 229 (what the buds' decoder takes at 48 kHz). 256 and 328 are lowered to 229. |
+//! | `HifiBitrate` | DWORD | 229 | HiFi bitrate in kbps, the top of the adaptive ladder: 88, 96, 128, 192 or 229 (what the buds' decoder takes at 48 kHz). 256 and 328 are lowered to 229. |
 //! | `UhqBitrate` | DWORD | 584 | UHQ bitrate in kbps, the top of the adaptive ladder: 152, 291 or 584 (the UHQ rates the buds decode). Another UHQ rate is lowered to the next of these. |
 //! | `AdaptiveBitrate` | DWORD | 1 | 1: the bitrate follows the link ([`crate::abr`]), never above the two values before. 0: always those (after the MTU fit, which steps down the rates the buds decode: 584 to 291 kbps, where 0.2.0 took 442). |
 //! | `LogLevel` | DWORD or string | 2 | 0 error, 1 warn, 2 info, 3 debug. |
@@ -41,7 +41,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             uhq_config: SscFlags::CONFIG_UHQ_V2,
-            hifi_bitrate: Bitrate::K192,
+            hifi_bitrate: Bitrate::K229,
             uhq_bitrate: Bitrate::K584,
             adaptive: true,
             log_level: Level::Info,
@@ -274,12 +274,12 @@ mod tests {
         assert!(w.is_empty());
         assert_eq!(
             (st.uhq_config, st.hifi_bitrate, st.uhq_bitrate, st.log_level),
-            (0x0A, Bitrate::K192, Bitrate::K584, Level::Info)
+            (0x0A, Bitrate::K229, Bitrate::K584, Level::Info)
         );
         assert!(st.adaptive);
         assert_eq!(
             st.describe(),
-            "UhqConfig=0x0a HifiBitrate=192 UhqBitrate=584 AdaptiveBitrate=1 LogLevel=info"
+            "UhqConfig=0x0a HifiBitrate=229 UhqBitrate=584 AdaptiveBitrate=1 LogLevel=info"
         );
     }
 
@@ -372,14 +372,14 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert_eq!(
             (st.hifi_bitrate, st.uhq_bitrate),
-            (Bitrate::K192, Bitrate::K291)
+            (Bitrate::K229, Bitrate::K291)
         );
     }
 
     #[test]
     fn rates_the_buds_do_not_decode_are_lowered_never_raised() {
         // (value, asked for, used): never more than what was asked for,
-        // which a fall-back to the default (192, 584) would be.
+        // which a fall-back to the default (229, 584) would be.
         for (name, asked, used) in [
             (VALUE_HIFI_BITRATE, 256, 229),
             (VALUE_HIFI_BITRATE, 328, 229),

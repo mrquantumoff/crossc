@@ -39,7 +39,7 @@ use windows::Win32::UI::Shell::{
 use windows::core::{GUID, HSTRING, PCWSTR};
 
 use crate::cert::{Store, TRUST_STORES, thumbprint};
-use crate::layout::{self, Layout, Mode, bundle_version_of, kept_release_dir};
+use crate::layout::{self, Layout, Mode, TRAY_EXE, bundle_version_of, kept_release_dir};
 use crate::model::{
     CertInfo, Flavor, InstallRecord, Latest, NodeInfo, PackageInfo, PackageKind, REQUIRED_FILES,
     Status, USER_SERVICE, hwid_matches, order_nodes, unlisted_on_driver,
@@ -49,6 +49,7 @@ use crate::parse::{
     format_age, hex_upper, inf_driver_ver, inf_hardware_ids, parse_enum_drivers,
 };
 use crate::service;
+use crate::tray;
 
 /// Keeps child consoles from flashing up when the app runs without one (release build).
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -118,6 +119,8 @@ pub fn query_status(layout: &Layout, flavor: Flavor) -> Status {
         service: service::query(USER_SERVICE),
         service_exe: Some(layout.service_exe())
             .filter(|p| p.is_file() && damaged_exe(p).is_none()),
+        tray: tray::query(&install_dir().join(TRAY_EXE)),
+        tray_exe: Some(layout.tray_exe()).filter(|p| p.is_file()),
         online: layout.mode == Mode::Online,
         record: read_record(),
         bundle_version: match layout.mode {
@@ -334,7 +337,8 @@ fn write_record_at(
     }
 }
 
-fn reg_string(root: HKEY, subkey: &str, value: &str) -> Option<String> {
+/// A string value; `None` when it is missing, empty or no string.
+pub fn reg_string(root: HKEY, subkey: &str, value: &str) -> Option<String> {
     let (subkey, value) = (HSTRING::from(subkey), HSTRING::from(value));
     unsafe {
         let mut bytes = 0u32;

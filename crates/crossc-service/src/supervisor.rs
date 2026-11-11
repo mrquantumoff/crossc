@@ -40,6 +40,9 @@ pub trait Host {
     /// Start a session for interface `path`; it must end once `stop` is
     /// requested.
     fn spawn(&self, path: &str, stop: StopSignal) -> Box<dyn Worker>;
+    /// Every session has been stopped and joined (the machine goes to
+    /// sleep): nothing of them may be left on show.
+    fn sessions_stopped(&self) {}
 }
 
 struct Running {
@@ -188,6 +191,7 @@ impl<H: Host> Supervisor<H> {
                         self.log
                             .log(Level::Info, "system is suspending: stopping sessions");
                         self.stop_all();
+                        self.host.sessions_stopped();
                     }
                     suspended = true;
                 }
@@ -224,6 +228,8 @@ mod tests {
         present: Mutex<Result<Vec<String>, String>>,
         spawned: Mutex<Vec<Spawned>>,
         joined: Mutex<Vec<String>>,
+        /// Sessions joined at each "all sessions stopped".
+        all_stopped: Mutex<Vec<usize>>,
     }
 
     struct FakeHost(Arc<World>);
@@ -266,6 +272,10 @@ mod tests {
                 world: self.0.clone(),
             })
         }
+        fn sessions_stopped(&self) {
+            let joined = self.0.joined.lock().unwrap().len();
+            self.0.all_stopped.lock().unwrap().push(joined);
+        }
     }
 
     fn world(present: &[&str]) -> Arc<World> {
@@ -273,6 +283,7 @@ mod tests {
             present: Mutex::new(Ok(Vec::new())),
             spawned: Mutex::default(),
             joined: Mutex::default(),
+            all_stopped: Mutex::default(),
         });
         set(&w, present);
         w
@@ -371,6 +382,8 @@ mod tests {
         assert_eq!(s.active(), ["a", "b"]);
         assert_eq!(log.find("system is suspending").len(), 1);
         assert_eq!(log.find("system resumed").len(), 1);
+        // The host heard of the suspend once, after both sessions had ended.
+        assert_eq!(*w.all_stopped.lock().unwrap(), [2]);
         s.stop_all();
         assert_eq!(w.joined.lock().unwrap().len(), 4);
     }

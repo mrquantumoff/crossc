@@ -1,7 +1,7 @@
 //! Build / Install / Uninstall / Remove certificate, run on a worker thread. The driver steps use the pnputil
 //! commands of tools/install-driver.ps1 (Install stages the new package before it removes the older ones, see
-//! `Ctx::install_stopping`); Install and Uninstall also handle the `crossc` service. Every child process's stdout
-//! and stderr are streamed line by line into the log callback as they arrive.
+//! `Ctx::install_stopping`); Install and Uninstall also handle the `crossc` service and the tray app (`tray`).
+//! Every child process's stdout and stderr are streamed line by line into the log callback as they arrive.
 //!
 //! "Download and install" is two calls with the user's confirmation between them: `fetch_release` downloads,
 //! verifies and unpacks a release and reports its certificate; `install_release` then runs the same Install on
@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use crate::cert::{Store, TEST_CERT_SUBJECT, TRUST_STORES, describe, parse_thumbprint, thumbprint};
 use crate::layout::{
-    BUNDLE_DRIVER_DIR, CLI_EXE, INSTALLER_EXE, Layout, Mode, SERVICE_EXE, bundle_version_of,
-    kept_release_dir,
+    BUNDLE_DRIVER_DIR, CLI_EXE, INSTALLER_EXE, Layout, Mode, SERVICE_EXE, TRAY_EXE,
+    bundle_version_of, kept_release_dir,
 };
 use crate::model::{
     DRIVER_SERVICE, FetchedRelease, Flavor, INBOX_SERVICE, InstallVerdict, NodeInfo, PackageInfo,
@@ -37,6 +37,7 @@ use crate::service;
 use crate::system::{
     self, CREATE_NO_WINDOW, RECORD_CERT, RECORD_DRIVER_VER, RECORD_PENDING, RECORD_VERSION,
 };
+use crate::tray;
 use crate::update;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,16 +518,31 @@ impl Ctx<'_> {
         if self.layout.has_service_crate() {
             args.extend(["-p", "crossc-service"]);
             built.push(self.layout.service_exe());
-            self.step("Building crossc-cli and crossc-service (release)");
-        } else {
-            self.step("Building crossc-cli (release)");
         }
+        self.step(build_step(&args));
         let rc = self.run_cmd(&cargo, &args, &self.layout.root, &env)?;
         if rc != 0 {
             return Err(format!("cargo {} failed (exit {rc})", args.join(" ")));
         }
         for exe in built {
             self.success(exe.display().to_string());
+        }
+
+        // The tray in a cargo run of its own: Windows does not let a running program be replaced, and a
+        // developer's tray runs from this very file (docs/SETUP.md 16a). That must not take the service and
+        // the CLI down with it; the tray is an extra here as it is in Install.
+        if self.layout.has_tray_crate() {
+            let args = ["build", "--release", "-p", "crossc-tray"];
+            let exe = self.layout.tray_exe();
+            self.step(build_step(&args));
+            let rc = self.run_cmd(&cargo, &args, &self.layout.root, &env)?;
+            match tray_build(rc, tray::running_count(&exe) > 0) {
+                TrayBuild::Built => self.success(exe.display().to_string()),
+                TrayBuild::InUse => self.warn(tray_in_use_note(rc, &exe)),
+                TrayBuild::Failed => {
+                    return Err(format!("cargo {} failed (exit {rc})", args.join(" ")));
+                }
+            }
         }
         Ok(())
     }
@@ -1123,7 +1139,8 @@ impl Ctx<'_> {
             self.remove_service()?;
         }
 
-        if same_file(source, &dest) {
+        let in_place = same_file(source, &dest);
+        if in_place {
             self.info(format!("{} is already in place", dest.display()));
         } else {
             std::fs::create_dir_all(&dest_dir)
@@ -1131,17 +1148,28 @@ impl Ctx<'_> {
             self.copy(source, &dest)?;
             self.copy_cli(&dest_dir, COPY_ATTEMPTS);
         }
+        // The tray is replaced here, with the other files, and started last: whether or not the service
+        // then registers and starts, a tray this Install ended comes back (it says what the service does).
+        let tray = (!in_place).then(|| self.update_tray(&dest_dir, COPY_ATTEMPTS));
+        let result = self.register_and_start(&dest, &dest_dir);
+        if let Some(tray) = tray {
+            self.finish_tray(&dest_dir, tray);
+        }
+        result
+    }
 
+    /// `crossc-service.exe install` in the install folder, then the start.
+    fn register_and_start(&self, dest: &Path, dest_dir: &Path) -> Result<(), String> {
         // The contract of crossc-service.exe: `install` registers the service, exit code 0 on success. Whether it
         // minds an existing registration is not promised, so the service control manager has the last word.
-        let rc = self.run_cmd(&dest, &["install"], &dest_dir, &[])?;
+        let rc = self.run_cmd(dest, &["install"], dest_dir, &[])?;
         let after = service::query(USER_SERVICE)?;
         if !after.state.installed() {
             return Err(format!(
                 "crossc-service install exited {rc} and the crossc service is not registered"
             ));
         }
-        let ours = registered_with(after.exe.as_deref(), &dest);
+        let ours = registered_with(after.exe.as_deref(), dest);
         match (rc, ours) {
             (0, true) => self.success(format!("service registered: {}", dest.display())),
             (0, false) => self.warn(format!(
@@ -1186,22 +1214,204 @@ impl Ctx<'_> {
     /// stops Install: not a bundle without it, and not a copy that fails because an older crossc-cli.exe is
     /// running from the install folder (the service still has to be registered and started after this).
     fn copy_cli(&self, dest_dir: &Path, attempts: u32) {
-        let cli = self.layout.cli_exe();
-        if !cli.is_file() {
-            self.warn(format!("{} not found: not copied", cli.display()));
+        self.copy_extra(&self.layout.cli_exe(), &dest_dir.join(CLI_EXE), attempts);
+    }
+
+    /// Copies a program Install can do without (the CLI, the tray). A source that is not there and a copy that
+    /// fails are warnings; `true` when the file was copied.
+    fn copy_extra(&self, source: &Path, dest: &Path, attempts: u32) -> bool {
+        if !source.is_file() {
+            self.warn(format!("{} not found: not copied", source.display()));
+            return false;
+        }
+        let Err(e) = self.copy_with(source, dest, attempts) else {
+            return true;
+        };
+        self.warn(extra_not_copied(&e, dest));
+        false
+    }
+
+    /// Puts `crossc-tray.exe` next to the installed service, ending a running tray first so its file can be
+    /// replaced. An extra like the CLI: a bundle without it (a release from before there was a tray) and a copy
+    /// that fails are warnings. A tray that is installed already is only ended when there is a new one to put
+    /// in its place.
+    ///
+    /// A tray that cannot be ended (another account's that Windows does not let this process open or end) does
+    /// not keep the old exe in place: the file in use is moved aside and the new one put where it was, so the
+    /// tray is the new one the next time it starts and Install need not be run again.
+    fn update_tray(&self, dest_dir: &Path, attempts: u32) -> TrayStep {
+        let source = self.layout.tray_exe();
+        let dest = dest_dir.join(TRAY_EXE);
+        let mut step = TrayStep {
+            first_install: !dest.is_file(),
+            was_running: false,
+            still_running: false,
+            copied: false,
+        };
+        if !source.is_file() {
+            // Says that it is not there.
+            step.copied = self.copy_extra(&source, &dest, attempts);
+            return step;
+        }
+        // What an earlier Install moved aside is free once that tray has exited.
+        remove_set_aside(&dest);
+        let stopped = tray::stop(&dest);
+        // Only a tray of this desktop is one to start again: another user's, in another session, says nothing
+        // about whether the user here had theirs open.
+        step.was_running = stopped.ended_here > 0;
+        step.still_running = stopped.left_here > 0;
+        if stopped.ended_here > 0 {
+            self.info("closed the running crossc-tray to replace it");
+        }
+        if stopped.ended_elsewhere > 0 {
+            self.info(format!(
+                "closed crossc-tray in {} other session(s) (another signed-in user's) to replace it; it starts \
+                 again when that user signs in, or opens it",
+                stopped.ended_elsewhere
+            ));
+        }
+        if let Some(e) = &stopped.error {
+            self.warn(e);
+        }
+        match self.copy_with(&source, &dest, attempts) {
+            Ok(()) => step.copied = true,
+            Err(e) => match replace_in_use(&source, &dest) {
+                Ok(aside) => {
+                    step.copied = true;
+                    // A tray that could not be ended, or could not even be looked at, is what holds the old
+                    // file: it is still there, and a new one next to it would exit at once. (With no such
+                    // tray the file was held by something else, and a tray that was ended comes back.)
+                    step.still_running |= stopped.left_elsewhere > 0 || stopped.unreadable > 0;
+                    self.success(format!("{} -> {}", source.display(), dest.display()));
+                    self.warn(format!(
+                        "{} was in use, so it was moved to {} and the new one put in its place. The old file is \
+                         deleted by the next Install or Uninstall",
+                        dest.display(),
+                        aside.display()
+                    ));
+                }
+                Err(_) => {
+                    self.warn(extra_not_copied(&e, &dest));
+                    // Only worth saying when the file could not be replaced: then such a tray is the likely
+                    // reason.
+                    if let Some(note) = stopped.left_note(&dest) {
+                        self.warn(note);
+                    }
+                }
+            },
+        }
+        step
+    }
+
+    /// After the service: has the tray start with Windows for the signed-in user (first install only) and
+    /// starts it in that user's session, not elevated (`tray::tray_plan`). Nothing here stops Install; what
+    /// could not be done is said with what to do by hand.
+    fn finish_tray(&self, dest_dir: &Path, step: TrayStep) {
+        let exe = dest_dir.join(TRAY_EXE);
+        // Nothing new and nothing ended (a release without a tray, or a copy that failed): nothing to do. A
+        // tray that was ended and could not be replaced is started again as it was.
+        if !exe.is_file() || !(step.copied || step.was_running) {
             return;
         }
-        let dest = dest_dir.join(CLI_EXE);
-        if let Err(e) = self.copy_with(&cli, &dest, attempts) {
+        let plan = tray::tray_plan(step.first_install, step.was_running, step.still_running);
+        if step.still_running {
+            // Starting one now would start nothing: the new process finds the old one and exits.
             self.warn(format!(
-                "{e}. Going on without it: {} is {}. Close any running crossc-cli and run Install again to \
-                 update it",
-                dest.display(),
-                if dest.is_file() {
-                    "left as it was"
-                } else {
-                    "not installed"
+                "a crossc-tray that could not be closed is still running, so none is started. Exit it (its \
+                 menu, Exit) and open it again: {}",
+                exe.display()
+            ));
+        }
+        if !plan.register && !plan.start {
+            if !step.still_running {
+                self.info(format!(
+                    "crossc-tray is updated; it was not running and is left closed (to open it: {})",
+                    exe.display()
+                ));
+            }
+            return;
+        }
+        self.step("Starting the tray app");
+        let by_hand = format!("Open the tray yourself: {}", exe.display());
+        // This process is elevated and may run as another account than the one at the desktop: the tray is
+        // registered and started for the desktop's user, with that user's rights, never as a child of this
+        // process.
+        let Some(user) = tray::desktop_user() else {
+            self.warn(format!(
+                "cannot tell who is signed in at this desktop, so crossc-tray is neither started nor set to \
+                 start with Windows. {by_hand} (its menu has \"Start with Windows\")"
+            ));
+            return;
+        };
+        let mut registered = false;
+        if plan.register {
+            match tray::enable_autostart(&user, &exe) {
+                Ok(()) => {
+                    registered = true;
+                    self.success(
+                        "crossc-tray starts with Windows for the signed-in user (to change that: \"Start with \
+                         Windows\" in its menu)",
+                    );
                 }
+                Err(e) => self.warn(format!(
+                    "cannot register crossc-tray to start with Windows: {e}. Switch it on in the tray's menu"
+                )),
+            }
+        }
+        if plan.start {
+            match tray::start_as(&user, &exe) {
+                Ok(()) => self.success(
+                    "crossc-tray is started (not elevated): its icon is in the notification area",
+                ),
+                Err(e) if registered => self.warn(format!(
+                    "{e}. {by_hand}; it also starts the next time you sign in"
+                )),
+                Err(e) => self.warn(format!("{e}. {by_hand}")),
+            }
+        }
+    }
+
+    /// Uninstall: ends the tray, deletes its exe and takes its autostart away. Whatever became of the service:
+    /// the driver goes either way, and a tray without it has nothing to show.
+    fn remove_tray(&self) {
+        let exe = system::install_dir().join(TRAY_EXE);
+        self.remove_tray_at(&exe);
+    }
+
+    fn remove_tray_at(&self, exe: &Path) {
+        let stopped = tray::stop(exe);
+        if stopped.ended() > 0 {
+            self.success("closed the running crossc-tray");
+        }
+        if let Some(e) = &stopped.error {
+            self.warn(e);
+        }
+        let left = stopped.left_note(exe);
+        // What an Install moved aside because it was in use.
+        remove_set_aside(exe);
+        // The exe goes here and not only with the install folder: that folder stays when the service could
+        // not be removed, and when this installer runs from inside it.
+        if exe.is_file() {
+            match retry(6, Duration::from_millis(500), || std::fs::remove_file(exe)) {
+                Ok(()) => self.success(format!("deleted {}", exe.display())),
+                Err(e) => {
+                    self.warn(format!("cannot delete {}: {e}", exe.display()));
+                    if let Some(note) = left {
+                        self.warn(note);
+                    }
+                }
+            }
+        }
+        let (removed, failed) = tray::remove_autostart(exe);
+        if removed > 0 {
+            self.success("crossc-tray no longer starts with Windows");
+        }
+        for e in failed {
+            self.warn(format!(
+                "cannot remove the autostart of crossc-tray for {e}. By hand, as that user: reg delete \
+                 \"HKCU\\{}\" /v {} /f",
+                tray::RUN_KEY,
+                tray::RUN_VALUE
             ));
         }
     }
@@ -1243,6 +1453,7 @@ impl Ctx<'_> {
         // Service first: it holds the buds' device open, and the driver cannot be swapped under it.
         self.step("Removing the crossc service");
         let service_result = self.remove_service();
+        self.remove_tray();
         match &service_result {
             Ok(()) => self.remove_install_dir(),
             // A service that is still registered must keep its exe; the driver is removed all the same.
@@ -1562,6 +1773,148 @@ fn is_cargo_run_var(k: &str) -> bool {
         )
 }
 
+/// The step line of a user-mode build: "Building crossc-cli and crossc-service (release)", from the `-p`
+/// arguments of the cargo command.
+fn build_step(cargo_args: &[&str]) -> String {
+    let packages: Vec<&str> = cargo_args
+        .windows(2)
+        .filter(|pair| pair[0] == "-p")
+        .map(|pair| pair[1])
+        .collect();
+    let list = match packages.as_slice() {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [first @ .., last] => format!("{} and {last}", first.join(", ")),
+    };
+    format!("Building {list} (release)")
+}
+
+/// What `Ctx::update_tray` found and did, for `Ctx::finish_tray` to decide by (`tray::tray_plan`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrayStep {
+    /// There was no `crossc-tray.exe` in the install folder before this Install.
+    first_install: bool,
+    /// A tray that ran at this desktop (in the installer's session) was ended to replace its exe.
+    was_running: bool,
+    /// A tray is still there: one at this desktop that could not be ended, or whatever kept the old exe in
+    /// use.
+    still_running: bool,
+    /// The new exe is in place.
+    copied: bool,
+}
+
+/// How the cargo run that builds the tray ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayBuild {
+    Built,
+    /// It failed while a tray runs from the file it builds: cargo cannot replace a running program.
+    InUse,
+    Failed,
+}
+
+/// `rc`: cargo's exit code. `running`: a tray runs from the exe the build writes (`target\release`).
+///
+/// A failure next to a running tray is taken for the file in use and does not stop Build. Cargo says what it
+/// was in the lines above either way, and with the tray closed a real error stops Build as any other does.
+fn tray_build(rc: i32, running: bool) -> TrayBuild {
+    match (rc, running) {
+        (0, _) => TrayBuild::Built,
+        (_, true) => TrayBuild::InUse,
+        (_, false) => TrayBuild::Failed,
+    }
+}
+
+fn tray_in_use_note(rc: i32, exe: &Path) -> String {
+    format!(
+        "cargo build -p crossc-tray failed (exit {rc}) while crossc-tray runs from {}: a running program \
+         cannot be replaced. Going on with {}. To rebuild it, exit that tray (its menu, Exit) and Build again",
+        exe.display(),
+        if exe.is_file() {
+            "the tray as it was built before"
+        } else {
+            "no tray"
+        }
+    )
+}
+
+/// The warning for a program Install can do without that could not be copied to `dest`; `e` is why.
+fn extra_not_copied(e: &str, dest: &Path) -> String {
+    let name = dest.file_stem().map_or_else(
+        || dest.display().to_string(),
+        |s| s.to_string_lossy().into_owned(),
+    );
+    format!(
+        "{e}. Going on without it: {} is {}. Close any running {name} and run Install again to update it",
+        dest.display(),
+        if dest.is_file() {
+            "left as it was"
+        } else {
+            "not installed"
+        }
+    )
+}
+
+/// How many set-aside names are tried for one file (each stays until the process that runs it has exited).
+const SET_ASIDE_NAMES: u32 = 8;
+
+/// The `n`th name a file in use is moved to: `crossc-tray.exe.old`, `crossc-tray.exe.old2`, ...
+fn set_aside_path(file: &Path, n: u32) -> PathBuf {
+    let mut name = file.file_name().unwrap_or_default().to_os_string();
+    name.push(if n <= 1 {
+        ".old".to_string()
+    } else {
+        format!(".old{n}")
+    });
+    file.with_file_name(name)
+}
+
+/// Deletes what `replace_in_use` moved aside for `file`, as far as it is free by now. Best effort: one that is
+/// still running stays for the next time.
+fn remove_set_aside(file: &Path) {
+    for n in 1..=SET_ASIDE_NAMES {
+        let _ = std::fs::remove_file(set_aside_path(file, n));
+    }
+}
+
+/// Replaces `dest` with a copy of `source` although a process runs `dest`: Windows lets the file of a running
+/// program be renamed, not overwritten or deleted. The old file is moved aside (the running process keeps
+/// running it from there), the new one is copied to `dest`. Returns where the old one went. When the copy then
+/// fails the old file is put back, so `dest` is never left missing.
+fn replace_in_use(source: &Path, dest: &Path) -> Result<PathBuf, String> {
+    if !dest.is_file() {
+        return Err(format!("{} is not there", dest.display()));
+    }
+    let mut last = String::new();
+    for n in 1..=SET_ASIDE_NAMES {
+        let aside = set_aside_path(dest, n);
+        // An older one that is free by now makes room; one still in use keeps its name.
+        let _ = std::fs::remove_file(&aside);
+        if aside.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::rename(dest, &aside) {
+            last = format!("cannot move {} aside: {e}", dest.display());
+            break;
+        }
+        return match std::fs::copy(source, dest) {
+            Ok(_) => Ok(aside),
+            Err(e) => {
+                let _ = std::fs::remove_file(dest);
+                let _ = std::fs::rename(&aside, dest);
+                Err(format!(
+                    "cannot copy {} to {}: {e}",
+                    source.display(),
+                    dest.display()
+                ))
+            }
+        };
+    }
+    if last.is_empty() {
+        last = format!("no free name to move {} aside to", dest.display());
+    }
+    Err(last)
+}
+
 /// How often a copy into %ProgramFiles%\crossc is tried, half a second apart.
 const COPY_ATTEMPTS: u32 = 10;
 
@@ -1664,7 +2017,7 @@ fn program_files() -> PathBuf {
 
 /// Path text for comparing: lower case, backslashes, no `\\?\` prefix, no trailing or doubled separator, and
 /// `.` and `..` resolved as text (`..` never climbs above the first part, the drive).
-fn path_key(p: &Path) -> String {
+pub fn path_key(p: &Path) -> String {
     let s = p.to_string_lossy().replace('/', "\\").to_lowercase();
     let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
     let mut parts: Vec<&str> = Vec::new();
@@ -2091,6 +2444,281 @@ mod tests {
         let (r, _) = with_ctx(&layout, |cx| cx.copy_with(&layout.cli_exe(), &dest, 1));
         assert!(r.unwrap_err().starts_with("cannot copy"));
         drop(lock);
+    }
+
+    #[test]
+    fn the_tray_is_an_extra_and_install_knows_a_first_install_from_an_update() {
+        let t = TempDir::new("tray-copy");
+        let layout = Layout {
+            mode: Mode::Bundle,
+            root: t.0.join("bundle"),
+        };
+        let dest_dir = t.0.join("installed");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let dest = dest_dir.join("crossc-tray.exe");
+
+        // A release from before there was a tray: a warning, nothing installed, nothing to start.
+        let (step, lines) = with_ctx(&layout, |cx| cx.update_tray(&dest_dir, 1));
+        assert_eq!(kinds(&lines), [LineKind::Warning], "{lines:?}");
+        assert!(lines[0].text.contains("not found"), "{lines:?}");
+        assert!(step.first_install && !step.was_running && !step.copied);
+        let ((), lines) = with_ctx(&layout, |cx| cx.finish_tray(&dest_dir, step));
+        assert!(lines.is_empty(), "{lines:?}");
+
+        // The first install copies it; no tray runs from the install folder, so none is ended.
+        t.file(r"bundle\crossc-tray.exe", "new");
+        let (step, lines) = with_ctx(&layout, |cx| cx.update_tray(&dest_dir, 1));
+        assert_eq!(kinds(&lines), [LineKind::Success], "{lines:?}");
+        assert_eq!(
+            step,
+            TrayStep {
+                first_install: true,
+                was_running: false,
+                still_running: false,
+                copied: true
+            }
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new");
+
+        // An update: the exe is replaced, and Install knows not to touch the user's autostart setting. With
+        // no tray running before, it is not started either: one line, no registry, no process.
+        t.file(r"bundle\crossc-tray.exe", "newer");
+        let (step, _) = with_ctx(&layout, |cx| cx.update_tray(&dest_dir, 1));
+        assert_eq!(
+            step,
+            TrayStep {
+                first_install: false,
+                was_running: false,
+                still_running: false,
+                copied: true
+            }
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "newer");
+        let ((), lines) = with_ctx(&layout, |cx| cx.finish_tray(&dest_dir, step));
+        assert_eq!(kinds(&lines), [LineKind::Info], "{lines:?}");
+        assert!(lines[0].text.contains("left closed"), "{lines:?}");
+
+        // The installed tray cannot be replaced: a warning, the old one stays, Install goes on.
+        use std::os::windows::fs::OpenOptionsExt;
+        t.file(r"bundle\crossc-tray.exe", "newest");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&dest)
+            .unwrap();
+        let (step, lines) = with_ctx(&layout, |cx| cx.update_tray(&dest_dir, 1));
+        assert_eq!(kinds(&lines), [LineKind::Warning], "{lines:?}");
+        assert!(
+            lines[0].text.contains("Close any running crossc-tray"),
+            "{lines:?}"
+        );
+        assert!(!step.copied && !step.was_running && !step.still_running);
+        drop(lock);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "newer");
+        assert!(!set_aside_path(&dest, 1).exists());
+        let ((), lines) = with_ctx(&layout, |cx| cx.finish_tray(&dest_dir, step));
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn nothing_is_started_and_nothing_called_started_next_to_a_tray_that_would_not_go() {
+        // The stop failed: the old tray is still there. A new one would exit at once on finding it, so none
+        // is started and the log does not say that one was. (Reaches no registry and no process: the plan
+        // has nothing to register or start.)
+        let t = TempDir::new("tray-stuck");
+        let layout = Layout {
+            mode: Mode::Bundle,
+            root: t.0.join("bundle"),
+        };
+        let dest_dir = t.0.join("installed");
+        t.file(r"installed\crossc-tray.exe", "old");
+        for copied in [false, true] {
+            let step = TrayStep {
+                first_install: false,
+                was_running: true,
+                still_running: true,
+                copied,
+            };
+            let ((), lines) = with_ctx(&layout, |cx| cx.finish_tray(&dest_dir, step));
+            assert_eq!(kinds(&lines), [LineKind::Warning], "{lines:?}");
+            assert!(
+                lines[0].text.contains("still running")
+                    && lines[0].text.contains("none is started"),
+                "{lines:?}"
+            );
+            assert!(
+                !lines.iter().any(|l| l.text.contains("is started (")),
+                "{lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tray_exe_that_is_in_use_is_moved_aside_and_replaced() {
+        // A copy of this test program stands in for a tray that cannot be ended (another account's): it runs
+        // from the install folder, so its file can be neither overwritten nor deleted, only renamed.
+        let t = TempDir::new("tray-aside");
+        let layout = Layout {
+            mode: Mode::Bundle,
+            root: t.0.join("bundle"),
+        };
+        let dest_dir = t.0.join("installed");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let dest = dest_dir.join("crossc-tray-stand-in.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &dest).unwrap();
+        let source = t.file(r"bundle\crossc-tray-stand-in.exe", "new");
+        let mut child = std::process::Command::new(&dest)
+            .args(["--exact", "tray::tests::sleeper_for_the_stop_test"])
+            .env("CROSSC_TEST_SLEEP", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while tray::running_count(&dest) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(tray::running_count(&dest), 1);
+        // What Install could do before: nothing. The copy fails for as long as the process lives.
+        let (r, _) = with_ctx(&layout, |cx| cx.copy_with(&source, &dest, 1));
+        assert!(r.unwrap_err().starts_with("cannot copy"));
+
+        let aside = replace_in_use(&source, &dest).unwrap();
+        assert_eq!(aside, set_aside_path(&dest, 1));
+        assert_eq!(aside, dest_dir.join("crossc-tray-stand-in.exe.old"));
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new");
+        assert!(aside.is_file());
+        // The process goes on, from the file that was moved.
+        assert!(child.try_wait().unwrap().is_none());
+        // While it runs the old file stays, also across another Install; a second replacement takes the
+        // next name.
+        remove_set_aside(&dest);
+        assert!(aside.is_file());
+        std::fs::write(&source, "newer").unwrap();
+        // (The new file is not in use, so the plain copy does it.)
+        let (r, _) = with_ctx(&layout, |cx| cx.copy_with(&source, &dest, 1));
+        r.unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "newer");
+        assert_eq!(
+            set_aside_path(&dest, 2),
+            dest_dir.join("crossc-tray-stand-in.exe.old2")
+        );
+
+        // Once that tray has exited, the next Install or Uninstall takes the old file away.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while aside.exists() && std::time::Instant::now() < deadline {
+            remove_set_aside(&dest);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!aside.exists());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "newer");
+
+        // A file that is locked outright (no process: a scanner, say) cannot be renamed either: an error,
+        // and the old file is where it was.
+        use std::os::windows::fs::OpenOptionsExt;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&dest)
+            .unwrap();
+        let e = replace_in_use(&source, &dest).unwrap_err();
+        assert!(e.contains("aside"), "{e}");
+        drop(lock);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "newer");
+        assert!(!aside.exists());
+        // Nothing there to replace: not this function's case.
+        assert!(replace_in_use(&source, &dest_dir.join("absent.exe")).is_err());
+        // A source that cannot be copied: the old file is put back.
+        let e = replace_in_use(&t.0.join("no-such-source.exe"), &dest).unwrap_err();
+        assert!(e.starts_with("cannot copy"), "{e}");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "newer");
+        assert!(!aside.exists());
+    }
+
+    #[test]
+    fn a_tray_that_runs_from_the_checkout_does_not_stop_the_build() {
+        // Built, whatever runs.
+        assert_eq!(tray_build(0, false), TrayBuild::Built);
+        assert_eq!(tray_build(0, true), TrayBuild::Built);
+        // Cargo cannot replace the exe of a running tray (exit 101): a warning, and Build goes on to what
+        // it built before; the service and the CLI are built by then.
+        assert_eq!(tray_build(101, true), TrayBuild::InUse);
+        // No tray in the way: a compile error is one.
+        assert_eq!(tray_build(101, false), TrayBuild::Failed);
+        assert_eq!(tray_build(1, false), TrayBuild::Failed);
+
+        let t = TempDir::new("tray-build");
+        let exe = t.file(r"target\release\crossc-tray.exe", "built before");
+        let note = tray_in_use_note(101, &exe);
+        assert!(
+            note.contains("(exit 101)")
+                && note.contains("a running program cannot be replaced")
+                && note.contains("the tray as it was built before")
+                && note.contains("Build again"),
+            "{note}"
+        );
+        assert!(tray_in_use_note(101, &t.0.join("none.exe")).contains("Going on with no tray"));
+        // No tray runs from a folder that was just made up.
+        assert_eq!(tray::running_count(&exe), 0);
+    }
+
+    #[test]
+    fn uninstall_deletes_the_tray_exe_itself() {
+        // Not left to the removal of the install folder, which is skipped when the installer runs from it.
+        // (No tray runs from this folder and no Run value names it: nothing is ended, no registry is written.)
+        let t = TempDir::new("tray-remove");
+        let layout = Layout {
+            mode: Mode::Bundle,
+            root: t.0.clone(),
+        };
+        let exe = t.file(r"installed\crossc-tray.exe", "tray");
+        let ((), lines) = with_ctx(&layout, |cx| cx.remove_tray_at(&exe));
+        assert_eq!(kinds(&lines), [LineKind::Success], "{lines:?}");
+        assert!(lines[0].text.contains("deleted"), "{lines:?}");
+        assert!(!exe.exists());
+        // Nothing there: nothing to say.
+        let ((), lines) = with_ctx(&layout, |cx| cx.remove_tray_at(&exe));
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn the_build_step_names_what_is_built() {
+        assert_eq!(
+            build_step(&["build", "--release", "-p", "crossc-cli"]),
+            "Building crossc-cli (release)"
+        );
+        assert_eq!(
+            build_step(&[
+                "build",
+                "--release",
+                "-p",
+                "crossc-cli",
+                "-p",
+                "crossc-service"
+            ]),
+            "Building crossc-cli and crossc-service (release)"
+        );
+        assert_eq!(
+            build_step(&[
+                "build",
+                "--release",
+                "-p",
+                "crossc-cli",
+                "-p",
+                "crossc-service",
+                "-p",
+                "crossc-tray"
+            ]),
+            "Building crossc-cli, crossc-service and crossc-tray (release)"
+        );
+        // The tray is built in a cargo run of its own.
+        assert_eq!(
+            build_step(&["build", "--release", "-p", "crossc-tray"]),
+            "Building crossc-tray (release)"
+        );
     }
 
     #[test]

@@ -360,6 +360,7 @@ fn a_taken_name_is_reported_and_retried_not_joined() {
         },
     )
     .unwrap();
+    let held = server.pipe_held();
     wait_for_report(&lines);
     {
         let lines = lines.lock().unwrap();
@@ -369,6 +370,15 @@ fn a_taken_name_is_reported_and_retried_not_joined() {
             "{lines:?}"
         );
     }
+    // And the server knows that the pipe of that name is not its own.
+    assert_eq!(held.get(), Held::Taken);
+    let own = Server::start(hub_with("A"), options(&pipe_name("squat-free"))).unwrap();
+    let t0 = Instant::now();
+    while own.pipe_held().get() == Held::NotYet && t0.elapsed() < WAIT {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(own.pipe_held().get(), Held::Ours);
+    own.stop();
     // Stopping does not wait for the retry.
     let t0 = Instant::now();
     server.stop();
@@ -383,7 +393,11 @@ fn serve(name: String, payloads: Vec<Vec<u8>>, hold: Duration) -> std::thread::J
     std::thread::spawn(move || {
         raw_connect(&pipe);
         for p in payloads {
-            raw_write(&pipe, &p);
+            // A client that only looked at who owns the pipe may have left
+            // before this write: nothing more to send it then.
+            if !raw_write(&pipe, &p) {
+                break;
+            }
         }
         std::thread::sleep(hold);
     })

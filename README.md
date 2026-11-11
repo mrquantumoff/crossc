@@ -28,7 +28,22 @@ What works: the buds show up as *Headphones (your buds' name)*; pick 48 kHz or
 The device shows as unplugged while the buds are away.
 
 The Windows volume slider and the buds' own volume are one control (AVRCP
-absolute volume through Windows' own AVRCP stack; not yet tested on hardware).
+absolute volume through Windows' own AVRCP stack).
+
+The bitrate adapts to the link: the service steps the SSC rate down while the
+Bluetooth link is congested and back up when it is clean again, without
+stopping the stream.
+
+A tray icon (`crossc-tray`) shows what the service is sending to the buds,
+with a details window. The installer installs it and has it start with
+Windows; see [docs/SETUP.md](docs/SETUP.md) section 16. (An update started
+from the 0.2.0 installer's own **Download and install** does not install the
+tray: that installer does not know it. Run the new `crossc-installer.exe`
+once and press **Install**.)
+
+The adaptive bitrate and the tray icon are new. Both pass their tests against
+a simulated driver; their live tests with real buds
+([docs/SETUP.md](docs/SETUP.md) sections 15 and 16f) have not been run yet.
 
 What does not exist yet: SBC/AAC fallback through this driver, production code
 signing.
@@ -52,6 +67,9 @@ apps -> Windows audio engine -> crossc_bth.sys (ACX playback device + Bluetooth 
   with the buds, encodes with `ssc-enc`, and sends one SSC frame per packet.
   It follows the buds: it only talks to them once Windows reports them
   connected.
+* **`crossc-tray`** is the icon in the notification area. It runs as the
+  signed-in user, not elevated, and only reads the status the service
+  publishes on a named pipe.
 * **`ssc-enc`** is a Rust port of the BSD-licensed
   [samsung-ssc-encoder](https://github.com/WillyBilly06/samsung-ssc-encoder),
   byte-identical to it in every mode and bitrate.
@@ -81,7 +99,7 @@ More in [docs/DESIGN.md](docs/DESIGN.md).
 2. Pair the buds with Windows as usual. Turn LE Audio off for them.
 3. Run `crossc-installer.exe`, press **Restart as administrator**, then
    **Install**. It trusts the bundle's test certificate, installs the driver on
-   the buds only, and installs and starts the service.
+   the buds only, installs and starts the service, and starts the tray icon.
 4. In Windows sound settings select *Headphones (your buds)*. Under the
    device's properties choose **24 bit, 48000 Hz** (HiFi) or **24 bit,
    96000 Hz** (UHQ).
@@ -90,7 +108,7 @@ The installer can also fetch and install the newest release itself, to update
 or when it was downloaded on its own: **Check for update**, then **Download and
 install**. It checks the download against the release's `SHA256SUMS.txt` and
 shows the certificate before it asks to trust it. **Uninstall** removes the
-service and the driver, **Remove certificate** the certificate.
+service, the tray icon and the driver, **Remove certificate** the certificate.
 
 ## Build from source
 
@@ -98,7 +116,7 @@ Requirements: Rust (stable, MSVC), Visual Studio Build Tools, the Windows SDK
 and WDK 10.0.26100, LLVM (`LIBCLANG_PATH`), `cargo install cargo-make`.
 
 ```powershell
-cargo build --release                 # service, CLI, installer, libraries
+cargo build --release                 # service, tray, CLI, installer, libraries
 cd drivers\crossc-bth
 cargo make default --release          # driver package (.sys/.inf/.cat + test certificate)
 ```
@@ -121,6 +139,8 @@ audio device.
 | `crates/ssc-enc` | SSC encoder |
 | `crates/crossc-core` | Device access, stream session, packetiser, resampler |
 | `crates/crossc-service` | The Windows service |
+| `crates/crossc-status` | Status the service publishes on a named pipe: protocol, server, client |
+| `crates/crossc-tray` | Tray icon and details window |
 | `crates/crossc-cli` | `probe`, `media`, `play`, `raw` |
 | `crates/crossc-installer` | Installer (GPUI) |
 | `docs/` | Design, setup and test notes, supported models |

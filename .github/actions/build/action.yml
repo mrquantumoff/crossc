@@ -105,7 +105,10 @@ runs:
         RUSTFLAGS: -C target-feature=+crt-static
       run: |
         $packages = @('-p', 'crossc-cli', '-p', 'crossc-installer')
-        if (Test-Path crates/crossc-service/Cargo.toml) { $packages += @('-p', 'crossc-service') }
+        # The same rule as tools/package.ps1: what has a crate is built, and is then required in the bundle.
+        foreach ($optional in 'crossc-service', 'crossc-tray') {
+          if (Test-Path "crates/$optional/Cargo.toml") { $packages += @('-p', $optional) }
+        }
         Write-Host "cargo build --release --locked $($packages -join ' ')"
         cargo build --release --locked @packages
 

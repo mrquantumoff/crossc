@@ -166,8 +166,9 @@ impl Hub {
 
     /// The last warning or error of device `id`, kept across the statuses
     /// its session sets (those carry `last_event: None`; see
-    /// [`Self::set_device_keeping_event`]). Unknown id: nothing happens.
-    pub fn set_device_event(&self, id: &str, mut event: Event) {
+    /// [`Self::set_device_keeping_event`]). Unknown id: nothing happens
+    /// and `false` is returned (the event is then the caller's to place).
+    pub fn set_device_event(&self, id: &str, mut event: Event) -> bool {
         wire::limit_event(&mut event);
         let id = key(id);
         {
@@ -176,15 +177,16 @@ impl Hub {
                 .devices
                 .binary_search_by(|d| d.id.as_str().cmp(id.as_str()))
             else {
-                return;
+                return false;
             };
             if s.devices[i].last_event.as_ref() == Some(&event) {
-                return;
+                return true;
             }
             s.devices[i].last_event = Some(event);
             s.generation += 1;
         }
         self.changed();
+        true
     }
 
     /// [`Self::set_device`] for a status without an event of its own: the
@@ -550,11 +552,12 @@ mod tests {
             time_unix: 5,
             ..Event::default()
         };
-        hub.set_device_event("A", e.clone()); // unknown device: ignored
+        // Unknown device: ignored, and said.
+        assert!(!hub.set_device_event("A", e.clone()));
         assert_eq!(hub.generation(), 0);
         hub.set_device_keeping_event(dev("A"));
-        hub.set_device_event("A", e.clone());
-        hub.set_device_event("A", e.clone());
+        assert!(hub.set_device_event("A", e.clone()));
+        assert!(hub.set_device_event("A", e.clone()));
         assert_eq!(hub.generation(), 2);
         let mut a = dev("A");
         a.phase = LinkPhase::Ready;

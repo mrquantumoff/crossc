@@ -11,7 +11,9 @@
 //!
 //! One session ([`crossc_core::session`]) runs per crossc device interface;
 //! the interfaces are rescanned every 5 s. As a service it logs to
-//! `%ProgramData%\crossc\service.log`.
+//! `%ProgramData%\crossc\service.log`. What it is doing (per device: phase,
+//! mode, bitrate, counters, volume, last warning) goes out on the named pipe
+//! `\\.\pipe\crossc-status` ([`crossc_status`]), which the tray app reads.
 
 // The logger and the supervisor are portable (and tested everywhere), but
 // only the Windows build has a driver to run them against.
@@ -21,6 +23,8 @@ mod host;
 mod logger;
 #[cfg(windows)]
 mod scm;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod status;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod supervisor;
 
@@ -166,10 +170,12 @@ mod win {
 
     use crossc_core::log::{Level, Log};
     use crossc_core::settings::Settings;
+    use crossc_status::pipe::Security;
     use windows::Win32::System::Console::SetConsoleCtrlHandler;
 
     use crate::host::RealHost;
     use crate::logger::StdoutLog;
+    use crate::status::{StatusLog, new_hub, start_server};
     use crate::supervisor::{Command, Supervisor};
 
     /// Where the console control handler sends the stop.
@@ -200,7 +206,11 @@ mod win {
         } else {
             settings.log_level
         };
-        let log: Arc<dyn Log> = Arc::new(StdoutLog::new(level));
+        // The status feed, as in the service; the console is the log, so
+        // there is no log directory to name.
+        let hub = new_hub(String::new());
+        let plain: Arc<dyn Log> = Arc::new(StdoutLog::new(level));
+        let log: Arc<dyn Log> = Arc::new(StatusLog::new(plain.clone(), hub.clone()));
         log.log(
             Level::Info,
             &format!(
@@ -227,10 +237,16 @@ mod win {
                 let _ = tx.send(Command::Stop);
             });
         }
-        let mut supervisor = Supervisor::new(RealHost::new(settings, log.clone()), log.clone());
+        // The pipe gets this console's own security (an elevated console's
+        // pipe is owned by Administrators, which the tray app trusts).
+        let status_server = start_server(&hub, Security::CurrentUser, plain);
+        let host = RealHost::new(settings, log.clone(), hub.clone());
+        let mut supervisor = Supervisor::new(host, log.clone());
         supervisor.run(&rx);
         log.log(Level::Info, "stopping");
         supervisor.stop_all();
+        hub.clear_devices();
+        drop(status_server);
         log.log(Level::Info, "stopped");
     }
 

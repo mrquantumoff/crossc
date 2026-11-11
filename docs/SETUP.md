@@ -818,10 +818,17 @@ keeps retrying. `--for SECONDS` makes it stop by itself. A typical start:
 ... INFO  [AABBCCDDEEFF] state wait-driver -> wait-link
 ... INFO  [AABBCCDDEEFF] the buds are connected
 ... INFO  [AABBCCDDEEFF] SSC SEP 0x03: caps 0x3e [...], Delay Reporting
-... INFO  [AABBCCDDEEFF] link up: HiFi 48 kHz/24: config 0x0c, 192 kbps, ...
+... INFO  [AABBCCDDEEFF] link up: HiFi 48 kHz/24: config 0x0c, 229 kbps, ...
 ... INFO  [AABBCCDDEEFF] state wait-link -> ready
 ... INFO  [AABBCCDDEEFF] state ready -> streaming
 ```
+
+The foreground run serves the status pipe too (section 16), with the
+console's own security instead of the service's: its log says
+`status pipe \\.\pipe\crossc-status is up` once the tray app would believe
+the pipe. An unelevated tray may still be refused by that pipe ("Access
+denied"); for a look at the status of a foreground run use
+`crossc-tray.exe --print-once` from the same elevated console.
 
 ### 11b. Install, status, uninstall (admin)
 
@@ -852,7 +859,8 @@ again on resume.
 `service.log.2`; three files at most). It has every state change, the
 configuration chosen, the buds' delay reports, statistics once a minute while
 streaming (packets, frames the driver dropped, discontinuities, WRITE
-latency), and each error once a minute at most.
+latency), and each error once a minute at most. One line after the start
+says whether the status pipe for the tray app is up (16f).
 
 ```powershell
 Get-Content C:\ProgramData\crossc\service.log -Tail 40 -Wait
@@ -865,9 +873,13 @@ Optional values under `HKLM\SOFTWARE\crossc`, read when the service starts:
 | Value | Type | Default | Meaning |
 |---|---|---|---|
 | `UhqConfig` | DWORD | `0x0A` | SSC configuration octet sent for UHQ 96 kHz. `0x0E` is what another implementation sends. |
-| `HifiBitrate` | DWORD | `192` | HiFi 48 kHz bitrate in kbps: 88, 96, 128, 192, 229, 256 or 328. |
-| `UhqBitrate` | DWORD | `584` | UHQ bitrate in kbps: 152, 250, 291, 308, 442 or 584. |
+| `HifiBitrate` | DWORD | `229` | Highest HiFi 48 kHz bitrate in kbps: 88, 96, 128, 192 or 229. |
+| `UhqBitrate` | DWORD | `584` | Highest UHQ bitrate in kbps: 152, 291 or 584. |
+| `AdaptiveBitrate` | DWORD | `1` | 1: the bitrate follows the link, never above the two values before. 0: always those. |
 | `LogLevel` | DWORD | `2` | 0 error, 1 warn, 2 info, 3 debug. |
+
+Section 15 has the bitrate values in full (what happens to a rate that is
+not in the list, and the ladders under each top rate).
 
 ```powershell
 reg add "HKLM\SOFTWARE\crossc" /v LogLevel /t REG_DWORD /d 3 /f
@@ -1527,9 +1539,14 @@ link is congested, then back up when the link is clean again:
 
 | Mode | Rates, kbps | Packets |
 |---|---|---|
-| HiFi 48 kHz/24 | 192 / 128 / 88 | 496 / 336 / 236 bytes, one every 18 ms |
+| HiFi 48 kHz/24 | 229 / 192 / 128 / 88 | 588 / 496 / 336 / 236 bytes, one every 18 ms |
 | UHQ 96 kHz/24 | 584 / 291 / 152 | 672 bytes every 9 ms, then two frames per packet: 672 / 360 bytes every 18 ms |
 | plain SSC (older buds) | 229 / 128 / 88 | 588 / 336 / 236 bytes |
+
+HiFi starts at 229 kbps: Buds4 Pro and Buds3 Pro were measured to decode
+both 229 and 192 kbps in HiFi (config `0x0C`, 48 kHz). 192 kbps, the top
+before this change and the highest rate the phones send, is now the first
+step down; `HifiBitrate = 192` gives the old ladder, 192 / 128 / 88.
 
 The rate is in every SSC frame, so a change needs no reconfiguration and
 the stream does not stop. Design, signals and constants: `docs/DESIGN.md`,
@@ -1563,7 +1580,7 @@ service starts):
 | Value | Type | Default | Meaning |
 |---|---|---|---|
 | `AdaptiveBitrate` | DWORD | `1` | `1`: the bitrate follows the link. `0`: one fixed rate, the configured one (after the two rules below). |
-| `HifiBitrate` | DWORD | `192` | Highest HiFi rate in kbps: 88, 96, 128, 192 or 229. 256 and 328 are no longer sent (the buds' decoder takes 229 at most at 48 kHz): they give 229. |
+| `HifiBitrate` | DWORD | `229` | Highest HiFi rate in kbps: 88, 96, 128, 192 or 229. The ladder is the rates of 229 / 192 / 128 / 88 that lie below it. 256 and 328 are no longer sent (the buds' decoder takes 229 at most at 48 kHz): they give 229. |
 | `UhqBitrate` | DWORD | `584` | Highest UHQ rate in kbps: 152, 291 or 584. 250, 308 and 442 are no longer sent (not known to be decoded): they give the next rate below, 152 or 291. |
 | `UhqConfig`, `LogLevel` | | | as in 11d |
 
@@ -1588,9 +1605,9 @@ Get-Content C:\ProgramData\crossc\service.log -Tail 40 -Wait
 Take the buds out of the case. New lines at start and at link up:
 
 ```
-... INFO  crossc-service x.y.z starting as a service; settings: UhqConfig=0x0a HifiBitrate=192 UhqBitrate=584 AdaptiveBitrate=1 LogLevel=info
-... INFO  [AABBCCDDEEFF] adaptive bitrate: 192 / 128 / 88 kbps
-... INFO  [AABBCCDDEEFF] link up: HiFi 48 kHz/24: config 0x0c, 192 kbps, 1 frame(s)/packet, 496-byte packets, input I24
+... INFO  crossc-service x.y.z starting as a service; settings: UhqConfig=0x0a HifiBitrate=229 UhqBitrate=584 AdaptiveBitrate=1 LogLevel=info
+... INFO  [AABBCCDDEEFF] adaptive bitrate: 229 / 192 / 128 / 88 kbps
+... INFO  [AABBCCDDEEFF] link up: HiFi 48 kHz/24: config 0x0c, 229 kbps, 1 frame(s)/packet, 588-byte packets, input I24
 ```
 
 ### 15b. Baseline: a good link must stay at the top (user)
@@ -1599,12 +1616,12 @@ Play music for three minutes with the buds in your ears, sitting at the PC.
 The statistics line (once a minute) now ends with the bitrate fields:
 
 ```
-... stats: packets=3333 frames_in=2880000 dropped=0 discontinuities=0 write avg=180us max=950us sink_delay=250.0ms rate=192kbps at[192k=60.0s 128k=0.0s 88k=0.0s] rate_changes=0 slow_writes=0 late_max=3ms
+... stats: packets=3333 frames_in=2880000 dropped=0 discontinuities=0 write avg=180us max=950us sink_delay=250.0ms rate=229kbps at[229k=60.0s 192k=0.0s 128k=0.0s 88k=0.0s] rate_changes=0 slow_writes=0 late_max=3ms
 ```
 
 | Field | Meaning | Expected here |
 |---|---|---|
-| `rate` | the bitrate at the time of the line | `192kbps` |
+| `rate` | the bitrate at the time of the line | `229kbps` |
 | `at[...]` | seconds of audio sent at each rate since the last line | all at the top rate |
 | `rate_changes` | changes since the last line | `0` |
 | `slow_writes` | WRITEs that took a quarter of a packet's audio time or more (4.5 ms for HiFi, 2.25 ms for UHQ at 584 kbps), whether or not they counted as congestion | `0`, or a handful |
@@ -1646,13 +1663,13 @@ What the log shows when it works, here walking away at 14:02:10 and coming
 back at 14:02:40:
 
 ```
-... 14:02:11.297 INFO  [AABBCCDDEEFF] bitrate 192 -> 128 kbps: link congested (WRITE blocked 123 ms in 5 slow packets); 336-byte packets
-... 14:02:11.610 INFO  [AABBCCDDEEFF] bitrate 128 -> 88 kbps: link congested (WRITE blocked 106 ms in 4 slow packets); 236-byte packets
-... 14:02:22.590 INFO  [AABBCCDDEEFF] bitrate 88 -> 128 kbps: link clean for 10 s; 336-byte packets
-... 14:02:23.261 INFO  [AABBCCDDEEFF] bitrate 128 -> 88 kbps: link congested (WRITE blocked 112 ms in 5 slow packets); 236-byte packets
-... 14:02:43.510 INFO  [AABBCCDDEEFF] bitrate 88 -> 128 kbps: link clean for 20 s; 336-byte packets
-... 14:02:53.520 INFO  [AABBCCDDEEFF] bitrate 128 -> 192 kbps: link clean for 10 s; 496-byte packets
-... 14:03:00.000 INFO  [AABBCCDDEEFF] stats: packets=3333 ... write avg=1742us max=33066us ... rate=192kbps at[192k=17.8s 128k=11.0s 88k=31.2s] rate_changes=6 slow_writes=101 late_max=131ms
+... 14:02:11.297 INFO  [AABBCCDDEEFF] bitrate 229 -> 192 kbps: link congested (WRITE blocked 123 ms in 5 slow packets); 496-byte packets
+... 14:02:11.610 INFO  [AABBCCDDEEFF] bitrate 192 -> 128 kbps: link congested (WRITE blocked 106 ms in 4 slow packets); 336-byte packets
+... 14:02:22.590 INFO  [AABBCCDDEEFF] bitrate 128 -> 192 kbps: link clean for 10 s; 496-byte packets
+... 14:02:23.261 INFO  [AABBCCDDEEFF] bitrate 192 -> 128 kbps: link congested (WRITE blocked 112 ms in 5 slow packets); 336-byte packets
+... 14:02:43.510 INFO  [AABBCCDDEEFF] bitrate 128 -> 192 kbps: link clean for 20 s; 496-byte packets
+... 14:02:53.520 INFO  [AABBCCDDEEFF] bitrate 192 -> 229 kbps: link clean for 10 s; 588-byte packets
+... 14:03:00.000 INFO  [AABBCCDDEEFF] stats: packets=3333 ... write avg=1742us max=33066us ... rate=229kbps at[229k=17.8s 192k=11.0s 128k=31.2s 88k=0.0s] rate_changes=6 slow_writes=101 late_max=131ms
 ```
 
 * Down is fast: within about 0.2 s of the WRITEs starting to block, one
@@ -1660,9 +1677,9 @@ back at 14:02:40:
   if the link is slower than the lower rate as well (WRITEs as long as a
   packet plays).
 * Up is slow: one rung after 10 s of clean link. The third and fourth line
-  are a probe that failed (128 kbps was still too much); the next try for
+  are a probe that failed (192 kbps was still too much); the next try for
   that rate then waits 20 s, then 40, at most 80. Each rate keeps its own
-  wait (192 kbps was never refused here, so it follows after 10 s), and a
+  wait (229 kbps was never refused here, so it follows after 10 s), and a
   wait halves again for every 15 s the stream holds that rate. So a link
   that stays bad settles at a lower rate, with a probe now and then.
 * At 96 kHz the first step reads
@@ -1716,7 +1733,9 @@ adaptive bitrate: 192 / 128 / 88 kbps (down while WRITEs block, up after 10 s of
 bitrate: 2 change(s); audio sent at 192k=109.2s 128k=10.8s 88k=0.0s
 ```
 
-Differences from the service: `play` keeps one frame per packet at every
+Differences from the service: `play` still takes 192 kbps as its HiFi rate
+when `--bitrate` is not given, so its HiFi ladder is the one under 192, not
+the service's 229 / 192 / 128 / 88; it keeps one frame per packet at every
 rate (also in UHQ, unless `--frames-per-packet` says otherwise), and the few
 packets it has already encoded still go out at the old rate. `--bitrate`
 and `--adaptive` exclude each other: `--bitrate` is exactly that rate.
@@ -1730,12 +1749,14 @@ Restart-Service crossc
 ```
 
 The log then has `AdaptiveBitrate=0` in the settings line and, at link up,
-`adaptive bitrate is off (AdaptiveBitrate=0): always 192 kbps`: one fixed
-rate, as 0.2.0 sent. The stream is 0.2.0's byte for byte, with two
+`adaptive bitrate is off (AdaptiveBitrate=0): always 229 kbps`: one fixed
+rate, as 0.2.0 sent. The stream is 0.2.0's byte for byte, with three
 exceptions that do not depend on this switch (see the settings table
-above): a `HifiBitrate` or `UhqBitrate` the buds are not known to decode is
-lowered, and on a media MTU too small for 584 kbps UHQ falls back to 291
-instead of 442 kbps. Back on:
+above): HiFi is sent at 229 kbps unless `HifiBitrate` says otherwise (0.2.0
+sent 192; set `HifiBitrate` to 192 for that), a `HifiBitrate` or
+`UhqBitrate` the buds are not known to decode is lowered, and on a media
+MTU too small for 584 kbps UHQ falls back to 291 instead of 442 kbps. Back
+on:
 
 ```powershell
 reg delete "HKLM\SOFTWARE\crossc" /v AdaptiveBitrate /f
@@ -1743,7 +1764,8 @@ Restart-Service crossc
 ```
 
 To keep it on but start lower (for a place where the top rate never holds),
-set the top of the ladder instead, for example HiFi 128 / 88:
+set the top of the ladder instead, for example HiFi 128 / 88 (or 192 for
+192 / 128 / 88):
 
 ```powershell
 reg add "HKLM\SOFTWARE\crossc" /v HifiBitrate /t REG_DWORD /d 128 /f
@@ -1774,8 +1796,10 @@ create a pipe of that name; the tray then shows "Status not trusted" instead
 of what that program says.
 
 > The service publishes its status from the version that includes the status
-> pipe (see `crates/crossc-status/INTEGRATION.md`). With an older service the
-> tray runs and says "Service not running".
+> pipe. With an older service (0.2.0 and before) the tray runs and says
+> "Service not running". The service's side has been tested against a fake
+> driver and a pipe of the test's own; the installed service with real buds
+> has not been looked at through the tray yet: 16f is that first check.
 
 ### 16a. Run it
 
@@ -1786,6 +1810,13 @@ cargo build --release -p crossc-tray
 & .\target\release\crossc-tray.exe --print-once    # one status as text, then exit (0: got one)
 & .\target\release\crossc-tray.exe --demo          # made-up states, no service needed
 ```
+
+While a tray runs from `target\release`, cargo cannot rebuild it (Windows does
+not let a running program be replaced: `failed to remove file ...
+crossc-tray.exe`, access denied). Exit it from its menu first. The installer's
+Build builds the tray in a step of its own for that reason: with a tray
+running from the checkout that step is a warning, and the service and the CLI
+are built all the same.
 
 `--demo` runs a script (no service, waiting, HiFi, UHQ, adaptive step down,
 reconnecting, two pairs of buds, version mismatch) so the icon and the window
@@ -1832,16 +1863,16 @@ the icon again. It has no taskbar button.
 | Windows format | the format of the Windows endpoint: what you chose under Sound > Properties > Format. "nothing played yet" until the first stream |
 | Sent to the buds | rate and depth of the audio as sent. Underneath, if they differ from the Windows format: "resampled from ...", "16-bit input widened", "24-bit input dithered down" |
 | Bitrate | the bitrate in use now. Underneath: `fixed` (`AdaptiveBitrate=0`), `adaptive · ladder 584 / 291 / 152` (at the top; these are the steps), or in amber `stepped down · step 2 of 3 · top 584` while the link carries less |
-| Delay | the playback delay the buds reported (AVDTP delay report); "not reported" if they have not |
+| Delay | the playback delay the buds reported for the current stream (AVDTP delay report); "not reported" if they have not, also after a reconnect or a switch of mode until they report again |
 | Volume | the level in percent, who applies the Windows slider, and "muted". `set on the buds`: the buds themselves (hardware volume over AVRCP). `applied by the service`: the service scales the audio because the buds did not take the volume. `applied by Windows`: Windows scales the audio (`DisableAvrcpVolume`, or an older driver) |
-| State | only when there is a reason to give: the state again, with the reason underneath (what the driver lacks, why the link went down, when the next attempt is) |
+| State | only when there is a reason to give: the state again, with the reason underneath (what the driver lacks, why the link went down, when the next attempt is). No reason is given while the buds are simply not connected |
 | Packet | size of a media packet in bytes and the SSC frames in it |
 | Media MTU | the media MTU limit in use, in bytes ("Copy details" also has how the limit was derived) |
 | Codec options | two octets in hex, `0x0a of 0x3e`: the SSC configuration octet sent to the buds, and the SSC capability octet the buds offered (`0x3e` on Buds4 Pro) |
 | Driver | version of `crossc_bth`; underneath the version of the IOCTL interface it speaks |
 | Activity | shown once the device has had a stream (or a counter is not zero) |
 | Packets sent, Frames read | media packets sent, and PCM frames taken from the endpoint, since the service started this device's session |
-| Dropped frames | PCM frames the driver dropped because the service did not read them in time. Should stay 0 |
+| Dropped frames | PCM frames the driver dropped from a running stream because the service did not read them in time, since the service started this device's session. Should stay 0. What the driver discards while no stream is started (the buds away, a stream the buds suspended) is not counted. The service asks the driver when a stream stops, when the endpoint's state changes and once a minute while a stream runs, so the number can be a minute old |
 | Stream gaps | discontinuities in the PCM the driver reported (a stream that stopped and started) |
 | Write errors | media writes that failed (each one takes the link down) |
 | Late packets | packets sent later than their schedule allows (40 ms or more behind the endpoint) |
@@ -1849,6 +1880,7 @@ the icon again. It has no taskbar button.
 | Streaming for | how long the current stream has been running |
 | Reconnects | how often the link was set up again after a failure |
 | Amber / red line | the last warning or error of this device from the service's log, and how long ago. Left out when it only repeats the reason under State ("Copy details" always has it) |
+| Amber / red line of the window | the service's own last warning or error, and how long ago ("Copy details": `last service warning`). That includes one about a device that has no card to show it on: `[<id>] the session thread panicked; it will be restarted`, `[<id>] cannot start a session thread` |
 | Footer | the service's version and how long it has been running |
 
 With two pairs of buds the cards stand side by side, equally high.
@@ -1898,3 +1930,42 @@ Right click:
 * Stop the service (`sc stop crossc`, admin): within a second the icon gets
   the red cross and the tooltip says `crossc — service not running`. Start it
   again: the icon follows within 5 s, without restarting the tray.
+
+### 16f. First run against the installed service (not verified yet)
+
+With the service of this build installed and running (15a), look at its log
+first. Shortly after the start it has one of:
+
+```
+... INFO  status pipe \\.\pipe\crossc-status is up
+... WARN  the status pipe \\.\pipe\crossc-status is not owned by SYSTEM or Administrators: the tray app will not trust it ("Status not trusted")
+... WARN  status pipe \\.\pipe\crossc-status cannot be created (another process holds that name); user interfaces get no status. Retrying every 5 s
+... WARN  a pipe named \\.\pipe\crossc-status exists that is not this service's: another program created it before the service could. ...
+```
+
+The first is what is expected: the service has opened its own pipe the way
+the tray does, owner check included. The second is about the service's own
+pipe. The last two come together and are about somebody else's: a program
+created a pipe of that name while the service was not running (during an
+update, say), and the service cannot have the name until that program is
+closed. It retries every 5 s and logs `status pipe ... is available now` when
+it has it. Then, from a normal (not elevated) PowerShell:
+
+```powershell
+& .\target\release\crossc-tray.exe --print-once ; $LASTEXITCODE
+```
+
+It must print one block per pair of buds (state, mode, bitrate, counters) and
+exit with 0. Compare the values with `service.log`: the mode and bitrate of
+`link up`, the ladder of `adaptive bitrate:`, the media MTU limit of
+`media channel open`, and after a `bitrate ... kbps` line the new rate.
+
+| What it prints | What it means |
+|---|---|
+| The devices | It works. |
+| Service not running | The pipe does not exist: the service is an older one or is stopped, or it logged `status pipe ... cannot be created` with another reason than a held name. |
+| Status not trusted | The pipe's owner is neither SYSTEM nor Administrators. Look at the service's log to see which of two things it is. **`a pipe named ... exists that is not this service's`** (with `cannot be created (another process holds that name)`): another program has the name, and the tray is looking at that program's pipe. Find and close that program (`Get-ChildItem \\.\pipe\ | Where-Object Name -eq crossc-status` shows that the pipe exists; a reboot clears it if the program cannot be found); the service takes the name within 5 s and logs `status pipe ... is available now`. Nothing in crossc needs changing. **`the status pipe ... is not owned by SYSTEM or Administrators`**: the service's own pipe has the wrong owner. Not expected of a LocalSystem service (what LocalSystem creates is owned by Administrators); if it happens, report it: the fix is to name the owner in the pipe's security descriptor (`SERVICE_SDDL` in `crates/crossc-status/src/pipe.rs`, described in `crates/crossc-status/INTEGRATION.md` 2b). |
+| Access denied | The pipe's access list did not let this user in. Not expected of the installed service; expected of `crossc-service run` in an elevated console when the tray is not elevated (11a). |
+
+Audio does not depend on any of this: a service without a working status
+pipe streams exactly as before, and says so once in its log.

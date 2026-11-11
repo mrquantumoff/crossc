@@ -395,6 +395,48 @@ fn client_session(ch: &Channel) -> Option<u32> {
         .map(|()| id)
 }
 
+/// Whether a [`Server`] has the pipe, as its thread last found. Cheap to
+/// clone; all clones are the same value.
+#[derive(Clone, Debug, Default)]
+pub struct PipeHeld(Arc<std::sync::atomic::AtomicU8>);
+
+/// What [`PipeHeld::get`] says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// The server's thread has not tried to create the pipe yet.
+    NotYet,
+    /// The server holds the pipe: whoever opens that name gets this
+    /// server.
+    Ours,
+    /// The name exists and is not this server's: another process created
+    /// it first. Whoever opens that name gets that process.
+    Taken,
+    /// The pipe could not be created for another reason; no pipe of that
+    /// name is known to exist.
+    Failed,
+}
+
+impl PipeHeld {
+    pub fn get(&self) -> Held {
+        match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => Held::Ours,
+            2 => Held::Taken,
+            3 => Held::Failed,
+            _ => Held::NotYet,
+        }
+    }
+
+    fn set(&self, held: Held) {
+        let v = match held {
+            Held::NotYet => 0,
+            Held::Ours => 1,
+            Held::Taken => 2,
+            Held::Failed => 3,
+        };
+        self.0.store(v, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The server's thread.
 ///
 /// From the moment the first instance of the pipe exists until the thread
@@ -426,6 +468,8 @@ struct ServerLoop {
     pacer: Pacer,
     seq: u64,
     started: Instant,
+    /// For whoever asks whether the pipe is this server's.
+    held: PipeHeld,
 }
 
 impl ServerLoop {
@@ -512,15 +556,30 @@ impl ServerLoop {
         )
         .and_then(Channel::new);
         match created {
-            Ok(mut ch) => match start_listening(&mut ch) {
-                Ok(()) => self.listening(ch),
-                Err(e) => {
-                    // Keep it: it holds the name.
-                    self.parked = Some(ch);
-                    self.not_listening(&e, true);
+            Ok(mut ch) => {
+                // From here on the thread always holds an instance.
+                self.held.set(Held::Ours);
+                match start_listening(&mut ch) {
+                    Ok(()) => self.listening(ch),
+                    Err(e) => {
+                        // Keep it: it holds the name.
+                        self.parked = Some(ch);
+                        self.not_listening(&e, true);
+                    }
                 }
-            },
-            Err(e) => self.not_listening(&e, holding),
+            }
+            Err(e) => {
+                if !holding {
+                    // With FILE_FLAG_FIRST_PIPE_INSTANCE, "access denied"
+                    // is what a name that exists already gets.
+                    self.held.set(if is(&e, ERROR_ACCESS_DENIED) {
+                        Held::Taken
+                    } else {
+                        Held::Failed
+                    });
+                }
+                self.not_listening(&e, holding)
+            }
         }
     }
 
@@ -679,6 +738,7 @@ impl ServerLoop {
 pub struct Server {
     stop: Arc<Handle>,
     thread: Option<JoinHandle<()>>,
+    held: PipeHeld,
 }
 
 impl Server {
@@ -701,7 +761,9 @@ impl Server {
             }
         });
         let unregister = hub.clone();
+        let held = PipeHeld::default();
         let state = ServerLoop {
+            held: held.clone(),
             hub,
             options,
             stop: stop.clone(),
@@ -726,7 +788,14 @@ impl Server {
         Ok(Server {
             stop,
             thread: Some(thread),
+            held,
         })
+    }
+
+    /// Whether this server has the pipe (it creates it on its own thread,
+    /// and keeps trying while another process holds the name).
+    pub fn pipe_held(&self) -> PipeHeld {
+        self.held.clone()
     }
 
     /// Disconnect the clients and end the thread.
@@ -1203,11 +1272,16 @@ fn raw_server(name: &str) -> Handle {
 }
 
 #[cfg(test)]
-fn raw_write(pipe: &Handle, bytes: &[u8]) {
+fn raw_write(pipe: &Handle, bytes: &[u8]) -> bool {
     let mut n = 0u32;
     // SAFETY: a blocking write of a live buffer.
-    unsafe { WriteFile(pipe.0, Some(bytes), Some(&mut n), None) }.unwrap();
+    if unsafe { WriteFile(pipe.0, Some(bytes), Some(&mut n), None) }.is_err() {
+        // The client has left already (one that only looked at who owns
+        // the pipe does, at once).
+        return false;
+    }
     assert_eq!(n as usize, bytes.len());
+    true
 }
 
 #[cfg(test)]

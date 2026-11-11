@@ -45,7 +45,7 @@ thread of `crossc_status::pipe::Server`.
 | `volume.mode` | `self.volume.mode` (`volume::VolumeMode::{Buds, Software, Windows}`, the same three as `crossc_status::VolumeMode`) |
 | `volume.muted` | `self.audio.muted()` |
 | `volume.level_percent` | from `self.audio.volume`: with hardware volume (`self.audio.hw_volume()`) and not muted, `avrcp * 100 / 127` rounded (`VolumeState::avrcp` is the 0..=127 AVRCP value the driver derives from the slider; it is 0 while muted, so send `None` then: the tray shows "muted" without a number); without hardware volume `None` |
-| `counters.dropped_frames` | `self.audio.frames_dropped` (the driver's counter, as of the last state the session saw; `log_stats` reads a fresh one, store it into `self.audio` there) |
+| `counters.dropped_frames` | `self.totals.dropped_frames`: what the driver's counter rose by while a stream was started (between a START and the end of that stream), added up when a state arrives, with every statistics line and when the stream stops. Not `self.audio.frames_dropped`: the driver never resets that counter and also counts what it renders while nothing reads it (no session attached, a stream that is not started), so it shows large numbers that are no loss |
 
 ### 1b. What must be added to `Session` (all small, all in session.rs)
 
@@ -168,6 +168,11 @@ thread. Call `hub.clear_devices()` after `stop_all()` (and in the supervisor's `
 reports once through `report` and retries every 5 s. Once it has the name it keeps it until it is stopped: it
 always holds at least one instance of the pipe, so no other process can create the pipe while the service runs.
 
+`Server::pipe_held()` says which of these it is (`Held::NotYet`, `Ours`, `Taken`, `Failed`). Ask it before
+judging the pipe by opening it: while another process holds the name, what a client opens is that process's
+pipe, and its owner says nothing about the service's descriptor (`Taken` is the log line "a pipe named ...
+exists that is not this service's", not "not owned by SYSTEM or Administrators").
+
 **`report` must write to the plain log, not to the wrapper of 2e.** The wrapper turns warnings into the state
 the server sends; a report about sending must not become a change of that state. `report_log` above is the log
 as it was before it was wrapped.
@@ -238,10 +243,15 @@ is created (scm.rs `service_main`, main.rs `run_foreground`), in a `Log` that fo
 ```rust
 let event = Event { level, time_unix: now, text };
 match line.strip_prefix('[').and_then(|l| l.split_once("] ")) {
-    Some((id, text)) => hub.set_device_event(id, event_with(text)),   // unknown id: ignored
-    None => hub.set_service_event(Some(event_with(line))),
+    Some((id, text)) if hub.set_device_event(id, event_with(text)) => {}
+    // No prefix, or a device the hub does not have (`false`): the service's, with the whole line.
+    _ => hub.set_service_event(Some(event_with(line))),
 }
 ```
+
+A line about a device that is not in the hub is not dropped: "the session thread panicked" is logged after the
+thread's device was taken out, and "cannot start a session thread" before there is one. Those are the lines a
+user most needs to see, so they become the service's last event, with the `[<id>] ` prefix kept.
 
 The text may be any length and contain anything: the hub cuts every string to 300 characters and takes out
 control and invisible formatting characters, exactly as a reader does, so no log line can make the state too

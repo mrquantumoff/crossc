@@ -17,7 +17,7 @@ It runs in one of three modes, decided at start from where the exe is:
 All three also have **Check for update** and, when the check finds a release newer than what is here,
 **Download and install \<tag\>**.
 
-A release zip holds `crossc-installer.exe`, `crossc-service.exe`, `crossc-cli.exe` and
+A release zip holds `crossc-installer.exe`, `crossc-service.exe`, `crossc-tray.exe`, `crossc-cli.exe` and
 `driver\{crossc_bth.sys, crossc_bth.inf, crossc_bth.cat, WDRLocalTestCert.cer}` side by side. Bundle mode needs no
 cargo and no repo; the header shows `bundle <version>` (the version in the INF's `DriverVer`).
 
@@ -74,7 +74,7 @@ Two clicks, with the facts to check between them:
    SHA-1 thumbprint of the certificate that would be trusted, where it was unpacked, and the statement that this
    installs a test-signed kernel driver downloaded from GitHub. It is part of the window, not a dialog.
    **Trust certificate and install \<tag\>** is the second click; **Cancel** deletes what was unpacked.
-4. The install is the bundle-mode Install on the unpacked folder (driver, service, CLI). Afterwards older
+4. The install is the bundle-mode Install on the unpacked folder (driver, service, tray app, CLI). Afterwards older
    downloads are deleted, and if the release's `crossc-installer.exe` is newer than the running one the log says
    where it is (the installer does not replace itself).
 
@@ -200,7 +200,8 @@ would be the machine-readable form and is what packaging should add.
 * **Status**: Administrator, Test signing, Secure Boot, Memory integrity, Driver package, Certificate trusted, one
   **Buds** row per paired node (the buds' Bluetooth name, service, problem code, instance id; driver stack, INF and
   version on a second line), Staged packages, **Service** (not installed / installed, stopped / running, and the
-  exe it is registered with), **Latest release** (see above). Green means OK, amber means worth a look, red means
+  exe it is registered with), **Tray app** (not installed / installed, not running / running, and whether it
+  starts with Windows; never red, crossc works without it), **Latest release** (see above). Green means OK, amber means worth a look, red means
   it blocks the install, grey means unknown. Every query runs unelevated and uses Win32 directly:
   * test signing and HVCI: `NtQuerySystemInformation(SystemCodeIntegrityInformation)` (no bcdedit needed)
   * Secure Boot: `HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\State\UEFISecureBootEnabled`
@@ -210,6 +211,8 @@ would be the machine-readable form and is what packaging should add.
   * certificate: CryptoAPI, read-only LocalMachine `Root` / `TrustedPublisher`, matched by the `.cer`'s SHA-1
   * staged packages: `pnputil /enum-drivers`, parsed like the script does
   * service: the service control manager (`OpenService` with query rights only)
+  * tray app: the file in `%ProgramFiles%\crossc`, the process list (a process whose image is that file), and
+    the `crossc-tray` value under the Run key of the user at the desktop
   * install record: `HKLM\SOFTWARE\crossc`, read-only
   * latest release: only when asked (Check for update), over HTTPS
 * **Warning** (bundle and online mode, until crossc is installed): what a test-signed kernel driver means, that
@@ -242,12 +245,12 @@ would be the machine-readable form and is what packaging should add.
 
 | Action | Elevation | Steps |
 |---|---|---|
-| Build (repo) | no | `cargo make` (or `cargo make default --release`) in `drivers\crossc-bth`, then `cargo build --release -p crossc-cli` (and `-p crossc-service` when the workspace has that crate). Sets `LIBCLANG_PATH` to `%ProgramFiles%\LLVM\bin` if unset |
-| Install | yes | preflight (test signing on; stops if it cannot be read, Secure Boot warning, package complete, supported models and paired nodes listed, service exe found and a complete Windows executable), put the `.cer` on record (`PendingCerts`) and trust it in Root + TrustedPublisher if not trusted yet, `pnputil /add-driver crossc_bth.inf` to stage the new package (refused by Windows: the certificate is taken out again and Install stops with nothing else changed), stop the `crossc` service if it runs (it holds the buds' device open; waits up to 45 s, the service's own stop allowance plus a margin), `pnputil /delete-driver oemNN.inf /uninstall /force` for the older crossc_bth packages (all but the one just staged), `pnputil /add-driver crossc_bth.inf /install` (3010 = reboot needed, 259 = no device to install on right now), verify **every** present node runs `crossc_bth` with problem 0 (on failure, prints the `pnputil /enum-devices /drivers` ranking of the node that did not switch); with no node present, verify the package is staged and the certificate trusted. Then the install record: remove the previously recorded and the pending certificates if this package has another one, write `CertThumbprint`, `Version` and `DriverVer`. Then the service: copy `crossc-service.exe` and `crossc-cli.exe` to `%ProgramFiles%\crossc\` (a `crossc-cli.exe` that cannot be replaced because it is running is a warning, not a stop), run `crossc-service.exe install` there, start the service and wait until it runs. If any step after the service stop fails, the log ends with a warning that the service ran before and does not now |
+| Build (repo) | no | `cargo make` (or `cargo make default --release`) in `drivers\crossc-bth`, then `cargo build --release -p crossc-cli` (and `-p crossc-service` when the workspace has that crate), then `cargo build --release -p crossc-tray` in a run of its own when the workspace has it: if that one fails while a tray runs from `target\release\crossc-tray.exe` (Windows does not let a running program be replaced), it is a warning and Build goes on with the tray as it was built before; with no tray running, a failure stops Build. Sets `LIBCLANG_PATH` to `%ProgramFiles%\LLVM\bin` if unset |
+| Install | yes | preflight (test signing on; stops if it cannot be read, Secure Boot warning, package complete, supported models and paired nodes listed, service exe found and a complete Windows executable), put the `.cer` on record (`PendingCerts`) and trust it in Root + TrustedPublisher if not trusted yet, `pnputil /add-driver crossc_bth.inf` to stage the new package (refused by Windows: the certificate is taken out again and Install stops with nothing else changed), stop the `crossc` service if it runs (it holds the buds' device open; waits up to 45 s, the service's own stop allowance plus a margin), `pnputil /delete-driver oemNN.inf /uninstall /force` for the older crossc_bth packages (all but the one just staged), `pnputil /add-driver crossc_bth.inf /install` (3010 = reboot needed, 259 = no device to install on right now), verify **every** present node runs `crossc_bth` with problem 0 (on failure, prints the `pnputil /enum-devices /drivers` ranking of the node that did not switch); with no node present, verify the package is staged and the certificate trusted. Then the install record: remove the previously recorded and the pending certificates if this package has another one, write `CertThumbprint`, `Version` and `DriverVer`. Then the service: copy `crossc-service.exe` and `crossc-cli.exe` to `%ProgramFiles%\crossc\` (a `crossc-cli.exe` that cannot be replaced because it is running is a warning, not a stop), close a running tray app and copy `crossc-tray.exe` there too, run `crossc-service.exe install` there, start the service and wait until it runs, then the tray app (see [The tray app](#the-tray-app)). If any step after the service stop fails, the log ends with a warning that the service ran before and does not now |
 | Build + Install (repo) | yes | both of the above |
 | Download and install, first click | yes | preflight (test signing on: no download without it), find a token, download `SHA256SUMS.txt` and the zip with progress lines in the log, compare the SHA-256, unpack to `%ProgramFiles%\crossc\releases\<tag>`, check the release (driver files, INF models, service exe, certificate subject). Installs nothing, trusts nothing |
 | Download and install, second click | yes | check that the certificate file still is the one that was shown (again at the moment it is trusted), then Install as above on the unpacked release, then delete every other folder and leftover in `releases` (not the one the running installer is in), and say so if the release has a newer installer. If the install fails the confirmation stays, to try again without downloading; the earlier release is still unpacked then, and the log says where |
-| Uninstall | yes | stop and remove the service (`crossc-service.exe uninstall`; through the service control manager if the exe is gone or that did not remove it), delete `%ProgramFiles%\crossc` (with the downloaded releases in it), delete staged crossc_bth packages, delete `Version` and `DriverVer` from the install record, `pnputil /scan-devices` (whenever a package was removed or there is a node to check), verify **every** present node is back on `BthA2dp`: the package's models and any other node that ran `crossc_bth` |
+| Uninstall | yes | stop and remove the service (`crossc-service.exe uninstall`; through the service control manager if the exe is gone or that did not remove it), close the tray app, delete its exe and remove its autostart (also when the service could not be removed), delete `%ProgramFiles%\crossc` (with the downloaded releases in it), delete staged crossc_bth packages, delete `Version` and `DriverVer` from the install record, `pnputil /scan-devices` (whenever a package was removed or there is a node to check), verify **every** present node is back on `BthA2dp`: the package's models and any other node that ran `crossc_bth` |
 | Remove certificate | yes | delete `CN=WDRLocalTestCert` from LocalMachine Root and TrustedPublisher, then delete `CertThumbprint` and `PendingCerts` from the install record |
 | Check for update | no | one GET for the release list; reads only |
 
@@ -265,6 +268,45 @@ updating it; with no service registered it does the driver only. What the instal
 variable is never read. The reported folder is only used when it is an absolute path with a drive and without
 `.` or `..` (otherwise `C:\Program Files` is used), and the folder is never deleted when the installer itself
 runs from it.
+
+### The tray app
+
+`crossc-tray.exe` is an extra, like the CLI: a bundle without it (a release from before there was a tray) installs,
+and nothing about the tray stops Install. The installer runs elevated, perhaps with another account's
+credentials, and the tray must run as the person at the desktop, not elevated. So "the user" is never the
+installer's own account. It is the user of the desktop shell (the process that owns `GetShellWindow`); when that
+process is another account's and Windows does not let the installer open it, the user of the installer's session,
+looked up by name (enough for the autostart value, not for starting anything):
+
+* **Copy.** A running tray is found by the path of its image (`%ProgramFiles%\crossc\crossc-tray.exe`, in any
+  session; a tray run from a checkout is left alone), asked to close (`WM_CLOSE` to its window, so its icon goes
+  at once), and terminated if it has not gone after 3 s. Then the exe is replaced. It is only closed when the
+  bundle has a new one. A tray of another account (the installer was elevated with an administrator's
+  credentials while a standard user's tray runs, or a second user is signed in) is opened with the debug
+  privilege, which an elevated process holds and which is switched on for that look only.
+  If the exe still cannot be overwritten because something runs it, it is renamed to `crossc-tray.exe.old`
+  (Windows allows that for a running program) and the new one is put in its place: the tray is the new one the
+  next time it starts, and the next Install or Uninstall deletes the old file. Only if that fails too is the old
+  exe left, with a warning that says how many `crossc-tray.exe` processes could not be looked at and to close the
+  tray from its menu.
+* **Autostart**, first install only (no `crossc-tray.exe` was installed before): the value `crossc-tray` =
+  `"<exe>"` under `HKEY_USERS\<the user's SID>\Software\Microsoft\Windows\CurrentVersion\Run`. That is the value
+  the tray's own "Start with Windows" menu item shows and toggles. An update does not write it: what the user
+  switched off stays off.
+* **Start**, on a first install and when this Install closed a tray that ran at this desktop (in the
+  installer's own Windows session): with a copy of the shell's token
+  (`CreateProcessWithTokenW`) and that user's environment, so the tray has the rights Explorer has. It is never
+  started as a child of the elevated installer. A tray the user had closed stays closed; a tray that was closed
+  in another user's session (fast user switching) does not count, and is not started again from here (it starts
+  when that user signs in, or opens it). No tray is started while one that could not be closed is still
+  running: the new process would find the old one and exit, so the log says to exit and reopen it instead of
+  "started". Without the
+  shell's token (no Explorer, or another account's), or when Windows refuses, the log says where the exe is; with
+  autostart registered it starts at the next sign-in anyway.
+* **Uninstall** closes the tray, deletes `crossc-tray.exe` (itself, not only with the folder: the folder stays
+  when the installer runs from it), and removes the `crossc-tray` Run value from the hive of every signed-in user
+  where it names the installed exe. A Run value of a user who is not
+  signed in stays (Windows skips a value whose program is gone); `docs/SETUP.md` 16d has the command.
 
 ## Hidden command-line modes
 
@@ -292,6 +334,7 @@ crossc-installer --show-confirm         # open the window with the confirmation 
   all as pure functions
 * `system.rs`, `cert.rs`, `service.rs`: Win32 queries that fill `Status`, and the install record; `service.rs`
   also stops, starts and deletes the service for the actions
+* `tray.rs`: the tray app: is it running, closing it, its autostart value, starting it as the desktop's user
 * `http.rs`: one GET through WinHTTP, redirects off
 * `update.rs`: token lookup, the release check, download + SHA-256 + unpack
 * `actions.rs`: the action steps and the child-process runner
@@ -311,9 +354,14 @@ default because it talks to the real `api.github.com` (read-only, a public repos
 It also runs a few smoke tests against the real machine, all read-only and unelevated: the code integrity query,
 the device list, the service query, reading the install record, and certificate add / find / remove in an
 in-memory store with test certificates from `testdata\` (self-signed, made for the tests, private keys deleted).
-The registry code is exercised on a throwaway key under `HKEY_CURRENT_USER`. The elevated steps themselves
+The registry code is exercised on a throwaway key under `HKEY_CURRENT_USER`. For the tray app: the Run value's
+format, the first-install / update decision (by session, and not next to a tray that would not go), the status
+row, finding a process by its image path, ending one, and replacing the exe of one that keeps running (a copy
+of the test program stands in for the tray); the real Run key is never written and no tray is started. Ending
+another account's tray with the debug privilege needs an elevated process and a second account and is not
+tested. The elevated steps themselves
 (pnputil, certificate stores, service control, the install record in `HKLM`, copying and unpacking to
-`%ProgramFiles%`) are not tested; they are thin wrappers around the tested functions, and every one of them sits
+`%ProgramFiles%`, writing another user's Run key, starting the tray with the shell's token) are not tested; they are thin wrappers around the tested functions, and every one of them sits
 behind the elevation check, which is tested.
 
 ## Dependencies

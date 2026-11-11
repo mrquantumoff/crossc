@@ -341,7 +341,7 @@ mod tests {
         let (p, packets) = run(f, 0x3E, 9600, 480);
         assert_eq!(packets.len(), 11);
         assert_eq!((p.frames(), p.packets(), p.pending()), (11, 11, 96));
-        check_packets(&packets, 484, Bitrate::K192.code());
+        check_packets(&packets, 576, Bitrate::K229.code());
     }
 
     #[test]
@@ -373,7 +373,7 @@ mod tests {
         let (_, mono16) = run(fmt(48000, 16, 16, 1), 0x3E, 4000, 480);
         assert_eq!(st16.len(), 4);
         assert_eq!(st16, mono16);
-        check_packets(&st16, 484, Bitrate::K192.code());
+        check_packets(&st16, 576, Bitrate::K229.code());
         // Plain SSC from 24-bit input (dithered down) and from 16-bit input.
         let (_, a) = run(fmt(48000, 32, 24, 2), 0x30, 4000, 480);
         let (_, b) = run(fmt(48000, 16, 16, 2), 0x30, 4000, 480);
@@ -387,7 +387,7 @@ mod tests {
         // (endpoint rate, caps, mode rate): frames out of the streaming
         // resampler, then whole SSC frames of those.
         for (rate, caps, to, frame_bytes) in [
-            (96000u32, 0x3Cu8, 48000u32, 484usize), // no UHQ: 96k -> HiFi 48k
+            (96000u32, 0x3Cu8, 48000u32, 576usize), // no UHQ: 96k -> HiFi 48k
             (96000, 0x30, 48000, 576),              // 96k -> SSC 48k
             (48000, 0x20, 44100, 576),              // 48k -> SSC 44.1k
             (96000, 0x20, 44100, 576),              // 96k -> SSC 44.1k

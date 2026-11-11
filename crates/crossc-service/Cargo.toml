@@ -12,9 +12,12 @@ path = "src/main.rs"
 [dependencies]
 crossc-core = { path = "../crossc-core" }
 crossc-ioctl = { path = "../crossc-ioctl" }
+crossc-status = { path = "../crossc-status" }
 
 [dev-dependencies]
+avdtp = { path = "../avdtp" }
 crossc-core = { path = "../crossc-core", features = ["testing"] }
+ssc-enc = { path = "../ssc-enc" }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.1"

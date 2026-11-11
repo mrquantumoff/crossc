@@ -6,7 +6,7 @@
 //! |---|---|---|
 //! | 96 kHz | UHQ v2 (`0x02`, and not `0x01`) | UHQ, config `0x0A`, 584 kbps, one frame per packet |
 //! | 96 kHz | no UHQ | resampled to 48 kHz, then as the 48 kHz row |
-//! | 48 kHz | HiFi (`0x04`) | HiFi, config `0x0C`, 192 kbps, 24-bit (16-bit input widened) |
+//! | 48 kHz | HiFi (`0x04`) | HiFi, config `0x0C`, 229 kbps, 24-bit (16-bit input widened) |
 //! | 48 kHz | 48 kHz SSC only (`0x10`) | SSC 48 kHz, config `0x10` (+`0x08` if offered), 16-bit (24-bit input dithered down) |
 //! | any | 44.1 kHz SSC only (`0x20`) | resampled to 44.1 kHz, SSC config `0x20` (+`0x08`) |
 //!
@@ -259,25 +259,25 @@ mod tests {
     #[test]
     fn buds4_pro_caps_0x3e() {
         assert_eq!(row(plan(F96, 0x3E).unwrap()), (Uhq, 0x0A, 584, None, I24));
-        assert_eq!(row(plan(F48, 0x3E).unwrap()), (Hifi, 0x0C, 192, None, I24));
+        assert_eq!(row(plan(F48, 0x3E).unwrap()), (Hifi, 0x0C, 229, None, I24));
         assert_eq!(
             row(plan(F48_16, 0x3E).unwrap()),
-            (Hifi, 0x0C, 192, None, I24),
+            (Hifi, 0x0C, 229, None, I24),
             "16-bit input widened"
         );
         let p = plan(F96, 0x3E).unwrap();
         assert_eq!((p.frame_bytes(), p.packet_bytes()), (660, 672));
         let p = plan(F48, 0x3E).unwrap();
-        assert_eq!((p.frame_bytes(), p.packet_bytes()), (484, 496));
+        assert_eq!((p.frame_bytes(), p.packet_bytes()), (576, 588));
     }
 
     #[test]
     fn no_uhq_caps_0x3c_resamples_96k_to_hifi() {
         assert_eq!(
             row(plan(F96, 0x3C).unwrap()),
-            (Hifi, 0x0C, 192, Some(48000), I24)
+            (Hifi, 0x0C, 229, Some(48000), I24)
         );
-        assert_eq!(row(plan(F48, 0x3C).unwrap()), (Hifi, 0x0C, 192, None, I24));
+        assert_eq!(row(plan(F48, 0x3C).unwrap()), (Hifi, 0x0C, 229, None, I24));
     }
 
     #[test]
@@ -334,9 +334,9 @@ mod tests {
         // 0x3F = Buds4 Pro caps + "sink disables UHQ v2".
         assert_eq!(
             row(plan(F96, 0x3F).unwrap()),
-            (Hifi, 0x0C, 192, Some(48000), I24)
+            (Hifi, 0x0C, 229, Some(48000), I24)
         );
-        assert_eq!(row(plan(F48, 0x3F).unwrap()), (Hifi, 0x0C, 192, None, I24));
+        assert_eq!(row(plan(F48, 0x3F).unwrap()), (Hifi, 0x0C, 229, None, I24));
         // UHQ and nothing else, but disabled: no mode at all.
         assert_eq!(plan(F96, 0x0B), Err(PlanError::NoMode(0x0B)));
         // Disabled UHQ next to plain SSC.
@@ -359,7 +359,7 @@ mod tests {
         // The departure from the table named in the module docs. 0x16 is the
         // fake sink's default octet.
         assert_eq!(row(plan(F96, 0x16).unwrap()), (Uhq, 0x02, 584, None, I24));
-        assert_eq!(row(plan(F48, 0x16).unwrap()), (Hifi, 0x04, 192, None, I24));
+        assert_eq!(row(plan(F48, 0x16).unwrap()), (Hifi, 0x04, 229, None, I24));
         // ... and keep it whenever it is offered.
         assert_eq!(plan(F96, 0x1E).unwrap().config, 0x0A);
         assert_eq!(plan(F48, 0x1E).unwrap().config, 0x0C);
@@ -382,11 +382,11 @@ mod tests {
         let f192 = fmt(192_000, 32, 24);
         assert_eq!(
             row(plan(f44, 0x3E).unwrap()),
-            (Hifi, 0x0C, 192, Some(48000), I24)
+            (Hifi, 0x0C, 229, Some(48000), I24)
         );
         assert_eq!(
             row(plan(f192, 0x3E).unwrap()),
-            (Hifi, 0x0C, 192, Some(48000), I24),
+            (Hifi, 0x0C, 229, Some(48000), I24),
             "UHQ is for 96 kHz only"
         );
         assert_eq!(
@@ -474,7 +474,7 @@ mod tests {
             forbid: 0,
             mode: Hifi,
             config: 0x0C,
-            kbps: 192,
+            kbps: 229,
         },
         TableRow {
             rate_96k_only: false,
@@ -559,12 +559,12 @@ mod tests {
         assert_eq!(p.bitrate, Bitrate::K291, "the next rate the buds decode");
         assert!(p.packet_bytes() <= 671);
         let mut p = plan(F48, 0x3E).unwrap();
-        assert_eq!(p.fit_mtu(300), Ok(Some(Bitrate::K192)));
+        assert_eq!(p.fit_mtu(300), Ok(Some(Bitrate::K229)));
         assert_eq!(p.bitrate, Bitrate::K96);
         let mut p = plan(F48, 0x3E).unwrap();
         let e = p.fit_mtu(48).unwrap_err();
         assert!(e.contains("exceed the media MTU limit 48"), "{e}");
-        assert_eq!(p.bitrate, Bitrate::K192, "unchanged when nothing fits");
+        assert_eq!(p.bitrate, Bitrate::K229, "unchanged when nothing fits");
     }
 
     #[test]
@@ -577,7 +577,7 @@ mod tests {
         assert!(a.same_stream(&plan(F96, 0x3C).unwrap()));
         assert!(
             a.describe()
-                .contains("HiFi 48 kHz/24: config 0x0c, 192 kbps")
+                .contains("HiFi 48 kHz/24: config 0x0c, 229 kbps")
         );
         assert!(
             plan(F96, 0x3C)

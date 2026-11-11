@@ -1,6 +1,7 @@
 //! The real system behind the supervisor: listing the crossc device
 //! interfaces, and one thread per interface running a session on the real
-//! driver. Also the device part of `status`.
+//! driver, publishing its status to the hub of the status feed. Also the
+//! device part of `status`.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -10,26 +11,30 @@ use crossc_core::device::{self, Device};
 use crossc_core::driver::LinkProbe;
 use crossc_core::log::{Level, Log};
 use crossc_core::pace::WallClock;
-use crossc_core::real::{BluetoothLink, RealDriver};
+use crossc_core::real::{BluetoothLink, RealDriver, device_name};
 use crossc_core::session::Session;
 use crossc_core::settings::Settings;
 use crossc_core::stop::StopSignal;
 use crossc_ioctl as ioc;
 use crossc_ioctl::audio::{AudioState, StreamState};
+use crossc_status::Hub;
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
 };
 
+use crate::status::run_published;
 use crate::supervisor::{Host, Worker, short_name};
 
 pub struct RealHost {
     settings: Settings,
     log: Arc<dyn Log>,
+    /// Where the session threads leave their status.
+    hub: Hub,
 }
 
 impl RealHost {
-    pub fn new(settings: Settings, log: Arc<dyn Log>) -> Self {
-        RealHost { settings, log }
+    pub fn new(settings: Settings, log: Arc<dyn Log>, hub: Hub) -> Self {
+        RealHost { settings, log, hub }
     }
 }
 
@@ -48,8 +53,9 @@ impl Worker for ThreadWorker {
     }
 }
 
-/// The body of a session thread: runs the session until `stop`.
-fn session_thread(path: String, stop: StopSignal, settings: Settings, log: Arc<dyn Log>) {
+/// The body of a session thread: runs the session until `stop`, with its
+/// status in `hub` under the session's log prefix meanwhile.
+fn session_thread(path: String, stop: StopSignal, settings: Settings, log: Arc<dyn Log>, hub: Hub) {
     let name = short_name(&path);
     // Audio is paced by this thread: keep it ahead of ordinary work.
     let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) };
@@ -64,12 +70,18 @@ fn session_thread(path: String, stop: StopSignal, settings: Settings, log: Arc<d
             stop.clone(),
             &name,
         );
-        session.run();
+        // The buds' Bluetooth name, as Windows has it (asked at the start
+        // and when the buds have been seen, never while audio streams).
+        let addr = addr_from_path(&path);
+        let bt_name = || addr.and_then(device_name).unwrap_or_default();
+        run_published(&mut session, &hub, &name, bt_name);
     });
     // The session does not panic by design. Should it ever, the handles are
     // closed by the unwind (the driver then detaches by itself) and the
     // supervisor starts a new session.
     if catch_unwind(run).is_err() {
+        // The unwind skipped the end of `run_published`.
+        hub.remove_device(&name);
         log.log(
             Level::Error,
             &format!("[{name}] the session thread panicked; it will be restarted"),
@@ -84,9 +96,10 @@ impl Host for RealHost {
 
     fn spawn(&self, path: &str, stop: StopSignal) -> Box<dyn Worker> {
         let (p, settings, log) = (path.to_string(), self.settings, self.log.clone());
+        let hub = self.hub.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("session-{}", short_name(path)))
-            .spawn(move || session_thread(p, stop, settings, log));
+            .spawn(move || session_thread(p, stop, settings, log, hub));
         match spawned {
             Ok(h) => Box::new(ThreadWorker(Some(h))),
             Err(e) => {
@@ -98,6 +111,12 @@ impl Host for RealHost {
                 Box::new(ThreadWorker(None))
             }
         }
+    }
+
+    fn sessions_stopped(&self) {
+        // Each session thread took its device out as it ended; this is for
+        // one that could not.
+        self.hub.clear_devices();
     }
 }
 
@@ -285,11 +304,36 @@ mod tests {
     fn a_session_thread_ends_when_asked_even_without_a_device() {
         let stop = StopSignal::new();
         let log: Arc<dyn Log> = Arc::new(crossc_core::log::NullLog);
-        let host = RealHost::new(Settings::default(), log);
-        let w = host.spawn(r"\\?\crossc-no-such-device", stop.clone());
+        let hub = crate::status::new_hub(String::new());
+        let host = RealHost::new(Settings::default(), log, hub.clone());
+        let path = r"\\?\crossc-no-such-device";
+        let w = host.spawn(path, stop.clone());
+        // Its status is in the hub meanwhile, under the log prefix: there
+        // from the start, with the reason once the first attempt has failed.
+        let t0 = std::time::Instant::now();
+        let failed = |hub: &Hub| {
+            let d = hub.snapshot().devices;
+            d.first().is_some_and(|d| !d.phase_reason.is_empty())
+        };
+        while !failed(&hub) && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!w.finished(), "it keeps retrying the device");
+        let devices = hub.snapshot().devices;
+        assert_eq!(devices.len(), 1, "{devices:?}");
+        let d = &devices[0];
+        assert_eq!(d.id, short_name(path));
+        assert_eq!(d.phase, crossc_status::LinkPhase::WaitingDriver);
+        assert!(
+            d.phase_reason.contains("cannot open the device"),
+            "{}",
+            d.phase_reason
+        );
+        assert_eq!((d.name.as_str(), &d.link, &d.driver), ("", &None, &None));
         stop.request();
         w.join();
+        assert!(hub.snapshot().devices.is_empty(), "gone with its session");
+        host.sessions_stopped();
     }
 }

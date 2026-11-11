@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crossc_core::log::{Level, Log};
 use crossc_core::settings::Settings;
+use crossc_status::pipe::Security;
 use windows_service::service::{
     PowerEventParam, ServiceAccess, ServiceAction, ServiceActionType, ServiceControl,
     ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceFailureActions,
@@ -22,6 +23,7 @@ use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::host::RealHost;
 use crate::logger::{FileLog, default_log_dir};
+use crate::status::{StatusLog, new_hub, start_server};
 use crate::supervisor::{Command, Supervisor};
 
 pub const SERVICE_NAME: &str = "crossc";
@@ -317,7 +319,12 @@ fn command_for(control: &ServiceControl) -> Option<Command> {
     }
 }
 
-fn run_service(log: Arc<FileLog>) -> Result<(), String> {
+fn run_service(file_log: Arc<FileLog>) -> Result<(), String> {
+    // The status feed's state first, then the log that feeds it its last
+    // warning, then everything that logs.
+    let hub = new_hub(default_log_dir().display().to_string());
+    let plain: Arc<dyn Log> = file_log.clone();
+    let log: Arc<dyn Log> = Arc::new(StatusLog::new(plain.clone(), hub.clone()));
     let (tx, rx) = mpsc::channel::<Command>();
     let handler = move |control: ServiceControl| -> ServiceControlHandlerResult {
         match (command_for(&control), &control) {
@@ -335,7 +342,7 @@ fn run_service(log: Arc<FileLog>) -> Result<(), String> {
     let handle = service_control_handler::register(SERVICE_NAME, handler)
         .map_err(|e| describe("registering the control handler", &e))?;
     let (settings, warnings) = Settings::load();
-    log.set_level(settings.log_level);
+    file_log.set_level(settings.log_level);
     log.log(
         Level::Info,
         &format!(
@@ -350,12 +357,18 @@ fn run_service(log: Arc<FileLog>) -> Result<(), String> {
     handle
         .set_service_status(status(ServiceState::Running, Duration::ZERO, 0))
         .map_err(|e| describe("reporting the running state", &e))?;
-    let mut supervisor = Supervisor::new(RealHost::new(settings, log.clone()), log.clone());
+    // The pipe the tray app reads. Without it the service works as before.
+    let status_server = start_server(&hub, Security::Service, plain);
+    let host = RealHost::new(settings, log.clone(), hub.clone());
+    let mut supervisor = Supervisor::new(host, log.clone());
     supervisor.run(&rx);
     // Tell the SCM how long the teardown may take before it starts.
     let _ = handle.set_service_status(status(ServiceState::StopPending, STOP_WAIT_HINT, 0));
     log.log(Level::Info, "stopping");
     supervisor.stop_all();
+    hub.clear_devices();
+    // Disconnects the clients and ends the pipe's thread.
+    drop(status_server);
     log.log(Level::Info, "stopped");
     handle
         .set_service_status(status(ServiceState::Stopped, Duration::ZERO, 0))

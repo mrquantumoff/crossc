@@ -182,6 +182,84 @@ impl Stats {
     }
 }
 
+/// Counters since the session started (the statistics interval's are in
+/// `Stats`). The three WRITE fields describe the current stream: they
+/// start anew with every START.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Totals {
+    /// Media packets sent.
+    pub packets: u64,
+    /// PCM frames taken from the endpoint (and not skipped).
+    pub frames_in: u64,
+    /// Gaps in the PCM the driver flagged.
+    pub discontinuities: u64,
+    /// Media WRITEs that failed.
+    pub write_errors: u64,
+    /// Packets whose PCM was [`crate::abr::LATE`] or more behind the
+    /// endpoint clock.
+    pub late_packets: u64,
+    /// Links that went down and are set up again.
+    pub reconnects: u32,
+    /// Frames the driver dropped while a stream was started: audio this
+    /// session did not read in time. The driver's own counter also counts
+    /// what it renders while nothing reads it (no session, a stream that
+    /// is not started) and is never reset; this one takes only what that
+    /// counter rose by between a START and the end of that stream.
+    pub dropped_frames: u64,
+    /// Time spent in the media WRITEs of the current stream.
+    pub write_total: Duration,
+    /// The longest of them.
+    pub write_max: Duration,
+    /// How many there were.
+    pub write_count: u64,
+}
+
+/// The current link, as [`Session::status`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkView {
+    pub plan: Plan,
+    /// The buds' SSC capability octet.
+    pub caps: u8,
+    /// The rates the stream may use, and which one it uses now.
+    pub ladder: Ladder,
+    pub rate: Rate,
+    /// Index of `rate` in the ladder (0: the top).
+    pub rung: usize,
+    /// Largest media packet allowed, bytes, and how that was derived.
+    pub mtu_limit: usize,
+    pub mtu_why: String,
+    /// For how long the stream has been started. `None`: it is not.
+    pub streaming_for: Option<Duration>,
+}
+
+/// Where the session is and what it has counted: plain data for whoever
+/// shows it (the service's status feed). See [`Session::status`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionStatus {
+    pub phase: Phase,
+    /// The link probe's last answer. `None`: not asked since the driver
+    /// was attached.
+    pub connected: Option<bool>,
+    /// Waiting out the backoff of a failed link before the next attempt.
+    pub retrying: bool,
+    /// Why the session is where it is: what the driver lacks, why the
+    /// stream could not be set up, why the link went down. Empty while
+    /// there is a link.
+    pub reason: String,
+    /// The endpoint's format: the current one, else the last valid one.
+    pub endpoint: Option<PcmFormat>,
+    pub link: Option<LinkView>,
+    /// Last delay the sink reported, 1/10 ms.
+    pub sink_delay: Option<u16>,
+    /// Who applies the volume.
+    pub volume: Decision,
+    /// The last audio state seen (flags, volume, the driver's counters).
+    pub audio: AudioState,
+    /// (driver version, protocol version) of GET_INFO while attached.
+    pub driver: Option<(u32, u32)>,
+    pub totals: Totals,
+}
+
 /// An open, configured stream to the buds.
 struct Link<D: Driver> {
     sig: Signaling<DriverChannel<D>>,
@@ -199,12 +277,19 @@ struct Link<D: Driver> {
     /// last packet: next to nothing while it works off a backlog.
     waited: Duration,
     mtu_limit: usize,
+    /// How `mtu_limit` was derived.
+    mtu_why: String,
     started: bool,
+    /// Since when the stream is started.
+    streaming_since: Option<Duration>,
     /// PCM rendered before this position predates the current START and is
     /// not sent (see [`Session::start`]).
     skip_before: u64,
     /// Frames skipped for that reason since START (for the log).
     skipped: u64,
+    /// The driver's dropped-frames counter as last accounted for in
+    /// [`Totals::dropped_frames`] (see [`Session::count_dropped`]).
+    dropped_seen: u64,
     /// Since when the link is up (for the backoff).
     since: Duration,
     /// Rendering stopped at this time while the stream was started.
@@ -314,6 +399,12 @@ pub struct Session<D: Driver, P: LinkProbe, K: Clock> {
     /// Bitrate changes logged in the period that began at `.0`, and held
     /// back since the last one logged.
     rate_log: (Duration, u32, u32),
+    /// Counters since the session started.
+    totals: Totals,
+    /// (driver version, protocol version) of GET_INFO while attached.
+    driver: Option<(u32, u32)>,
+    /// Why the session is where it is (see [`SessionStatus::reason`]).
+    reason: String,
 }
 
 impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
@@ -352,6 +443,9 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             volume_logged: None,
             write_error: None,
             rate_log: (Duration::ZERO, 0, 0),
+            totals: Totals::default(),
+            driver: None,
+            reason: String::new(),
         }
     }
 
@@ -387,6 +481,43 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
     /// The gain the current link's pipeline is ramping to (or holds).
     pub fn pipeline_gain(&self) -> Option<[f64; 2]> {
         self.link.as_ref().map(|l| l.pipe.gain().target())
+    }
+
+    /// The session's clock.
+    pub fn now(&self) -> Duration {
+        self.clock.now()
+    }
+
+    /// Where the session is and what it has counted, as of the last step.
+    /// Plain data from memory: no driver call, nothing logged.
+    pub fn status(&self) -> SessionStatus {
+        let now = self.clock.now();
+        SessionStatus {
+            phase: self.phase,
+            connected: self.was_connected,
+            retrying: self.phase == Phase::WaitLink && self.retry_at > now,
+            reason: self.reason.clone(),
+            endpoint: if self.audio.format.is_valid() {
+                Some(self.audio.format)
+            } else {
+                self.last_format
+            },
+            link: self.link.as_ref().map(|l| LinkView {
+                plan: l.plan,
+                caps: l.sep.flags.0,
+                ladder: *l.abr.ladder(),
+                rate: l.abr.rate(),
+                rung: l.abr.rung(),
+                mtu_limit: l.mtu_limit,
+                mtu_why: l.mtu_why.clone(),
+                streaming_for: l.streaming_since.map(|t| now.saturating_sub(t)),
+            }),
+            sink_delay: self.last_delay,
+            volume: self.volume,
+            audio: self.audio,
+            driver: self.driver,
+            totals: self.totals,
+        }
     }
 
     /// Run until the stop request has been honoured.
@@ -481,6 +612,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
                 self.set_phase(Phase::WaitLink);
             }
             Err(msg) => {
+                self.reason = format!("driver not ready: {msg}");
                 self.error_once(
                     "driver",
                     &format!(
@@ -524,6 +656,8 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             .attach()
             .map_err(|e| format!("AUDIO_ATTACH: {e}"))?;
         self.addr = info.remote_addr;
+        self.driver = Some((info.driver_version, info.protocol_version));
+        self.reason.clear();
         self.note_state(st);
         self.info(&format!(
             "attached: driver {}.{}.{} (protocol v{}), buds {}",
@@ -658,6 +792,10 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
     /// The driver ended the session (or its audio requests fail): drop
     /// everything and start over at WaitDriver.
     fn on_detached(&mut self, why: &str) {
+        self.reason = format!("the driver detached the session ({why})");
+        self.driver = None;
+        // The stream it was reported for is gone.
+        self.last_delay = None;
         self.error_once(
             "detached",
             &format!(
@@ -705,7 +843,9 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
                     self.info("the buds are not connected; waiting for them");
                 }
                 self.was_connected = Some(false);
-                // Whatever failed before, a new connection starts afresh.
+                // Whatever failed before, a new connection starts afresh:
+                // the buds being away is all there is to say now.
+                self.reason.clear();
                 self.backoff = 0;
                 self.retry_at = now;
                 return;
@@ -722,6 +862,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             Ok(link) => {
                 self.limiter.forget("link");
                 self.info(&format!("link up: {}", link.plan.describe()));
+                self.reason.clear();
                 self.link = Some(link);
                 self.set_phase(Phase::Ready);
             }
@@ -734,6 +875,10 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
                 };
                 self.retry_at = now + wait;
                 self.next_probe = self.retry_at;
+                // A delay the sink reported for the stream that did not
+                // come about is nobody's.
+                self.last_delay = None;
+                self.reason = format!("cannot set up the stream: {}", f.msg);
                 self.error_once(
                     "link",
                     &format!(
@@ -801,7 +946,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             msg: e.to_string(),
             unsupported: true,
         })?;
-        let (media, plan, mtu_limit) = self.open_stream(&mut sig, &sep, fmt, plan)?;
+        let (media, plan, mtu_limit, mtu_why) = self.open_stream(&mut sig, &sep, fmt, plan)?;
         let mut pipe = match self.new_pipeline(fmt, &plan) {
             Ok(p) => p,
             Err(e) => {
@@ -828,9 +973,12 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             late: Lateness::new(),
             waited: Duration::ZERO,
             mtu_limit,
+            mtu_why,
             started: false,
+            streaming_since: None,
             skip_before: 0,
             skipped: 0,
+            dropped_seen: 0,
             since: now,
             idle_since: None,
             next_start: now,
@@ -884,7 +1032,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
         sep: &SscSep,
         fmt: PcmFormat,
         plan: Plan,
-    ) -> Result<(DriverChannel<D>, Plan, usize), Fail> {
+    ) -> Result<(DriverChannel<D>, Plan, usize, String), Fail> {
         let config = caps::ssc_configuration(plan.config, sep.delay_reporting);
         sig.stream = Some(LocalStream {
             int_seid: INT_SEID,
@@ -969,7 +1117,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             media.in_mtu,
             plan.packet_bytes()
         ));
-        Ok((media, plan, limit))
+        Ok((media, plan, limit, why))
     }
 
     // -- Ready / Streaming --------------------------------------------------
@@ -1078,9 +1226,44 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
         Flow::Keep
     }
 
+    /// The driver's dropped-frames counter stands at `counter`: what it
+    /// rose by since it was last looked at was lost from the started
+    /// stream. (From START on only: what the driver drops while nothing
+    /// reads it is no loss.)
+    ///
+    /// The counter only rises, but what is looked at may be older than the
+    /// last look (a state that was announced before the counter was last
+    /// asked for): the base never goes back, or the same frames would be
+    /// counted again.
+    fn count_dropped(&mut self, link: &mut Link<D>, counter: u64) {
+        if counter <= link.dropped_seen {
+            return;
+        }
+        if link.started {
+            self.totals.dropped_frames += counter - link.dropped_seen;
+        }
+        link.dropped_seen = counter;
+    }
+
+    /// [`Self::count_dropped`] with the counter as the driver has it now:
+    /// before the stream leaves the started state, so that what was lost
+    /// since the last look is not forgotten.
+    fn count_dropped_now(&mut self, link: &mut Link<D>) {
+        if link.started
+            && let Ok(st) = self.drv.audio_state()
+        {
+            self.count_dropped(link, st.frames_dropped);
+            // Only the counter: the rest of a state goes through
+            // `note_state`, with the event that announces it.
+            self.audio.frames_dropped = st.frames_dropped;
+        }
+    }
+
     /// Bookkeeping when the stream leaves the started state.
     fn stream_stopped(&mut self, link: &mut Link<D>) {
+        self.count_dropped_now(link);
         link.started = false;
+        link.streaming_since = None;
         link.idle_since = None;
         link.pipe.flush();
         self.drv.flush_pcm();
@@ -1090,6 +1273,10 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
     /// accepted, or we accepted the sink's).
     fn begin_streaming(&mut self, link: &mut Link<D>, now: Duration) {
         link.started = true;
+        link.streaming_since = Some(now);
+        self.totals.write_total = Duration::ZERO;
+        self.totals.write_max = Duration::ZERO;
+        self.totals.write_count = 0;
         link.sink_suspended = false;
         link.start_failures = 0;
         link.idle_since = None;
@@ -1100,6 +1287,10 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
         // START retried while audio kept playing, a rebuilt link) it
         // is a backlog that would only add delay: skip up to now.
         let st = self.drv.audio_state().unwrap_or(self.audio);
+        // Only the counter: the rest of a state goes through `note_state`.
+        self.audio.frames_dropped = st.frames_dropped;
+        // What the driver dropped before this START was not this stream's.
+        link.dropped_seen = st.frames_dropped;
         let fresh = u64::from(link.fmt.sample_rate / 2);
         link.skip_before = if st.frames_rendered.saturating_sub(self.run_start) <= fresh {
             self.run_start
@@ -1191,6 +1382,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
     }
 
     fn on_state(&mut self, link: &mut Link<D>, s: AudioState) -> Flow {
+        self.count_dropped(link, s.frames_dropped);
         self.note_state(s);
         link.pipe.set_gain(self.volume.gain, false);
         if s.format.is_valid() && s.format != link.fmt {
@@ -1232,9 +1424,12 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
         }
         // CLOSE, then the old media channel goes, then the new stream.
         let r = media::release(&mut link.sig, link.sep.seid);
-        // The stream is being closed: what the sink did to it is moot.
+        // The stream is being closed: what the sink did to it is moot, and
+        // the delay it reported was that stream's (the new one reports its
+        // own while it is set up).
         let mut moot = None;
         let ended = self.take_events(&mut link.sig, &mut moot);
+        self.last_delay = None;
         if let Err(e) = r {
             return down(format!("CLOSE before reconfiguring: {e}"), false);
         }
@@ -1246,7 +1441,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
         }
         let sep = link.sep.clone();
         match self.open_stream(&mut link.sig, &sep, fmt, plan) {
-            Ok((media, plan, limit)) => {
+            Ok((media, plan, limit, why)) => {
                 let mut pipe = match self.new_pipeline(fmt, &plan) {
                     Ok(p) => p,
                     Err(e) => return down(e, true),
@@ -1260,6 +1455,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
                 link.media = media;
                 link.plan = plan;
                 link.mtu_limit = limit;
+                link.mtu_why = why;
                 link.fmt = fmt;
                 link.pipe = pipe;
                 link.sink_suspended = false;
@@ -1301,6 +1497,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             link.pipe.flush();
             link.late.reset();
             link.stats.discontinuities += 1;
+            self.totals.discontinuities += 1;
             self.say(
                 Level::Debug,
                 &format!("discontinuity before frame {}", h.first_frame),
@@ -1324,7 +1521,9 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             );
             link.skipped = 0;
         }
-        link.stats.frames_in += u64::from(h.frames).saturating_sub(stale);
+        let taken = u64::from(h.frames).saturating_sub(stale);
+        link.stats.frames_in += taken;
+        self.totals.frames_in += taken;
         // How far behind the endpoint this chunk is taken up.
         let late = link
             .late
@@ -1342,6 +1541,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             let r = link.media.send(pkt);
             let now = self.clock.now();
             if let Err(e) = r {
+                self.totals.write_errors += 1;
                 // A WRITE that did not complete in time is a link that
                 // carries too little; a channel or a link that went away
                 // says nothing of the kind.
@@ -1356,6 +1556,13 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             link.stats.packets += 1;
             link.stats.write_total += write;
             link.stats.write_max = link.stats.write_max.max(write);
+            self.totals.packets += 1;
+            self.totals.write_count += 1;
+            self.totals.write_total += write;
+            self.totals.write_max = self.totals.write_max.max(write);
+            if late >= crate::abr::LATE {
+                self.totals.late_packets += 1;
+            }
             // The rate of the next packet follows this one's fate.
             let waited = std::mem::take(&mut link.waited);
             let obs = Obs {
@@ -1382,6 +1589,10 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             Ok(st) => {
                 let d = st.frames_dropped.saturating_sub(s.dropped_base);
                 link.stats.dropped_base = st.frames_dropped;
+                self.count_dropped(link, st.frames_dropped);
+                // Only the counter: the rest of a state goes through
+                // `note_state`, with the event that announces it.
+                self.audio.frames_dropped = st.frames_dropped;
                 d.to_string()
             }
             Err(_) => "?".into(),
@@ -1410,6 +1621,9 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
     /// back if it is still ours, close the channels, reconnect later.
     fn teardown(&mut self, mut link: Link<D>, reason: &str, release: bool) {
         let now = self.clock.now();
+        self.count_dropped_now(&mut link);
+        self.reason = format!("link down: {reason}");
+        self.totals.reconnects += 1;
         self.warn(&format!("link down: {reason}"));
         if let Err(e) = self.drv.set_link(false) {
             self.error_once("set-link", &format!("AUDIO_SET_LINK(false): {e}"));
@@ -1418,6 +1632,8 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             self.release(&mut link.sig, link.sep.seid);
         }
         self.drain_trace(&mut link.sig);
+        // The delay the sink reported was this stream's.
+        self.last_delay = None;
         self.drv.flush_pcm();
         if now.saturating_sub(link.since) >= STABLE_LINK {
             self.backoff = 0;

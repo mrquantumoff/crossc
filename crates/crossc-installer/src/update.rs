@@ -1375,6 +1375,7 @@ pub mod tests {
             (&p("crossc-cli.exe"), &small_exe),
             (&p("crossc-installer.exe"), &small_exe),
             (&p("crossc-service.exe"), &small_exe),
+            (&p("crossc-tray.exe"), &small_exe),
             (&p("driver/WDRLocalTestCert.cer"), crate::cert::tests::WDR_A),
             (&p("driver/crossc_bth.cat"), b"catalog"),
             (&p("driver/crossc_bth.inf"), inf.as_bytes()),
@@ -1414,7 +1415,7 @@ pub mod tests {
     fn a_bundle_unpacks_without_its_top_folder() {
         let t = TempDir::new("unpack");
         let (files, bytes) = unpack(&bundle_zip(TOP), &t.0).unwrap();
-        assert_eq!(files, 11);
+        assert_eq!(files, 12);
         assert_eq!(
             files_in(&t.0),
             [
@@ -1424,6 +1425,7 @@ pub mod tests {
                 "crossc-cli.exe",
                 "crossc-installer.exe",
                 "crossc-service.exe",
+                "crossc-tray.exe",
                 "driver/WDRLocalTestCert.cer",
                 "driver/crossc_bth.cat",
                 "driver/crossc_bth.inf",
@@ -1918,7 +1920,7 @@ pub mod tests {
         assert_eq!(unpacked.dir, releases.join("v0.2.0"));
         assert_eq!(unpacked.asset, "crossc-0.2.0-x64.zip");
         assert_eq!(unpacked.sha256, sha256);
-        assert_eq!(unpacked.files, 11);
+        assert_eq!(unpacked.files, 12);
 
         // What is on disk: the release, unpacked without its top folder, and nothing else.
         let mut top_level: Vec<String> = std::fs::read_dir(&releases)
@@ -1928,7 +1930,7 @@ pub mod tests {
         top_level.sort();
         assert_eq!(top_level, ["v0.2.0"]);
         let files = files_in(&unpacked.dir);
-        assert_eq!(files.len(), 11, "{files:?}");
+        assert_eq!(files.len(), 12, "{files:?}");
         assert!(
             files.contains(&"driver/crossc_bth.inf".to_string())
                 && !files.contains(&"old.txt".to_string())
@@ -1997,7 +1999,7 @@ pub mod tests {
             "{text:?}"
         );
         assert!(
-            text.iter().any(|l| l.contains("unpacked 11 files")),
+            text.iter().any(|l| l.contains("unpacked 12 files")),
             "{text:?}"
         );
         assert!(

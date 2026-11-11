@@ -308,16 +308,49 @@ impl Driver for RealDriver {
 #[derive(Default)]
 pub struct BluetoothLink;
 
-fn device_info(radio: Option<HANDLE>, addr: u64) -> Result<bool, u32> {
+fn device_info(radio: Option<HANDLE>, addr: u64) -> Result<BLUETOOTH_DEVICE_INFO, u32> {
     let mut di = BLUETOOTH_DEVICE_INFO {
         dwSize: std::mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32,
         ..Default::default()
     };
     di.Address.Anonymous.ullLong = addr;
     match unsafe { BluetoothGetDeviceInfo(radio, &mut di) } {
-        0 => Ok(di.fConnected.as_bool()),
+        0 => Ok(di),
         e => Err(e),
     }
+}
+
+/// What Windows knows about the device at `addr`: asked of every local
+/// radio at once, and of each radio in turn if that fails.
+fn device_info_any(addr: u64) -> Result<BLUETOOTH_DEVICE_INFO, u32> {
+    // With no radio handle the API asks every local radio.
+    let first = match device_info(None, addr) {
+        Ok(di) => return Ok(di),
+        Err(e) => e,
+    };
+    let mut result = Err(first);
+    for r in radios() {
+        if result.is_err() {
+            result = device_info(Some(r), addr);
+        }
+        let _ = unsafe { CloseHandle(r) };
+    }
+    result
+}
+
+/// The name in a `szName` field: UTF-16 up to the first NUL.
+fn name_from_utf16(raw: &[u16]) -> String {
+    let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+    String::from_utf16_lossy(&raw[..end]).trim().to_string()
+}
+
+/// The Bluetooth name Windows has for the device at `addr` (empty if it has
+/// none), or `None` if it does not know the device. Like the link probe,
+/// this only reads what Windows already has.
+pub fn device_name(addr: u64) -> Option<String> {
+    device_info_any(addr)
+        .ok()
+        .map(|di| name_from_utf16(&di.szName))
 }
 
 /// Handles of all local Bluetooth radios (to be closed by the caller).
@@ -345,19 +378,9 @@ fn radios() -> Vec<HANDLE> {
 
 impl LinkProbe for BluetoothLink {
     fn connected(&mut self, addr: u64) -> Result<bool, String> {
-        // With no radio handle the API asks every local radio.
-        let first = match device_info(None, addr) {
-            Ok(c) => return Ok(c),
-            Err(e) => e,
-        };
-        let mut result = Err(first);
-        for r in radios() {
-            if result.is_err() {
-                result = device_info(Some(r), addr);
-            }
-            let _ = unsafe { CloseHandle(r) };
-        }
-        result.map_err(|e| format!("BluetoothGetDeviceInfo failed: Win32 error {e}"))
+        device_info_any(addr)
+            .map(|di| di.fConnected.as_bool())
+            .map_err(|e| format!("BluetoothGetDeviceInfo failed: Win32 error {e}"))
     }
 }
 
@@ -541,6 +564,22 @@ mod tests {
         for p in paths {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    #[test]
+    fn names_end_at_the_first_nul() {
+        let mut raw = [0u16; 248];
+        for (i, c) in "  Some Buds ".encode_utf16().enumerate() {
+            raw[i] = c;
+        }
+        raw[20] = u16::from(b'x'); // after the terminator: not part of it
+        assert_eq!(name_from_utf16(&raw), "Some Buds");
+        assert_eq!(name_from_utf16(&[0u16; 248]), "");
+        // No terminator at all: the whole field.
+        assert_eq!(name_from_utf16(&[u16::from(b'a'); 4]), "aaaa");
+        // An address nothing is paired under: no name, or an empty one.
+        let n = device_name(0x0000_1234_5678_9ABC);
+        assert!(n.as_deref().is_none_or(str::is_empty), "{n:?}");
     }
 
     #[test]

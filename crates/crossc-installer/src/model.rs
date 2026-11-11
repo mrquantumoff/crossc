@@ -291,6 +291,18 @@ pub struct ServiceInfo {
     pub exe: Option<String>,
 }
 
+/// The tray app (`crossc-tray.exe`) in the install folder (`tray::query`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrayInfo {
+    /// `crossc-tray.exe` is in the install folder.
+    pub installed: bool,
+    /// A process runs it.
+    pub running: bool,
+    /// It starts when the signed-in user signs in (the `crossc-tray` value under that user's Run key names it).
+    /// `None`: who is signed in at this desktop cannot be told.
+    pub autostart: Option<bool>,
+}
+
 /// What Install wrote down in `HKLM\SOFTWARE\crossc` (`system::read_record`). Every value may be missing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InstallRecord {
@@ -402,6 +414,10 @@ pub struct Status {
     /// The `crossc-service.exe` Install would copy (bundle: next to the installer, repo: `target\release`);
     /// `None` when it is not there or is not a complete Windows executable.
     pub service_exe: Option<PathBuf>,
+    pub tray: TrayInfo,
+    /// The `crossc-tray.exe` Install would copy (next to the service exe); `None` when it is not there. Never
+    /// in the way of Install: the tray is an extra.
+    pub tray_exe: Option<PathBuf>,
     /// Online mode: the installer runs on its own (no `driver\` next to it, no repo). Its package is the release
     /// it installed earlier, if any; until then there is none and "Download and install" is the way.
     pub online: bool,
@@ -683,6 +699,7 @@ pub fn checklist(s: &Status) -> Vec<CheckItem> {
     });
 
     v.push(service_item(s));
+    v.push(tray_item(s));
     v.push(latest_item(s));
 
     v
@@ -875,6 +892,58 @@ fn service_item(s: &Status) -> CheckItem {
             ),
         },
         state => item("Service", Level::Warn, format!("{state}: {exe}")),
+    }
+}
+
+/// The "Tray app" row. Never red and never part of the next step: crossc works without the tray.
+fn tray_item(s: &Status) -> CheckItem {
+    const LABEL: &str = "Tray app";
+    let autostart = match s.tray.autostart {
+        Some(true) => "starts with Windows",
+        Some(false) => "does not start with Windows (its menu has \"Start with Windows\")",
+        None => "whether it starts with Windows is not known",
+    };
+    if s.tray.running {
+        return item(LABEL, Level::Good, format!("running; {autostart}"));
+    }
+    if s.tray.installed {
+        return item(
+            LABEL,
+            Level::Warn,
+            format!(
+                "installed, not running: open crossc-tray.exe in %ProgramFiles%\\crossc; {autostart}"
+            ),
+        );
+    }
+    match (&s.tray_exe, s.is_bundle()) {
+        (Some(_), _) if s.service_exe.is_some() => item(
+            LABEL,
+            Level::Warn,
+            "not installed (Install adds and starts it)",
+        ),
+        (Some(_), _) => item(
+            LABEL,
+            Level::Warn,
+            "not installed; Install adds it together with the service",
+        ),
+        (None, true) if s.online && !s.package().complete() => item(
+            LABEL,
+            Level::Warn,
+            "not installed (\"Download and install\" adds and starts it)",
+        ),
+        (None, true) => item(
+            LABEL,
+            Level::Warn,
+            format!(
+                "not installed; {} has no crossc-tray.exe, so Install skips it",
+                s.bundle_noun()
+            ),
+        ),
+        (None, false) => item(
+            LABEL,
+            Level::Warn,
+            "not installed; target\\release\\crossc-tray.exe is not built, so Install skips it",
+        ),
     }
 }
 
@@ -1728,6 +1797,8 @@ pub mod tests {
             staged: Ok(vec![]),
             service: service(ServiceState::NotInstalled),
             service_exe: Some(PathBuf::from(r"C:\x\target\release\crossc-service.exe")),
+            tray: TrayInfo::default(),
+            tray_exe: Some(PathBuf::from(r"C:\x\target\release\crossc-tray.exe")),
             online: false,
             record: InstallRecord::default(),
             bundle_version: None,
@@ -1743,6 +1814,7 @@ pub mod tests {
                 ..package(PackageKind::Bundle, true)
             }],
             service_exe: Some(PathBuf::from(r"C:\crossc-0.1\crossc-service.exe")),
+            tray_exe: Some(PathBuf::from(r"C:\crossc-0.1\crossc-tray.exe")),
             ..ready()
         }
     }
@@ -1765,6 +1837,113 @@ pub mod tests {
 
     fn row<'a>(c: &'a [CheckItem], label: &str) -> &'a CheckItem {
         c.iter().find(|i| i.label == label).unwrap()
+    }
+
+    // ---- tray app -----------------------------------------------------------------------------------------------
+
+    #[test]
+    fn the_tray_row_follows_the_tray_and_never_blocks() {
+        let tray = |s: &Status| row(&checklist(s), "Tray app").clone();
+        let level_and_text = |s: &Status| {
+            let r = tray(s);
+            (r.level, r.detail)
+        };
+        // Nothing installed yet: Install brings it, like the service.
+        for s in [ready(), ready_bundle()] {
+            assert_eq!(
+                level_and_text(&s),
+                (
+                    Level::Warn,
+                    "not installed (Install adds and starts it)".to_string()
+                )
+            );
+        }
+
+        // Installed and running, as Install leaves it.
+        let mut s = installed(ready_bundle());
+        let steps_without_tray = next_step(&s);
+        s.tray = TrayInfo {
+            installed: true,
+            running: true,
+            autostart: Some(true),
+        };
+        assert_eq!(
+            level_and_text(&s),
+            (Level::Good, "running; starts with Windows".to_string())
+        );
+        // The user switched autostart off in the tray's menu, or there is no shell to ask: still fine.
+        s.tray.autostart = Some(false);
+        let (level, text) = level_and_text(&s);
+        assert_eq!(level, Level::Good);
+        assert!(
+            text.starts_with("running; does not start with Windows"),
+            "{text}"
+        );
+        s.tray.autostart = None;
+        assert_eq!(tray(&s).level, Level::Good);
+
+        // Closed by the user: worth a look, with where to find it.
+        s.tray.running = false;
+        s.tray.autostart = Some(true);
+        assert_eq!(
+            level_and_text(&s),
+            (
+                Level::Warn,
+                r"installed, not running: open crossc-tray.exe in %ProgramFiles%\crossc; starts with Windows"
+                    .to_string()
+            )
+        );
+
+        // A release from before there was a tray, and a checkout where it is not built: said, not red.
+        s.tray = TrayInfo::default();
+        s.tray_exe = None;
+        assert_eq!(
+            level_and_text(&s),
+            (
+                Level::Warn,
+                "not installed; the bundle has no crossc-tray.exe, so Install skips it".to_string()
+            )
+        );
+        s.online = true;
+        assert!(tray(&s).detail.contains("the downloaded release has no"));
+        let mut repo = installed(ready());
+        repo.tray_exe = None;
+        assert!(tray(&repo).detail.contains("is not built"));
+        // Built, but no service exe to install with it.
+        repo.tray_exe = ready().tray_exe;
+        repo.service_exe = None;
+        assert_eq!(
+            tray(&repo).detail,
+            "not installed; Install adds it together with the service"
+        );
+
+        // The installer on its own, before the first download.
+        let mut lone = ready_bundle();
+        lone.online = true;
+        lone.packages[0].missing = REQUIRED_FILES.to_vec();
+        lone.service_exe = None;
+        lone.tray_exe = None;
+        assert_eq!(
+            tray(&lone).detail,
+            "not installed (\"Download and install\" adds and starts it)"
+        );
+
+        // Whatever the tray does, it is never red and the next step is the same.
+        let mut s = installed(ready_bundle());
+        for (installed, running) in [(false, false), (true, false), (true, true)] {
+            for autostart in [None, Some(false), Some(true)] {
+                for tray_exe in [None, ready_bundle().tray_exe] {
+                    s.tray = TrayInfo {
+                        installed,
+                        running,
+                        autostart,
+                    };
+                    s.tray_exe = tray_exe;
+                    assert_ne!(tray(&s).level, Level::Bad);
+                    assert_eq!(next_step(&s), steps_without_tray);
+                }
+            }
+        }
     }
 
     // ---- node matching -------------------------------------------------------------------------------------------
@@ -2387,6 +2566,7 @@ pub mod tests {
                 "Buds",
                 "Staged packages",
                 "Service",
+                "Tray app",
                 "Latest release"
             ]
         );
@@ -2473,7 +2653,8 @@ pub mod tests {
         );
         assert!(buds.iter().all(|b| b.sub.is_some()));
         // The rows after the nodes are still there.
-        assert_eq!(c[c.len() - 2].label, "Service");
+        assert_eq!(c[c.len() - 3].label, "Service");
+        assert_eq!(c[c.len() - 2].label, "Tray app");
         assert_eq!(c.last().unwrap().label, "Latest release");
         assert_eq!(
             row(&c, "Service").detail,

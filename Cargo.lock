@@ -1248,8 +1248,11 @@ version = "0.2.0"
 name = "crossc-service"
 version = "0.2.0"
 dependencies = [
+ "avdtp",
  "crossc-core",
  "crossc-ioctl",
+ "crossc-status",
+ "ssc-enc",
  "windows 0.62.2",
  "windows-service",
 ]

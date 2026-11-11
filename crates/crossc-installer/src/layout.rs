@@ -1,7 +1,8 @@
 //! Where the driver package and the companion executables are. Three layouts:
 //!
-//! * **bundle**: an unpacked release zip, `crossc-installer.exe`, `crossc-service.exe`, `crossc-cli.exe` and
-//!   `driver\{crossc_bth.sys,.inf,.cat,WDRLocalTestCert.cer}` side by side. No cargo and no repo.
+//! * **bundle**: an unpacked release zip, `crossc-installer.exe`, `crossc-service.exe`, `crossc-cli.exe`,
+//!   `crossc-tray.exe` and `driver\{crossc_bth.sys,.inf,.cat,WDRLocalTestCert.cer}` side by side. No cargo and
+//!   no repo.
 //! * **repo**: a checkout, with the package under `drivers\crossc-bth\target\<flavor>\crossc_bth_package` and the
 //!   executables under `target\release`.
 //! * **online**: the installer on its own, with neither next to it. Its bundle is the release it downloaded and
@@ -21,6 +22,8 @@ use crate::release::{Version, bundle_version};
 pub const BUNDLE_DRIVER_DIR: &str = "driver";
 pub const SERVICE_EXE: &str = "crossc-service.exe";
 pub const CLI_EXE: &str = "crossc-cli.exe";
+/// The tray app. An extra like the CLI: a bundle without it (a release from before there was one) installs.
+pub const TRAY_EXE: &str = "crossc-tray.exe";
 pub const INSTALLER_EXE: &str = "crossc-installer.exe";
 /// Folder below the install folder that downloaded releases are unpacked to, one folder per tag.
 pub const RELEASES_DIR: &str = "releases";
@@ -116,13 +119,26 @@ impl Layout {
         self.exe_dir().join(CLI_EXE)
     }
 
+    pub fn tray_exe(&self) -> PathBuf {
+        self.exe_dir().join(TRAY_EXE)
+    }
+
     /// Repo only: the workspace has the service crate, so Build can build it.
     pub fn has_service_crate(&self) -> bool {
+        self.has_crate("crossc-service")
+    }
+
+    /// Repo only: the workspace has the tray crate, so Build can build it.
+    pub fn has_tray_crate(&self) -> bool {
+        self.has_crate("crossc-tray")
+    }
+
+    fn has_crate(&self, name: &str) -> bool {
         self.mode == Mode::Repo
             && self
                 .root
                 .join("crates")
-                .join("crossc-service")
+                .join(name)
                 .join("Cargo.toml")
                 .is_file()
     }
@@ -158,7 +174,7 @@ fn is_bundle_dir(d: &Path) -> bool {
     d.join(BUNDLE_DRIVER_DIR).join(INF_NAME).is_file()
 }
 
-/// Where the service and the CLI are installed: `<Program Files>\crossc`.
+/// Where the service, the CLI and the tray app are installed: `<Program Files>\crossc`.
 ///
 /// `program_files` is the Program Files folder **as the system reports it** (`system::program_files`, the known
 /// folder), never the `ProgramFiles` environment variable: a release is downloaded, verified, unpacked and
@@ -287,6 +303,12 @@ pub mod tests {
                 .ends_with(r"target\release\crossc-service.exe")
         );
         assert!(layout.cli_exe().ends_with(r"target\release\crossc-cli.exe"));
+        assert!(
+            layout
+                .tray_exe()
+                .ends_with(r"target\release\crossc-tray.exe")
+        );
+        assert!(layout.has_tray_crate());
     }
 
     #[test]
@@ -305,7 +327,9 @@ pub mod tests {
         assert_eq!(layout.package_dir(Flavor::Debug), t.0.join("driver"));
         assert_eq!(layout.service_exe(), t.0.join("crossc-service.exe"));
         assert_eq!(layout.cli_exe(), t.0.join("crossc-cli.exe"));
+        assert_eq!(layout.tray_exe(), t.0.join("crossc-tray.exe"));
         assert!(!layout.has_service_crate());
+        assert!(!layout.has_tray_crate());
     }
 
     #[test]
