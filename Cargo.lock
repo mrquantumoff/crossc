@@ -1210,7 +1210,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crossc-cli"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "avdtp",
  "crossc-core",
@@ -1221,7 +1221,7 @@ dependencies = [
 
 [[package]]
 name = "crossc-core"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "avdtp",
  "crossc-ioctl",
@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "crossc-installer"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "flate2",
  "gpui",
@@ -1242,11 +1242,11 @@ dependencies = [
 
 [[package]]
 name = "crossc-ioctl"
-version = "0.2.0"
+version = "1.0.0"
 
 [[package]]
 name = "crossc-service"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "avdtp",
  "crossc-core",
@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "crossc-status"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "crossc-tray"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "async-channel 2.5.0",
  "crossc-status",

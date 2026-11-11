@@ -1,6 +1,6 @@
 [package]
 name = "crossc-tray"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
 description = "Notification-area icon and flyout that show what crossc-service is streaming to the Galaxy Buds"
 publish = false
