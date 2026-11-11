@@ -941,13 +941,18 @@ mod tests {
             assert!(DebugPrivilege::enable().is_none());
             return;
         }
+        // Usually off until asked for; some elevated tokens (CI runners) have it on already, and then
+        // nothing is to be given back.
         let first = DebugPrivilege::enable().expect("elevated: the token holds it");
-        assert!(first.restore, "it is off until asked for");
+        let was_off = first.restore;
         let second = DebugPrivilege::enable().expect("still there");
         assert!(!second.restore, "the inner one leaves it to the outer one");
         drop(second);
         drop(first);
-        assert!(DebugPrivilege::enable().is_some_and(|p| p.restore));
+        assert!(
+            DebugPrivilege::enable().is_some_and(|p| p.restore == was_off),
+            "given back to the state it was found in"
+        );
     }
 
     /// The registry code on a throwaway key of the current user, never the real Run key.
