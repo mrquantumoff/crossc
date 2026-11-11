@@ -301,6 +301,8 @@ pub struct TrayInfo {
     /// It starts when the signed-in user signs in (the `crossc-tray` value under that user's Run key names it).
     /// `None`: who is signed in at this desktop cannot be told.
     pub autostart: Option<bool>,
+    /// The all-users Start menu has the "crossc tray" shortcut, and it starts this exe (`shortcut::starts`).
+    pub shortcut: bool,
 }
 
 /// What Install wrote down in `HKLM\SOFTWARE\crossc` (`system::read_record`). Every value may be missing.
@@ -903,17 +905,29 @@ fn tray_item(s: &Status) -> CheckItem {
         Some(false) => "does not start with Windows (its menu has \"Start with Windows\")",
         None => "whether it starts with Windows is not known",
     };
+    // The Start menu entry is said with an installed tray only, and never changes the row's level.
+    let shortcut = if s.tray.shortcut {
+        "in the Start menu as \"crossc tray\""
+    } else {
+        "no Start menu shortcut (Install adds it)"
+    };
     if s.tray.running {
-        return item(LABEL, Level::Good, format!("running; {autostart}"));
-    }
-    if s.tray.installed {
         return item(
             LABEL,
-            Level::Warn,
-            format!(
-                "installed, not running: open crossc-tray.exe in %ProgramFiles%\\crossc; {autostart}"
-            ),
+            Level::Good,
+            format!("running; {autostart}; {shortcut}"),
         );
+    }
+    if s.tray.installed {
+        let detail = if s.tray.shortcut {
+            format!("installed, not running: open \"crossc tray\" from the Start menu; {autostart}")
+        } else {
+            format!(
+                "installed, not running: open crossc-tray.exe in %ProgramFiles%\\crossc; {autostart}; \
+                 {shortcut}"
+            )
+        };
+        return item(LABEL, Level::Warn, detail);
     }
     match (&s.tray_exe, s.is_bundle()) {
         (Some(_), _) if s.service_exe.is_some() => item(
@@ -1866,11 +1880,27 @@ pub mod tests {
             installed: true,
             running: true,
             autostart: Some(true),
+            shortcut: true,
         };
         assert_eq!(
             level_and_text(&s),
-            (Level::Good, "running; starts with Windows".to_string())
+            (
+                Level::Good,
+                "running; starts with Windows; in the Start menu as \"crossc tray\"".to_string()
+            )
         );
+        // The Start menu entry is gone (deleted by hand, or an install from before there was one): said, and
+        // still fine.
+        s.tray.shortcut = false;
+        assert_eq!(
+            level_and_text(&s),
+            (
+                Level::Good,
+                "running; starts with Windows; no Start menu shortcut (Install adds it)"
+                    .to_string()
+            )
+        );
+        s.tray.shortcut = true;
         // The user switched autostart off in the tray's menu, or there is no shell to ask: still fine.
         s.tray.autostart = Some(false);
         let (level, text) = level_and_text(&s);
@@ -1889,7 +1919,17 @@ pub mod tests {
             level_and_text(&s),
             (
                 Level::Warn,
-                r"installed, not running: open crossc-tray.exe in %ProgramFiles%\crossc; starts with Windows"
+                r#"installed, not running: open "crossc tray" from the Start menu; starts with Windows"#
+                    .to_string()
+            )
+        );
+        // Without the Start menu entry: the exe in the install folder.
+        s.tray.shortcut = false;
+        assert_eq!(
+            level_and_text(&s),
+            (
+                Level::Warn,
+                r"installed, not running: open crossc-tray.exe in %ProgramFiles%\crossc; starts with Windows; no Start menu shortcut (Install adds it)"
                     .to_string()
             )
         );
@@ -1933,14 +1973,21 @@ pub mod tests {
         for (installed, running) in [(false, false), (true, false), (true, true)] {
             for autostart in [None, Some(false), Some(true)] {
                 for tray_exe in [None, ready_bundle().tray_exe] {
-                    s.tray = TrayInfo {
-                        installed,
-                        running,
-                        autostart,
-                    };
-                    s.tray_exe = tray_exe;
-                    assert_ne!(tray(&s).level, Level::Bad);
-                    assert_eq!(next_step(&s), steps_without_tray);
+                    let mut levels = Vec::new();
+                    for shortcut in [false, true] {
+                        s.tray = TrayInfo {
+                            installed,
+                            running,
+                            autostart,
+                            shortcut,
+                        };
+                        s.tray_exe = tray_exe.clone();
+                        assert_ne!(tray(&s).level, Level::Bad);
+                        assert_eq!(next_step(&s), steps_without_tray);
+                        levels.push(tray(&s).level);
+                    }
+                    // The shortcut never changes the row's level.
+                    assert_eq!(levels[0], levels[1]);
                 }
             }
         }

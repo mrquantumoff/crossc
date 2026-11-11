@@ -34,6 +34,7 @@ use crate::parse::{
 };
 use crate::release::{LatestRelease, REPO_ENV, auth_text, releases_to_prune};
 use crate::service;
+use crate::shortcut;
 use crate::system::{
     self, CREATE_NO_WINDOW, RECORD_CERT, RECORD_DRIVER_VER, RECORD_PENDING, RECORD_VERSION,
 };
@@ -1155,7 +1156,67 @@ impl Ctx<'_> {
         if let Some(tray) = tray {
             self.finish_tray(&dest_dir, tray);
         }
+        // Also when nothing was copied (the files were in place already): every Install leaves the entry
+        // there and pointing at the installed tray.
+        self.add_tray_shortcut(&dest_dir.join(TRAY_EXE), system::tray_shortcut().as_deref());
         result
+    }
+
+    /// Writes the Start menu entry "crossc tray" for all users (`shortcut`), over one that is there: an update
+    /// refreshes it. Only for a tray that is installed; `lnk`: where it goes (`system::tray_shortcut`), `None`
+    /// when the system does not report the Start menu folder. An extra like the tray: what fails is a warning.
+    /// With no tray installed, an entry an earlier Install left would start nothing: it is deleted.
+    fn add_tray_shortcut(&self, exe: &Path, lnk: Option<&Path>) {
+        if !exe.is_file() {
+            if let Some(lnk) = lnk
+                && lnk.is_file()
+            {
+                self.info(format!(
+                    "{} is not installed: its Start menu entry goes",
+                    exe.display()
+                ));
+                self.remove_tray_shortcut(Some(lnk));
+            }
+            return;
+        }
+        let Some(lnk) = lnk else {
+            self.warn(format!(
+                "the system does not report the Start menu folder, so crossc-tray gets no Start menu entry. Open \
+                 it from {}",
+                exe.display()
+            ));
+            return;
+        };
+        match shortcut::create(lnk, &shortcut::Link::tray(exe)) {
+            Ok(()) => self.success(format!("Start menu entry: {}", lnk.display())),
+            Err(e) => self.warn(format!(
+                "{e}: crossc-tray gets no Start menu entry. Open it from {}",
+                exe.display()
+            )),
+        }
+    }
+
+    /// Uninstall: deletes the Start menu entry and crossc's Start menu folder when nothing else is in it.
+    fn remove_tray_shortcut(&self, lnk: Option<&Path>) {
+        let Some(lnk) = lnk else {
+            self.warn(
+                "the system does not report the Start menu folder: a \"crossc tray\" entry there is not deleted",
+            );
+            return;
+        };
+        match shortcut::remove(lnk) {
+            Ok(removed) => {
+                if removed.shortcut {
+                    self.success(format!("deleted {}", lnk.display()));
+                }
+                if removed.dir
+                    && let Some(dir) = lnk.parent()
+                {
+                    self.success(format!("deleted {}", dir.display()));
+                }
+            }
+            Err(e) => self.warn(e),
+        }
     }
 
     /// `crossc-service.exe install` in the install folder, then the start.
@@ -1376,6 +1437,7 @@ impl Ctx<'_> {
     fn remove_tray(&self) {
         let exe = system::install_dir().join(TRAY_EXE);
         self.remove_tray_at(&exe);
+        self.remove_tray_shortcut(system::tray_shortcut().as_deref());
     }
 
     fn remove_tray_at(&self, exe: &Path) {
@@ -2053,7 +2115,7 @@ fn registered_with(registered: Option<&str>, exe: &Path) -> bool {
 }
 
 /// Both paths name the same existing file (so a copy from one to the other would be pointless or destructive).
-fn same_file(a: &Path, b: &Path) -> bool {
+pub fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => path_key(&a) == path_key(&b),
         _ => false,
@@ -2682,6 +2744,66 @@ mod tests {
         // Nothing there: nothing to say.
         let ((), lines) = with_ctx(&layout, |cx| cx.remove_tray_at(&exe));
         assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    /// Install's and Uninstall's handling of the Start menu entry, on a folder under the temp directory (never
+    /// the real Start menu).
+    #[test]
+    fn install_adds_the_start_menu_entry_and_uninstall_takes_it_away() {
+        let t = TempDir::new("tray-shortcut");
+        let layout = Layout {
+            mode: Mode::Bundle,
+            root: t.0.clone(),
+        };
+        let exe = t.0.join(r"installed\crossc-tray.exe");
+        let dir = shortcut::start_menu_dir(Some(&t.0.join("Programs"))).unwrap();
+        let lnk = shortcut::tray_shortcut(&dir);
+
+        // No tray installed (a release without one): no entry, nothing said.
+        let ((), lines) = with_ctx(&layout, |cx| cx.add_tray_shortcut(&exe, Some(&lnk)));
+        assert!(lines.is_empty(), "{lines:?}");
+        assert!(!dir.exists());
+
+        // Installed: the entry is written, and written again by the next Install.
+        t.file(r"installed\crossc-tray.exe", "tray");
+        for _ in 0..2 {
+            let ((), lines) = with_ctx(&layout, |cx| cx.add_tray_shortcut(&exe, Some(&lnk)));
+            assert_eq!(kinds(&lines), [LineKind::Success], "{lines:?}");
+            assert!(shortcut::starts(&lnk, &exe));
+        }
+        // The status sees it, for this exe only.
+        assert!(tray::query(&exe, Some(&lnk)).shortcut);
+        assert!(!tray::query(&t.0.join("other.exe"), Some(&lnk)).shortcut);
+        assert!(!tray::query(&exe, None).shortcut);
+
+        // No Start menu folder reported: a warning, Install goes on.
+        let ((), lines) = with_ctx(&layout, |cx| cx.add_tray_shortcut(&exe, None));
+        assert_eq!(kinds(&lines), [LineKind::Warning], "{lines:?}");
+
+        // Uninstall: the entry and the folder that is empty then.
+        let ((), lines) = with_ctx(&layout, |cx| cx.remove_tray_shortcut(Some(&lnk)));
+        assert_eq!(
+            kinds(&lines),
+            [LineKind::Success, LineKind::Success],
+            "{lines:?}"
+        );
+        assert!(!lnk.exists() && !dir.exists());
+        // Again: nothing there, nothing to say.
+        let ((), lines) = with_ctx(&layout, |cx| cx.remove_tray_shortcut(Some(&lnk)));
+        assert!(lines.is_empty(), "{lines:?}");
+
+        // An Install that leaves no tray (an update without one) deletes the entry an earlier Install wrote: it
+        // would start nothing.
+        let ((), _) = with_ctx(&layout, |cx| cx.add_tray_shortcut(&exe, Some(&lnk)));
+        assert!(shortcut::starts(&lnk, &exe));
+        std::fs::remove_file(&exe).unwrap();
+        let ((), lines) = with_ctx(&layout, |cx| cx.add_tray_shortcut(&exe, Some(&lnk)));
+        assert_eq!(
+            kinds(&lines),
+            [LineKind::Info, LineKind::Success, LineKind::Success],
+            "{lines:?}"
+        );
+        assert!(!lnk.exists() && !dir.exists());
     }
 
     #[test]

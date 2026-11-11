@@ -805,13 +805,15 @@ pub fn remove_autostart(exe: &Path) -> (usize, Vec<String>) {
     (removed, failed)
 }
 
-/// The state of the tray installed at `exe`, for the status. Works unelevated (it then sees the trays of the
-/// same user only, which is the one that matters).
-pub fn query(exe: &Path) -> TrayInfo {
+/// The state of the tray installed at `exe`, for the status; `shortcut` is its Start menu entry
+/// (`system::tray_shortcut`). Works unelevated (it then sees the trays of the same user only, which is the one
+/// that matters); the shortcut is only read.
+pub fn query(exe: &Path, shortcut: Option<&Path>) -> TrayInfo {
     TrayInfo {
         installed: exe.is_file(),
         running: running_count(exe) > 0,
         autostart: desktop_user().map(|user| autostart_enabled(&user, exe)),
+        shortcut: shortcut.is_some_and(|lnk| crate::shortcut::starts(lnk, exe)),
     }
 }
 
@@ -1026,7 +1028,7 @@ mod tests {
         let elsewhere = t.0.join(me.file_name().unwrap());
         assert_eq!(running_count(&elsewhere), 0);
         assert_eq!(stop(&elsewhere), Stopped::default());
-        let info = query(&elsewhere);
+        let info = query(&elsewhere, None);
         assert!(!info.installed && !info.running);
     }
 
@@ -1086,7 +1088,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(running_count(&exe), 1);
-        assert!(query(&exe).running);
+        assert!(query(&exe, None).running);
 
         let started = Instant::now();
         let stopped = stop(&exe);

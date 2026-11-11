@@ -597,10 +597,10 @@ enough; use the script.
    progress bar advances at normal speed, and DebugView shows
 
    ```
-   crossc: acx: stream created: 48000 Hz, 2 ch, 32-bit container, block 8 bytes
+   crossc: acx: stream created: RAW mode, 48000 Hz, 2 ch, 24 valid bits in 32-bit containers, block 8 bytes, tap yes, 1 of 4 streams
    crossc: acx: 2 RT packet(s) of ... bytes (... bytes allocated each)
-   crossc: acx: stream prepared
-   crossc: acx: stream running
+   crossc: acx: stream prepared (tap ring 96000 bytes)
+   crossc: acx: stream running (48000 Hz, feeds the tap: true)
    ```
 
    and, when playback stops (the audio engine closes the stream a few seconds
@@ -1037,9 +1037,9 @@ earlier ones. Keep the service **stopped** until step 3
    music. Expected: sound in the buds. DebugView:
 
    ```
-   crossc: acx: stream created: 48000 Hz, 2 ch, 24 valid bits in 32-bit containers, block 8 bytes, tap true
+   crossc: acx: stream created: RAW mode, 48000 Hz, 2 ch, 24 valid bits in 32-bit containers, block 8 bytes, tap yes, 1 of 4 streams
    crossc: acx: stream prepared (tap ring 96000 bytes)
-   crossc: acx: stream running
+   crossc: acx: stream running (48000 Hz, feeds the tap: true)
    ```
 
    Play for a minute, pause the player and wait until the stream pauses
@@ -1800,6 +1800,10 @@ of what that program says.
 > "Service not running". The service's side has been tested against a fake
 > driver and a pipe of the test's own; the installed service with real buds
 > has not been looked at through the tray yet: 16f is that first check.
+
+The installer's Install also adds a Start menu entry for all users,
+"crossc tray" in a `crossc` folder, to open the installed tray; Uninstall
+removes it.
 
 ### 16a. Run it
 

@@ -34,7 +34,8 @@ use windows::Win32::System::Registry::{
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Shell::{
-    FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+    FOLDERID_CommonPrograms, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, KF_FLAG_DEFAULT,
+    SHGetKnownFolderPath,
 };
 use windows::core::{GUID, HSTRING, PCWSTR};
 
@@ -49,6 +50,7 @@ use crate::parse::{
     format_age, hex_upper, inf_driver_ver, inf_hardware_ids, parse_enum_drivers,
 };
 use crate::service;
+use crate::shortcut;
 use crate::tray;
 
 /// Keeps child consoles from flashing up when the app runs without one (release build).
@@ -119,7 +121,7 @@ pub fn query_status(layout: &Layout, flavor: Flavor) -> Status {
         service: service::query(USER_SERVICE),
         service_exe: Some(layout.service_exe())
             .filter(|p| p.is_file() && damaged_exe(p).is_none()),
-        tray: tray::query(&install_dir().join(TRAY_EXE)),
+        tray: tray::query(&install_dir().join(TRAY_EXE), tray_shortcut().as_deref()),
         tray_exe: Some(layout.tray_exe()).filter(|p| p.is_file()),
         online: layout.mode == Mode::Online,
         record: read_record(),
@@ -396,6 +398,18 @@ pub fn program_files() -> Option<PathBuf> {
 /// `layout::install_dir` is used.
 pub fn install_dir() -> PathBuf {
     layout::install_dir(program_files().as_deref().map(Path::as_os_str))
+}
+
+/// The all-users Start menu's Programs folder (`%ProgramData%\Microsoft\Windows\Start Menu\Programs`), as the
+/// system reports it.
+pub fn common_programs() -> Option<PathBuf> {
+    known_folder(&FOLDERID_CommonPrograms)
+}
+
+/// The tray app's Start menu shortcut (`shortcut::tray_shortcut` in `shortcut::start_menu_dir`); `None` when
+/// the system does not report the Start menu folder.
+pub fn tray_shortcut() -> Option<PathBuf> {
+    shortcut::start_menu_dir(common_programs().as_deref()).map(|dir| shortcut::tray_shortcut(&dir))
 }
 
 /// `<Program Files>\crossc\releases` (`layout::releases_dir`), on the same terms as [`install_dir`].

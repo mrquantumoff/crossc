@@ -27,6 +27,7 @@ mod model;
 mod parse;
 mod release;
 mod service;
+mod shortcut;
 mod system;
 mod tray;
 mod ui;
@@ -311,6 +312,15 @@ fn status_report(layout: &Layout, s: &Status) -> String {
     );
     let _ = writeln!(
         out,
+        "tray shortcut     : {}",
+        if s.tray.shortcut {
+            "Start menu, crossc\\crossc tray"
+        } else {
+            "none"
+        }
+    );
+    let _ = writeln!(
+        out,
         "tray exe          : {}",
         s.tray_exe
             .as_ref()
@@ -399,6 +409,7 @@ mod tests {
             "staged",
             "service           : not installed  [-]",
             "tray              : not installed, not running, autostart unknown",
+            "tray shortcut     : none",
             r"tray exe          : C:\x\target\release\crossc-tray.exe",
             "] Tray app             not installed (Install adds and starts it)",
             "latest release    : unknown: \"Check for update\" asks GitHub for the newest release",
@@ -431,10 +442,28 @@ mod tests {
             "actions           : Install, Uninstall, Remove certificate",
             "install warning   : shown",
             r"service exe       : C:\crossc-0.1\crossc-service.exe",
+            "tray shortcut     : none",
         ] {
             assert!(text.contains(needle), "{needle} missing in\n{text}");
         }
         assert!(!text.contains("Build"), "{text}");
+
+        // An installed tray with its Start menu entry, in both places the status shows it.
+        let mut with_tray = status.clone();
+        with_tray.tray = crate::model::TrayInfo {
+            installed: true,
+            running: true,
+            autostart: Some(true),
+            shortcut: true,
+        };
+        let text = super::status_report(&layout, &with_tray);
+        for needle in [
+            "tray              : installed, running, autostart on",
+            r"tray shortcut     : Start menu, crossc\crossc tray",
+            "in the Start menu as \"crossc tray\"",
+        ] {
+            assert!(text.contains(needle), "{needle} missing in\n{text}");
+        }
         assert!(!text.contains("unlisted node"), "{text}");
 
         // Buds on crossc_bth that this bundle does not list are named, and so is a service exe that is unusable.
