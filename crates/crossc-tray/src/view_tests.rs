@@ -109,7 +109,10 @@ fn tooltips() {
         tooltip(&live("adaptive")),
         "Buds4 Pro — UHQ 96 kHz/24 · 291 kbps · MTU 1005"
     );
-    assert_eq!(tooltip(&live("waiting")), "Buds4 Pro — buds not connected");
+    // Buds that are not connected are not listed.
+    assert_eq!(tooltip(&live("waiting")), "crossc — buds not connected");
+    assert!(cards(&live("waiting")).is_empty());
+    assert_eq!(glyph(&live("waiting")), Glyph::Waiting);
     assert_eq!(tooltip(&live("reconnect")), "Buds4 Pro — reconnecting");
     assert_eq!(
         tooltip(&live("two")),
@@ -777,4 +780,18 @@ fn a_detail_gets_the_lines_its_words_need() {
             }
         }
     }
+}
+
+#[test]
+fn unconnected_buds_are_hidden_next_to_connected_ones() {
+    let Feed::Live(mut s) = live("two") else {
+        panic!()
+    };
+    s.devices[1].phase = LinkPhase::WaitingBuds;
+    let feed = Feed::Live(s.clone());
+    assert_eq!(cards(&feed).len(), 1);
+    assert!(!tooltip(&feed).contains("Buds3 Pro"));
+    assert!(headline(&feed).is_none());
+    // "Copy details" still lists both.
+    assert!(report(&feed).contains("Buds3 Pro"));
 }

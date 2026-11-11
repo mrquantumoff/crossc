@@ -106,6 +106,15 @@ fn rank(g: Glyph) -> (u8, u8) {
     }
 }
 
+/// The devices the icon, tooltip and cards show: buds that are not connected
+/// to this PC (or whose session has stopped) are left out. "Copy details"
+/// still lists every device.
+pub fn shown(s: &Snapshot) -> impl Iterator<Item = &DeviceStatus> {
+    s.devices
+        .iter()
+        .filter(|d| !matches!(d.phase, LinkPhase::WaitingBuds | LinkPhase::Stopped))
+}
+
 /// The icon for a state.
 pub fn glyph(feed: &Feed) -> Glyph {
     match feed {
@@ -114,9 +123,7 @@ pub fn glyph(feed: &Feed) -> Glyph {
         Feed::Down(
             Outage::Denied | Outage::Version { .. } | Outage::Unreadable | Outage::Untrusted,
         ) => Glyph::Problem,
-        Feed::Live(s) => s
-            .devices
-            .iter()
+        Feed::Live(s) => shown(s)
             .map(device_glyph)
             .max_by_key(|g| rank(*g))
             .unwrap_or(Glyph::Waiting),
@@ -325,6 +332,11 @@ pub fn headline(feed: &Feed) -> Option<(Tone, &'static str, String)> {
              Install the driver on your paired Galaxy Buds with the crossc installer."
                 .to_string(),
         ),
+        Feed::Live(s) if shown(s).next().is_none() => (
+            Tone::Muted,
+            "Buds not connected",
+            "Connect your Galaxy Buds to this PC to stream with crossc.".to_string(),
+        ),
         Feed::Live(_) => return None,
     };
     Some((tone, title, text))
@@ -355,12 +367,7 @@ pub fn fit_utf16(s: &str, max: usize) -> String {
 /// The icon's tooltip: one line per device, or what is wrong.
 pub fn tooltip(feed: &Feed) -> String {
     let text = match (feed, headline(feed)) {
-        (Feed::Live(s), None) => s
-            .devices
-            .iter()
-            .map(device_line)
-            .collect::<Vec<_>>()
-            .join("\n"),
+        (Feed::Live(s), None) => shown(s).map(device_line).collect::<Vec<_>>().join("\n"),
         (_, Some((_, title, _))) => format!("crossc — {}", lower_first(title)),
         (_, None) => "crossc".to_string(),
     };
@@ -734,7 +741,7 @@ fn upper_first(s: &str) -> String {
 /// The cards of a state (none unless it is live with devices).
 pub fn cards(feed: &Feed) -> Vec<Card> {
     match feed {
-        Feed::Live(s) => s.devices.iter().map(|d| card(d, s.time_unix)).collect(),
+        Feed::Live(s) => shown(s).map(|d| card(d, s.time_unix)).collect(),
         _ => Vec::new(),
     }
 }
