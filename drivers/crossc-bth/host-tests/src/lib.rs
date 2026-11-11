@@ -45,3 +45,5 @@ mod cb_tests;
 mod rt_tests;
 #[cfg(test)]
 mod volume_tests;
+#[cfg(test)]
+mod format_tests;

@@ -35,8 +35,8 @@
 //!   chunk never mixes formats.
 
 use crossc_ioctl::audio::{
-    AUDIO_FLAG_ACX, AUDIO_FLAG_ATTACHED, AUDIO_FLAG_LINK, AUDIO_FLAGS_VOLUME, AudioState, PCM_FLAG_DISCONTINUITY,
-    PcmFormat, PcmHeader, StreamState, VolumeState,
+    AUDIO_FLAG_ACX, AUDIO_FLAG_ATTACHED, AUDIO_FLAG_LINK, AUDIO_FLAGS_VOLUME, AudioState, OFFERED_FORMATS,
+    PCM_FLAG_DISCONTINUITY, PcmFormat, PcmHeader, StreamState, VolumeState, offered_for,
 };
 
 use crate::pcm_ring::Ring;
@@ -58,7 +58,7 @@ pub fn ring_bytes(format: &PcmFormat) -> usize {
 }
 
 /// Write a GET_STATE / WAIT_EVENT reply into `out`: as much of the
-/// protocol 3 reply as fits, and at least the protocol 2 part (a v2 caller
+/// protocol 4 reply as fits, and at least the protocol 2 part (a v2 caller
 /// passes a 40-byte buffer and gets exactly what protocol 2 sent). Returns
 /// the reply length; `None` if `out` is shorter than the v2 reply.
 pub fn write_state(out: &mut [u8], state: &AudioState) -> Option<usize> {
@@ -69,6 +69,25 @@ pub fn write_state(out: &mut [u8], state: &AudioState) -> Option<usize> {
     let n = out.len().min(e.len());
     out.get_mut(..n)?.copy_from_slice(e.get(..n)?);
     Some(n)
+}
+
+/// Index in `OFFERED_FORMATS` (crossc_ioctl::audio) of the default format
+/// stored in the device's hardware key: `DefaultSampleRate` and
+/// `DefaultBits` as read (`None`: value missing or unreadable). A rate the
+/// endpoint does not offer, or no rate at all, gives index 0 (48 kHz/24),
+/// what the driver offered before the choice existed.
+pub fn stored_default(rate: Option<u32>, bits: Option<u32>) -> usize {
+    match rate {
+        Some(r) => offered_for(r, bits.unwrap_or(0)).unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// The `DefaultSampleRate` / `DefaultBits` values that store
+/// `OFFERED_FORMATS[index]` (read back by [`stored_default`]). `None` for an
+/// index out of range.
+pub fn stored_values(index: usize) -> Option<(u32, u32)> {
+    OFFERED_FORMATS.get(index).map(|f| (f.sample_rate, u32::from(f.valid_bits)))
 }
 
 /// The sequence number after `seq`: the next one, skipping 0 ("none" in
@@ -194,6 +213,9 @@ pub struct Session {
     /// `AUDIO_FLAG_*` bits and fields.
     volume_flags: u32,
     volume: VolumeState,
+    /// Protocol 4: the host pin's default format (`acx.rs`), all zero while
+    /// unknown (no ACX on the device).
+    default_format: PcmFormat,
 }
 
 impl Default for Session {
@@ -226,6 +248,7 @@ impl Session {
             read_ticket: 0,
             volume_flags: 0,
             volume: VolumeState { level: 0, left: 0, right: 0, avrcp: 0, gets: 0, sets: 0, events: 0 },
+            default_format: PcmFormat { sample_rate: 0, channels: 0, container_bits: 0, valid_bits: 0 },
         }
     }
 
@@ -262,7 +285,19 @@ impl Session {
             frames_rendered: self.rendered,
             frames_dropped: self.dropped,
             volume: self.volume,
+            default_format: self.default_format,
         }
+    }
+
+    /// The host pin's default format is now `format`. Returns true (and
+    /// bumps the sequence number) if that changed it.
+    pub fn set_default_format(&mut self, format: PcmFormat) -> bool {
+        if self.default_format == format {
+            return false;
+        }
+        self.default_format = format;
+        self.bump();
+        true
     }
 
     /// New volume report. Returns true (and bumps the sequence number) if

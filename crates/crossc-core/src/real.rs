@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crossc_ioctl as ioc;
-use crossc_ioctl::audio::AudioState;
+use crossc_ioctl::audio::{AudioState, PcmFormat};
 use windows::Win32::Devices::Bluetooth::{
     BLUETOOTH_DEVICE_INFO, BLUETOOTH_FIND_RADIO_PARAMS, BluetoothFindFirstRadio,
     BluetoothFindNextRadio, BluetoothFindRadioClose, BluetoothGetDeviceInfo,
@@ -20,6 +20,7 @@ use windows::Win32::System::Threading::WaitForMultipleObjects;
 use crate::channel::ChanError;
 use crate::device::{Device, Pending, decode_pcm, decode_state};
 use crate::driver::{Driver, Interest, LinkProbe, Wake};
+use crate::format_watch::WakeEvent;
 use crate::stop::StopSignal;
 
 struct Inner {
@@ -31,6 +32,8 @@ struct Inner {
     pcm: Option<Pending>,
     /// The pending READ and the channel it is for.
     sig: Option<(u32, Pending)>,
+    /// Also ends a wait (as a timeout), reset by the wait that saw it.
+    wake: Option<WakeEvent>,
 }
 
 /// See the module docs.
@@ -49,6 +52,7 @@ enum Source {
     Signaling,
     State,
     Pcm,
+    Wake,
 }
 
 impl RealDriver {
@@ -63,7 +67,15 @@ impl RealDriver {
             state: None,
             pcm: None,
             sig: None,
+            wake: None,
         })))
+    }
+
+    /// Let `wake` end every [`Driver::wait`] early (reported as
+    /// [`Wake::Timeout`]): the Windows format watcher's event, so the
+    /// session looks at a new format at once. The wait resets the event.
+    pub fn set_wake(&self, wake: WakeEvent) {
+        self.0.borrow_mut().wake = Some(wake);
     }
 
     pub fn path(&self) -> String {
@@ -147,6 +159,10 @@ impl Driver for RealDriver {
         self.dev()?.set_link(connected)
     }
 
+    fn set_default_format(&self, format: PcmFormat) -> Result<(), ChanError> {
+        self.dev()?.set_default_format(format)
+    }
+
     fn open_channel(
         &self,
         req: ioc::OpenChannelRequest,
@@ -228,8 +244,8 @@ impl Driver for RealDriver {
         {
             return Wake::Signaling(Err(e));
         }
-        let mut handles: Vec<HANDLE> = Vec::with_capacity(5);
-        let mut sources: Vec<Source> = Vec::with_capacity(5);
+        let mut handles: Vec<HANDLE> = Vec::with_capacity(6);
+        let mut sources: Vec<Source> = Vec::with_capacity(6);
         if let Some(h) = i.stop.event() {
             handles.push(h);
             sources.push(Source::Stop);
@@ -251,6 +267,10 @@ impl Driver for RealDriver {
         if let (true, Some(p)) = (interest.pcm, &i.pcm) {
             handles.push(p.event());
             sources.push(Source::Pcm);
+        }
+        if let Some(w) = &i.wake {
+            handles.push(w.handle());
+            sources.push(Source::Wake);
         }
         if handles.is_empty() {
             let stop = i.stop.clone();
@@ -298,6 +318,12 @@ impl Driver for RealDriver {
                 Err(e) => Wake::StateError(e),
             },
             Source::Pcm => Wake::Pcm(finish(i.pcm.take()).and_then(|b| decode_pcm(&b))),
+            Source::Wake => {
+                if let Some(w) = &i.wake {
+                    w.reset();
+                }
+                Wake::Timeout
+            }
         }
     }
 }
@@ -397,6 +423,10 @@ mod tests {
         assert!(d.audio_state().is_err());
         assert!(d.attach().is_err());
         assert!(d.set_link(true).is_err());
+        assert!(
+            d.set_default_format(crossc_ioctl::audio::OFFERED_FORMATS[1])
+                .is_err()
+        );
         assert!(d.write(1, &[0]).is_err());
         assert!(d.read(1, Duration::from_millis(1)).is_err());
         assert!(d.close_channel(1).is_err());
@@ -564,6 +594,47 @@ mod tests {
         for p in paths {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    #[test]
+    fn the_wake_event_ends_a_wait_once_and_is_reset() {
+        let stop = StopSignal::new();
+        let Some((path, dev, attach)) = crate::device::oplock_file("wake-event") else {
+            return;
+        };
+        let d = RealDriver::new("unused", stop.clone());
+        {
+            let mut i = d.0.borrow_mut();
+            i.dev = Some(dev);
+            i.attach = Some(attach);
+        }
+        let watch = crate::format_watch::tests_wake_event();
+        d.set_wake(watch.clone());
+        // Not signalled: a real timeout.
+        let t0 = std::time::Instant::now();
+        assert!(matches!(
+            d.wait(&Interest::default(), Duration::from_millis(40)),
+            Wake::Timeout
+        ));
+        assert!(t0.elapsed() >= Duration::from_millis(25));
+        // Signalled: the wait ends at once, and the event is reset by it, so
+        // the next wait waits again instead of spinning.
+        unsafe { windows::Win32::System::Threading::SetEvent(watch.handle()) }.unwrap();
+        let t0 = std::time::Instant::now();
+        assert!(matches!(
+            d.wait(&Interest::default(), Duration::from_secs(20)),
+            Wake::Timeout
+        ));
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        let t0 = std::time::Instant::now();
+        assert!(matches!(
+            d.wait(&Interest::default(), Duration::from_millis(40)),
+            Wake::Timeout
+        ));
+        assert!(t0.elapsed() >= Duration::from_millis(25));
+        d.detach();
+        drop(d);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -44,8 +44,10 @@ touching the driver.
 
 ## Audio path contract (driver <-> service)
 
-All additive to the pipe IOCTLs; `PROTOCOL_VERSION` 3 (2 added the audio
-IOCTLs, 3 the volume state in `AUDIO_GET_STATE`, see "Volume" below).
+All additive to the pipe IOCTLs; `PROTOCOL_VERSION` 4 (2 added the audio
+IOCTLs, 3 the volume state in `AUDIO_GET_STATE`, see "Volume" below, 4
+`AUDIO_SET_DEFAULT_FORMAT` and the default format in `AUDIO_GET_STATE`, see
+"Format selection" below).
 
 | IOCTL | Direction | Behaviour |
 |---|---|---|
@@ -54,20 +56,22 @@ IOCTLs, 3 the volume state in `AUDIO_GET_STATE`, see "Volume" below).
 | `AUDIO_GET_STATE` | out | Snapshot: sequence number, stream state (none / paused / running), stream format (rate, channels, valid bits, container bits), link flag, counters (frames rendered, frames dropped). Protocol 3 appends the volume state (64 bytes in all); a 40-byte buffer still gets the v2 part, and a v3 reader takes a 40-byte reply from a v2 driver as "no hardware volume". |
 | `AUDIO_WAIT_EVENT` | pends | Hanging get: completes when the state sequence differs from the caller's. |
 | `AUDIO_READ_PCM` | pends | Completes with the next chunk of rendered PCM in the stream format: header (first frame index, frame count, flags: discontinuity) + interleaved samples. One reader. |
+| `AUDIO_SET_DEFAULT_FORMAT` | in | Protocol 4. Makes one of the offered formats the endpoint's default, the one Windows opens its next stream in; stored in the device's hardware key. Any admin handle, attached or not. `AUDIO_GET_STATE` reports the default behind the v3 bytes (72 bytes in all; a 64-byte reply, from a v3 driver, reads as "unknown"). |
 
 Rules the driver keeps regardless of the service:
 
 * The audio engine never blocks on the service. The endpoint's clock is a
   driver timer; with nobody attached, or a reader that falls behind, PCM is
   dropped (counted, flagged as a discontinuity) and the stream keeps its pace.
-* The endpoint's host pin offers its formats (48 kHz/24-in-32 as the
-  default, 96 kHz/24-in-32, 48 kHz/16) in the RAW signal processing mode
-  list only, as 1.0.0 did. The driver can also give it a DEFAULT list with
-  the same formats (`DEFAULT_MODE_LIST` in `acx.rs`), but that is off: it
-  rests on the untested idea that it would let Windows play at 96 kHz (both
-  lists default to 48 kHz, so it may well not), and with two modes the audio
-  engine can run two streams at once, which the driver does not mix: only
-  one would reach the buds.
+* The endpoint's host pin offers its formats (48 kHz/24-in-32,
+  96 kHz/24-in-32, 48 kHz/16; `OFFERED_FORMATS` in `crossc-ioctl`) in the
+  RAW signal processing mode list only, as 1.0.0 did. Which one is the
+  list's default is chosen per device ("Format selection" below); 48 kHz/24
+  until something else is chosen. The driver can also give the pin a
+  DEFAULT list with the same formats and default (`DEFAULT_MODE_LIST` in
+  `acx.rs`), but that is off: it does not change the rate by itself (the
+  default does), and with two modes the audio engine can run two streams at
+  once, which the driver does not mix: only one would reach the buds.
 * Several streams can exist at once (a format switch creates the new one
   before the old one is gone); the stream state and the tap describe one of
   them: a new stream takes the tap unless the current one is running, the
@@ -79,6 +83,61 @@ Rules the driver keeps regardless of the service:
 * Everything the service can send is validated in the driver; a wrong or
   malicious caller gets an error, never a fault.
 * Pipe and audio IOCTLs are for SYSTEM and Administrators only.
+
+## Format selection
+
+Windows does not open the endpoint's stream in the format picked in the
+sound settings. ACX answers `KSPROPERTY_PIN_PROPOSEDATAFORMAT2` with the
+default format of the host pin's mode list, and "if driver supports this
+property, OS will always use this format for the specific signal
+processing mode" (WDK, `ksproperty-pin-proposedataformat2`). With a fixed
+48 kHz default that meant: the user picks 96000 Hz, the endpoint's
+`PKEY_AudioEngine_DeviceFormat` says 96000, `GetMixFormat` and the stream
+the driver renders say 48000, and UHQ is never used. So the default follows
+the choice:
+
+* **Driver.** The default is a per-device index into the offered formats.
+  It is read from `DefaultSampleRate` / `DefaultBits` (REG_DWORD) in the
+  device's hardware key whenever the circuit is built (every
+  PrepareHardware); missing or unknown means 48 kHz/24.
+  `AUDIO_SET_DEFAULT_FORMAT` changes it at run time:
+  `AcxDataFormatListAssignDefaultDataFormat` on the live list(s),
+  `AcxPinNotifyDataFormatChange` on the host pin
+  (`KSEVENT_PINCAPS_FORMATCHANGE`), then the two values are written so the
+  choice survives a restart. The handles this needs are kept under a
+  passive wait lock from AcxDeviceAddCircuit to ReleaseHardware, and the
+  IOCTL reports and stores the new default under it too, so two requests at
+  once cannot leave the lists, the reported default and the stored values
+  apart. Nothing of it can stop the device from starting (without the lock
+  the IOCTL is refused and the stored value still applies).
+* **Service.** For each crossc device a helper thread finds the device's
+  render endpoint under
+  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render`
+  (the registry, not the MMDevice API: the service is LocalSystem in
+  session 0): the endpoint whose `{233164c8-1b2c-4c7d-bc68-b671687a2567},1`
+  (the KS filter path) has the crossc interface's device instance and the
+  reference string `headphones0`, with `DeviceState` active or unplugged.
+  The instance id alone (`{b3f8fa53-0004-438e-9003-51a46e139bfc},2`) is not
+  enough: the endpoint the inbox A2DP driver left on the same node has it
+  too. It reads `PKEY_AudioEngine_DeviceFormat`
+  (`{f19f064d-082c-4e27-bc73-6882a1bb8e4c},0`: `VT_BLOB` header, then the
+  `WAVEFORMATEX(TENSIBLE)` from byte 8) and waits for
+  `RegNotifyChangeKeyValue` on the Render key (no polling). A changed format
+  wakes the session, which maps it to an offered format (same rate; 24-bit
+  for 24 bits or more; a rate not offered is left alone) and sends
+  `AUDIO_SET_DEFAULT_FORMAT` when it differs from the default the driver
+  reports: once per change, not again after a failure until the choice or
+  the driver changes, and compared afresh after every attach. One info line
+  per change (`Windows device format for <id> is 96000 Hz/24: driver
+  default set`). A driver older than protocol 4 is still used; when the
+  choice is anything but 48 kHz/24 (what such a driver plays), the service
+  says once per attach that it cannot follow it.
+* **Streams already open.** A stream keeps its format; the new default is
+  what the engine's next stream gets. If the engine keeps rendering the old
+  format for 5 s after the default was set, the service warns that the
+  change applies when playback restarts (pause and resume). Whether the
+  engine reopens its stream by itself on the format-change event has not
+  been seen on a device; restarting the device to force it is not done.
 
 ## Service behaviour
 

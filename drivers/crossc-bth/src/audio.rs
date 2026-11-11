@@ -131,6 +131,7 @@ pub fn is_audio_ioctl(code: ULONG) -> bool {
             | wire::IOCTL_AUDIO_GET_STATE
             | wire::IOCTL_AUDIO_WAIT_EVENT
             | wire::IOCTL_AUDIO_READ_PCM
+            | wire::IOCTL_AUDIO_SET_DEFAULT_FORMAT
     )
 }
 
@@ -280,10 +281,12 @@ pub unsafe fn enabled(dev: *mut DeviceContext) -> bool {
 pub unsafe fn ioctl(dev: *mut DeviceContext, req: WDFREQUEST, rc: *mut RequestContext, input: RawInput, code: ULONG) {
     unsafe {
         // No endpoint (ACX off by either kill switch, or no circuit): only
-        // GET_STATE works. Checked before the buffers, so the answer does
-        // not depend on what the caller passed. (The session checks it again
-        // under the lock together with everything else.)
-        if code != wire::IOCTL_AUDIO_GET_STATE {
+        // GET_STATE works, and SET_DEFAULT_FORMAT, which acx.rs keeps for
+        // the next circuit (it refuses it itself with ACX off). Checked
+        // before the buffers, so the answer does not depend on what the
+        // caller passed. (The session checks it again under the lock
+        // together with everything else.)
+        if code != wire::IOCTL_AUDIO_GET_STATE && code != wire::IOCTL_AUDIO_SET_DEFAULT_FORMAT {
             let a = audio(dev);
             lock(a);
             let supported = session(a).endpoint();
@@ -298,6 +301,7 @@ pub unsafe fn ioctl(dev: *mut DeviceContext, req: WDFREQUEST, rc: *mut RequestCo
             wire::IOCTL_AUDIO_SET_LINK => ioctl_set_link(dev, req, input),
             wire::IOCTL_AUDIO_WAIT_EVENT => ioctl_wait_event(dev, req, rc, input),
             wire::IOCTL_AUDIO_READ_PCM => ioctl_read_pcm(dev, req, rc),
+            wire::IOCTL_AUDIO_SET_DEFAULT_FORMAT => ioctl_set_default_format(dev, req, input),
             _ => complete(req, STATUS_INVALID_DEVICE_REQUEST, 0),
         }
     }
@@ -423,6 +427,25 @@ unsafe fn ioctl_read_pcm(dev: *mut DeviceContext, req: WDFREQUEST, rc: *mut Requ
             Ok(0) => park(dev, req, rc, ticket, Parked::Read),
             Ok(n) => complete(req, STATUS_SUCCESS, n),
         }
+    }
+}
+
+/// SET_DEFAULT_FORMAT: any (admin) handle, never pends. The format must be
+/// one of `OFFERED_FORMATS` exactly; `acx.rs` does the rest (host pin
+/// lists, registry, the state's `default_format`).
+unsafe fn ioctl_set_default_format(dev: *mut DeviceContext, req: WDFREQUEST, input: RawInput) {
+    unsafe {
+        let Ok(r) = with_input(input, wire::SetDefaultFormatRequest::decode) else {
+            return complete(req, STATUS_BUFFER_TOO_SMALL, 0);
+        };
+        let Some(index) = wire::offered_index(&r.format) else {
+            return complete(req, STATUS_INVALID_PARAMETER, 0);
+        };
+        if !(*audio(dev)).enabled {
+            return complete(req, STATUS_NOT_SUPPORTED, 0);
+        }
+        let status = crate::acx::set_default_format((*dev).device, index);
+        complete(req, status, 0);
     }
 }
 
@@ -719,6 +742,20 @@ pub unsafe fn set_endpoint(dev: *mut DeviceContext, present: bool) {
         let a = audio(dev);
         lock(a);
         let changed = session(a).set_endpoint(present);
+        unlock(a);
+        if changed {
+            kick_wait(dev);
+        }
+    }
+}
+
+/// The host pin's default format is `format` now (all zero: unknown).
+/// Completes a waiting WAIT_EVENT if that changed the state. IRQL <= DISPATCH.
+pub unsafe fn set_default_format(dev: *mut DeviceContext, format: wire::PcmFormat) {
+    unsafe {
+        let a = audio(dev);
+        lock(a);
+        let changed = session(a).set_default_format(format);
         unlock(a);
         if changed {
             kick_wait(dev);

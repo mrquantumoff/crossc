@@ -1185,7 +1185,7 @@ fn volume_report_bumps_seq_but_counters_do_not() {
 }
 
 #[test]
-fn state_replies_fit_v2_and_v3_buffers() {
+fn state_replies_fit_v2_v3_and_v4_buffers() {
     use crate::audio_core::write_state;
     use crossc_ioctl::audio::{AUDIO_FLAG_HW_VOLUME, VolumeState};
     let mut s = Session::new();
@@ -1203,11 +1203,15 @@ fn state_replies_fit_v2_and_v3_buffers() {
     let mut b50 = [0xAA; 50];
     assert_eq!(write_state(&mut b50, &st), Some(50));
     assert_eq!(AudioState::decode(&b50).unwrap().volume.level, -5);
-    // A v3 caller, and a bigger buffer: the full 64 bytes, nothing more.
+    // A v3 caller: its 64 bytes.
+    let mut b64 = [0xAA; 64];
+    assert_eq!(write_state(&mut b64, &st), Some(AudioState::SIZE_V3));
+    assert_eq!(AudioState::decode(&b64), Ok(st));
+    // A v4 caller, and a bigger buffer: the full 72 bytes, nothing more.
     let mut b80 = [0xAA; 80];
     assert_eq!(write_state(&mut b80, &st), Some(AudioState::SIZE));
-    assert_eq!(AudioState::decode(&b80[..64]), Ok(st));
-    assert_eq!(b80[64], 0xAA);
+    assert_eq!(AudioState::decode(&b80[..AudioState::SIZE]), Ok(st));
+    assert_eq!(b80[AudioState::SIZE], 0xAA);
     // Shorter than v2: refused (STATUS_BUFFER_TOO_SMALL).
     assert_eq!(write_state(&mut [0; 39], &st), None);
 }

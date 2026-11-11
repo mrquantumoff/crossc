@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use crossc_ioctl as ioc;
-use crossc_ioctl::audio::{AudioState, PcmHeader};
+use crossc_ioctl::audio::{AudioState, PcmFormat, PcmHeader};
 
 use crate::channel::{ChanError, SduChannel};
 
@@ -74,6 +74,9 @@ pub trait Driver: Clone {
     fn detach(&self);
     /// AUDIO_SET_LINK.
     fn set_link(&self, connected: bool) -> Result<(), ChanError>;
+    /// AUDIO_SET_DEFAULT_FORMAT (protocol 4): `format` must be one of
+    /// `crossc_ioctl::audio::OFFERED_FORMATS`.
+    fn set_default_format(&self, format: PcmFormat) -> Result<(), ChanError>;
     /// OPEN_CHANNEL (blocks until the L2CAP channel is up, or `timeout`).
     fn open_channel(
         &self,

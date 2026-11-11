@@ -279,5 +279,10 @@ int main(void) {
         printf("init ACX_DATAFORMAT_LIST_CONFIG: Size=%u Flags=%u\n", c.Size, c.Flags);
     }
     G(AUDIO_SIGNALPROCESSINGMODE_DEFAULT);
+
+    /* ---- default format chosen at run time (SET_DEFAULT_FORMAT) ----
+     * AcxDataFormatListAssignDefaultDataFormat is printed with the first part. */
+    I(AcxPinNotifyDataFormatChange);
+    V(KEY_SET_VALUE); V(REG_DWORD); V(STATUS_OBJECT_NAME_NOT_FOUND);
     return 0;
 }

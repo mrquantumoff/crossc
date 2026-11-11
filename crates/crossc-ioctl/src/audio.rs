@@ -46,6 +46,26 @@
 //! works; [`AudioState::decode`] accepts a `SIZE_V2` reply (a v2 driver) and
 //! reads the volume fields as zero, which means "no hardware volume".
 //!
+//! # Default format (protocol 4)
+//! The endpoint offers the formats of [`OFFERED_FORMATS`]. Windows plays at
+//! the *default* one: ACX answers `KSPROPERTY_PIN_PROPOSEDATAFORMAT2` with
+//! the default of the host pin's mode list, and the audio engine then uses
+//! that format whatever the user picked in the sound settings. So the
+//! service makes the default follow that choice with
+//! [`IOCTL_AUDIO_SET_DEFAULT_FORMAT`] (any admin handle, attached or not;
+//! `STATUS_INVALID_PARAMETER` for a format not in the list,
+//! `STATUS_NOT_SUPPORTED` with ACX off). The driver stores the choice in the
+//! device's hardware key (`DefaultSampleRate`, `DefaultBits`), reads it
+//! back whenever it builds the endpoint, and reports the default in
+//! [`AudioState::default_format`] (a change bumps [`AudioState::seq`]). A
+//! stream that is already open keeps its format; the new default is what
+//! the next stream the engine opens gets.
+//!
+//! The reply grew from [`AudioState::SIZE_V3`] to [`AudioState::SIZE`] bytes;
+//! a v4 driver fills as much as the caller's buffer holds, and
+//! [`AudioState::decode`] reads a shorter reply's default format as all
+//! zero ("unknown": a v3 or older driver).
+//!
 //! # Rules the driver keeps
 //! * The audio engine never waits for the service. With nobody attached, or a
 //!   reader that falls behind, rendered PCM is dropped and counted in
@@ -77,6 +97,10 @@ pub const IOCTL_AUDIO_WAIT_EVENT: u32 = ctl_code(FILE_DEVICE_CROSSC, 0x813, METH
 /// least one frame (`STATUS_BUFFER_TOO_SMALL`); [`PCM_READ_BUFFER`] is a good
 /// size. One outstanding (`STATUS_DEVICE_BUSY`). Attached handle only.
 pub const IOCTL_AUDIO_READ_PCM: u32 = ctl_code(FILE_DEVICE_CROSSC, 0x814, METHOD_BUFFERED, RW);
+/// Protocol 4. In: [`SetDefaultFormatRequest`]. Out: nothing. Any admin
+/// handle; never pends. See the module docs, "Default format".
+pub const IOCTL_AUDIO_SET_DEFAULT_FORMAT: u32 =
+    ctl_code(FILE_DEVICE_CROSSC, 0x815, METHOD_BUFFERED, RW);
 
 /// Recommended READ_PCM output buffer: header + 4096 frames of 32-bit stereo.
 pub const PCM_READ_BUFFER: usize = PcmHeader::SIZE + 4096 * 8;
@@ -186,6 +210,87 @@ impl PcmFormat {
     }
 }
 
+/// The formats the endpoint offers, in the driver's order. The first is the
+/// default when nothing else was chosen (and the fallback for a stored
+/// choice the driver does not know).
+pub const OFFERED_FORMATS: [PcmFormat; 3] = [
+    // HiFi
+    PcmFormat {
+        sample_rate: 48_000,
+        channels: 2,
+        container_bits: 32,
+        valid_bits: 24,
+    },
+    // UHQ
+    PcmFormat {
+        sample_rate: 96_000,
+        channels: 2,
+        container_bits: 32,
+        valid_bits: 24,
+    },
+    // 16-bit
+    PcmFormat {
+        sample_rate: 48_000,
+        channels: 2,
+        container_bits: 16,
+        valid_bits: 16,
+    },
+];
+
+/// Index in [`OFFERED_FORMATS`] of exactly `f`.
+pub fn offered_index(f: &PcmFormat) -> Option<usize> {
+    OFFERED_FORMATS.iter().position(|o| o == f)
+}
+
+/// Index in [`OFFERED_FORMATS`] of the format for a sample rate and a bit
+/// depth (valid bits), as the sound settings name a format and as the
+/// driver stores its default: the format of that rate and depth, else the
+/// first one of that rate (only 24-bit exists at 96 kHz), else `None`.
+/// `bits` 0 means "not given".
+pub fn offered_for(rate: u32, bits: u32) -> Option<usize> {
+    let depth = |o: &PcmFormat| match bits {
+        0 => true,
+        b if b >= 24 => o.valid_bits == 24,
+        b => u32::from(o.valid_bits) == b,
+    };
+    OFFERED_FORMATS
+        .iter()
+        .position(|o| o.sample_rate == rate && depth(o))
+        .or_else(|| OFFERED_FORMATS.iter().position(|o| o.sample_rate == rate))
+}
+
+/// SET_DEFAULT_FORMAT request (protocol 4): one of [`OFFERED_FORMATS`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SetDefaultFormatRequest {
+    pub format: PcmFormat,
+}
+
+impl SetDefaultFormatRequest {
+    pub const SIZE: usize = 8;
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[0..4].copy_from_slice(&self.format.sample_rate.to_le_bytes());
+        b[4] = self.format.channels;
+        b[5] = self.format.container_bits;
+        b[6] = self.format.valid_bits;
+        // 7 reserved
+        b
+    }
+    pub fn decode(b: &[u8]) -> Result<Self, WireError> {
+        if b.len() < Self::SIZE {
+            return Err(WireError::TooShort);
+        }
+        Ok(Self {
+            format: PcmFormat {
+                sample_rate: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                channels: b[4],
+                container_bits: b[5],
+                valid_bits: b[6],
+            },
+        })
+    }
+}
+
 /// The driver has ACX enabled (an endpoint exists at all).
 pub const AUDIO_FLAG_ACX: u32 = 1;
 /// An ATTACH request is pending.
@@ -258,14 +363,20 @@ pub struct AudioState {
     pub frames_dropped: u64,
     /// Protocol 3 (zero from a v2 driver).
     pub volume: VolumeState,
+    /// Protocol 4: the format the endpoint offers as its default, which is
+    /// the one Windows opens its next stream in (module docs, "Default
+    /// format"). All zero from a v3 driver: unknown.
+    pub default_format: PcmFormat,
 }
 
 impl AudioState {
     /// Size of the reply in protocol 2, and the smallest output buffer a v3
-    /// driver accepts.
+    /// or v4 driver accepts.
     pub const SIZE_V2: usize = 40;
-    /// Size of the full protocol 3 reply.
-    pub const SIZE: usize = 64;
+    /// Size of the protocol 3 reply.
+    pub const SIZE_V3: usize = 64;
+    /// Size of the full protocol 4 reply.
+    pub const SIZE: usize = 72;
     pub fn encode(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
         b[0..4].copy_from_slice(&self.seq.to_le_bytes());
@@ -289,10 +400,18 @@ impl AudioState {
         b[58..60].copy_from_slice(&v.sets.to_le_bytes());
         b[60..62].copy_from_slice(&v.events.to_le_bytes());
         // 62..64 reserved
+        // protocol 4
+        let d = &self.default_format;
+        b[64..68].copy_from_slice(&d.sample_rate.to_le_bytes());
+        b[68] = d.channels;
+        b[69] = d.container_bits;
+        b[70] = d.valid_bits;
+        // 71 reserved
         b
     }
-    /// Accepts a v2 reply ([`Self::SIZE_V2`] bytes: volume all zero) as well
-    /// as a longer one (bytes past [`Self::SIZE`] are ignored).
+    /// Accepts a v2 reply ([`Self::SIZE_V2`] bytes: volume all zero) or a v3
+    /// one ([`Self::SIZE_V3`]: default format all zero) as well as a longer
+    /// one (bytes past [`Self::SIZE`] are ignored).
     pub fn decode(b: &[u8]) -> Result<Self, WireError> {
         if b.len() < Self::SIZE_V2 {
             return Err(WireError::TooShort);
@@ -329,6 +448,12 @@ impl AudioState {
                 gets: u16_at(56),
                 sets: u16_at(58),
                 events: u16_at(60),
+            },
+            default_format: PcmFormat {
+                sample_rate: i32_at(64) as u32,
+                channels: b.get(68).copied().unwrap_or(0),
+                container_bits: b.get(69).copied().unwrap_or(0),
+                valid_bits: b.get(70).copied().unwrap_or(0),
             },
         })
     }
@@ -431,6 +556,10 @@ mod tests {
         container_bits: 32,
         valid_bits: 24,
     };
+    const FMT_48K: PcmFormat = PcmFormat {
+        sample_rate: 48000,
+        ..FMT
+    };
 
     #[test]
     fn codes_are_distinct_and_in_the_crossc_range() {
@@ -445,6 +574,7 @@ mod tests {
             IOCTL_AUDIO_GET_STATE,
             IOCTL_AUDIO_WAIT_EVENT,
             IOCTL_AUDIO_READ_PCM,
+            IOCTL_AUDIO_SET_DEFAULT_FORMAT,
         ];
         for (i, a) in codes.iter().enumerate() {
             assert_eq!(a >> 16, FILE_DEVICE_CROSSC);
@@ -452,6 +582,7 @@ mod tests {
             assert!(codes[i + 1..].iter().all(|b| b != a));
         }
         assert_eq!(IOCTL_AUDIO_ATTACH, 0x8C55_E040);
+        assert_eq!(IOCTL_AUDIO_SET_DEFAULT_FORMAT, 0x8C55_E054);
     }
 
     #[test]
@@ -464,6 +595,7 @@ mod tests {
             frames_rendered: 0x0102_0304_0506_0708,
             frames_dropped: 9,
             volume: VolumeState::default(),
+            default_format: OFFERED_FORMATS[0],
         };
         let b = s.encode();
         assert_eq!(AudioState::decode(&b), Ok(s));
@@ -492,6 +624,7 @@ mod tests {
                 sets: 2,
                 events: 0x1234,
             },
+            default_format: FMT,
         };
         let b = s.encode();
         assert_eq!(b.len(), AudioState::SIZE);
@@ -505,6 +638,16 @@ mod tests {
             v2,
             AudioState {
                 volume: VolumeState::default(),
+                default_format: PcmFormat::default(),
+                ..s
+            }
+        );
+        // Likewise a v3 caller's 64 bytes: everything but the default format.
+        let v3 = AudioState::decode(&b[..AudioState::SIZE_V3]).unwrap();
+        assert_eq!(
+            v3,
+            AudioState {
+                default_format: PcmFormat::default(),
                 ..s
             }
         );
@@ -521,7 +664,7 @@ mod tests {
         assert_eq!((part.volume.level, part.volume.left), (-667_751, 0));
         // Longer replies (a later version) are accepted.
         let mut long = [0u8; 80];
-        long[..64].copy_from_slice(&b);
+        long[..AudioState::SIZE].copy_from_slice(&b);
         assert_eq!(AudioState::decode(&long), Ok(s));
         // The volume flags are disjoint from the v2 ones.
         assert_eq!(
@@ -546,6 +689,40 @@ mod tests {
             Ok(WaitEventRequest { seq: 0xAABB_CCDD })
         );
         assert_eq!(WaitEventRequest::decode(&[]), Err(WireError::TooShort));
+        let r = SetDefaultFormatRequest {
+            format: OFFERED_FORMATS[1],
+        };
+        assert_eq!(
+            r.encode(),
+            [0x00, 0x77, 0x01, 0x00, 2, 32, 24, 0],
+            "96000 Hz, stereo, 24 in 32"
+        );
+        assert_eq!(SetDefaultFormatRequest::decode(&r.encode()), Ok(r));
+        assert_eq!(
+            SetDefaultFormatRequest::decode(&[0; 7]),
+            Err(WireError::TooShort)
+        );
+    }
+
+    #[test]
+    fn offered_formats_and_their_names() {
+        assert!(OFFERED_FORMATS.iter().all(PcmFormat::is_valid));
+        assert_eq!(OFFERED_FORMATS[0], FMT_48K);
+        assert_eq!(offered_index(&FMT), Some(1));
+        assert_eq!(offered_index(&PcmFormat { channels: 1, ..FMT }), None);
+        // As the sound settings name them.
+        assert_eq!(offered_for(96_000, 24), Some(1));
+        assert_eq!(offered_for(48_000, 24), Some(0));
+        assert_eq!(offered_for(48_000, 16), Some(2));
+        // 32-bit (float) is taken as 24, and 96 kHz has 24-bit only.
+        assert_eq!(offered_for(48_000, 32), Some(0));
+        assert_eq!(offered_for(96_000, 16), Some(1));
+        // No depth given: the first of that rate.
+        assert_eq!(offered_for(48_000, 0), Some(0));
+        assert_eq!(offered_for(96_000, 0), Some(1));
+        // A rate the endpoint does not offer.
+        assert_eq!(offered_for(44_100, 16), None);
+        assert_eq!(offered_for(0, 0), None);
     }
 
     #[test]

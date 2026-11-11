@@ -89,6 +89,39 @@
 //! the device is added, so a change needs a device restart (disable/enable,
 //! or reconnecting the buds is not enough).
 //!
+//! # Default format
+//! Windows renders in the default format of the host pin's mode list, not
+//! in the one picked in the sound settings: ACX answers
+//! KSPROPERTY_PIN_PROPOSEDATAFORMAT2 with that default, and "if driver
+//! supports this property, OS will always use this format for the specific
+//! signal processing mode" (WDK docs, ksproperty-pin-proposedataformat2).
+//! So the default is chosen per device:
+//! * `DefaultSampleRate` / `DefaultBits` (REG_DWORD) in the device's
+//!   hardware key, read on every PrepareHardware and used when the lists
+//!   are filled (`audio_core::stored_default`: missing or unknown ->
+//!   48 kHz/24, the 1.0 default);
+//! * `IOCTL_AUDIO_SET_DEFAULT_FORMAT` (the service, when the Windows device
+//!   format changes): `AcxDataFormatListAssignDefaultDataFormat` on the live
+//!   lists, then `AcxPinNotifyDataFormatChange` on the host pin
+//!   (KSEVENT_PINCAPS_FORMATCHANGE; the ACX docs say ACX raises it itself
+//!   when a list changes, the explicit call covers a default that moves
+//!   within an unchanged list), then the values above are written so the
+//!   choice survives a restart.
+//!
+//! A stream that is open keeps its format; the engine's next stream gets
+//! the new default. Whether the engine re-reads the default on the event
+//! alone, without a new stream, has not been seen on a device.
+//!
+//! The handles this needs (host pin, lists, formats) belong to the circuit
+//! and are kept in [`AcxDeviceCtx`] under its passive `fmt_lock` from the
+//! moment the circuit is added until ReleaseHardware; the lock is never
+//! held across AcxDeviceAddCircuit, never taken with the audio spinlock held
+//! (the IOCTL takes that spinlock inside it, to report the new default), and
+//! never taken in an ACX callback. The IOCTL also reports and stores the
+//! default under it, so with two at once the default last given to the lists
+//! is the one reported and stored. Nothing here can fail the device: without the
+//! IOCTL is refused and the stored default still applies at the next start.
+//!
 //! # Failure policy
 //! * `AcxDriverInitialize` fails -> ACX off for the driver, pipe unaffected.
 //! * `AcxDeviceInitInitialize` / `AcxDeviceInitialize` fail -> DeviceAdd fails
@@ -109,7 +142,7 @@ use core::mem::{offset_of, size_of, zeroed};
 use core::ptr::{addr_of_mut, null_mut};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use crossc_ioctl::audio::PcmFormat;
+use crossc_ioctl::audio::{OFFERED_FORMATS, PcmFormat};
 
 use wdk_sys::ntddk::{
     ExAllocatePool2, ExFreePool, IoAllocateMdl, IoFreeMdl, KeFlushQueuedDpcs, KeQueryPerformanceCounter,
@@ -335,6 +368,8 @@ static CIRCUIT_NAME_US: StaticUnicode = StaticUnicode(UNICODE_STRING {
 });
 static DISABLE_ACX_VALUE: [u16; 10] = utf16("DisableAcx");
 static DISABLE_AVRCP_VOLUME_VALUE: [u16; 18] = utf16("DisableAvrcpVolume");
+static DEFAULT_SAMPLE_RATE_VALUE: [u16; 17] = utf16("DefaultSampleRate");
+static DEFAULT_BITS_VALUE: [u16; 11] = utf16("DefaultBits");
 
 fn unicode(s: &'static [u16]) -> UNICODE_STRING {
     UNICODE_STRING {
@@ -402,9 +437,10 @@ const fn pcm_stereo(rate: u32, container_bits: u16, valid_bits: u16) -> KsWaveFo
 ///
 /// Why it exists: the hypothesis that the audio engine's DEFAULT-mode
 /// streams would then be described by the pin itself, and that this could
-/// let Windows play at 96 kHz. Nothing shows that yet: both lists default to
-/// 48 kHz, and the engine takes a mode's format from its list's default
-/// (KSPROPERTY_PIN_PROPOSEDATAFORMAT2).
+/// let Windows play at 96 kHz. It cannot by itself: the engine takes a
+/// mode's format from its list's default (KSPROPERTY_PIN_PROPOSEDATAFORMAT2),
+/// and both lists get the same default. What decides the rate is that
+/// default, which follows the sound settings (see "Default format" below).
 ///
 /// Why it is off: the host pin allows any number of streams, and a pin with
 /// streams in several modes is a multi-stream pin to the engine: it can run
@@ -421,11 +457,15 @@ const fn pcm_stereo(rate: u32, container_bits: u16, valid_bits: u16) -> KsWaveFo
 const DEFAULT_MODE_LIST: bool = false;
 
 /// Formats offered on the host pin, in its RAW mode list (and in its
-/// DEFAULT one, see [`DEFAULT_MODE_LIST`]). Index 0 is the default.
+/// DEFAULT one, see [`DEFAULT_MODE_LIST`]); `crossc_ioctl::audio::
+/// OFFERED_FORMATS` in the same order (asserted below). Which one is the
+/// lists' default is chosen per device ("Default format" below); index 0
+/// when nothing was chosen.
 /// 24-bit is offered as 24 valid bits in a 32-bit container, the layout the
 /// sample (`Pcm48000c2_24in32`) and HD Audio use; packed 3-byte samples are
 /// not offered.
-static FORMATS: [KsWaveFormatExtensible; 3] = [
+const FORMAT_COUNT: usize = 3;
+static FORMATS: [KsWaveFormatExtensible; FORMAT_COUNT] = [
     pcm_stereo(48_000, 32, 24), // HiFi
     pcm_stereo(96_000, 32, 24), // UHQ
     pcm_stereo(48_000, 16, 16), // fallback
@@ -634,6 +674,21 @@ const _: () = {
     // The tap's session can know every stream the driver allows.
     assert!(rt_limits::MAX_STREAMS as usize <= crate::audio_core::MAX_TRACKED);
 
+    // ---- default format (msvc-layout.txt, last part) ------------------------
+    assert!(_ACXFUNCENUM::AcxPinNotifyDataFormatChangeTableIndex == 143);
+    assert!(KEY_SET_VALUE == 0x2 && REG_DWORD == 0x4);
+    assert!(STATUS_OBJECT_NAME_NOT_FOUND as u32 == 0xC000_0034);
+    // FORMATS is crossc_ioctl's OFFERED_FORMATS, in the same order (the
+    // service and the IOCTL name formats by that list).
+    assert!(FORMATS.len() == OFFERED_FORMATS.len());
+    let mut i = 0;
+    while i < FORMATS.len() {
+        let (k, o) = (&FORMATS[i], &OFFERED_FORMATS[i]);
+        assert!(k.samples_per_sec == o.sample_rate && k.channels == o.channels as u16);
+        assert!(k.bits_per_sample == o.container_bits as u16 && k.valid_bits_per_sample == o.valid_bits as u16);
+        i += 1;
+    }
+
     // ---- unified volume (msvc-layout.txt, "unified volume" part) ----------
     assert!(_ACXFUNCENUM::AcxCircuitInitAssignCategoriesTableIndex == 5);
     assert!(_ACXFUNCENUM::AcxCircuitInitAssignPropertiesTableIndex == 7);
@@ -784,6 +839,19 @@ struct AcxDeviceCtx {
     vol_work: WDFWORKITEM,
     /// `VOL_WORK_*` bits the work item has to do.
     vol_pending: AtomicU32,
+    /// Guards the five fields below ("Default format" in the module docs).
+    /// PASSIVE only. Null if it could not be created: the IOCTL is then
+    /// refused, the stored default still applies.
+    fmt_lock: WDFWAITLOCK,
+    /// Index in [`FORMATS`] of the host pin's default.
+    default_index: usize,
+    /// While the circuit is added (else null): its host pin, the pin's RAW
+    /// and DEFAULT mode lists (the second null unless
+    /// [`DEFAULT_MODE_LIST`]) and each list's ACXDATAFORMAT objects in
+    /// [`FORMATS`] order.
+    host_pin: ACXPIN,
+    fmt_lists: [ACXDATAFORMATLIST; 2],
+    fmt_objs: [[ACXDATAFORMAT; FORMAT_COUNT]; 2],
 }
 acx_context_type!(ACX_DEVICE_CTX_INFO, AcxDeviceCtx, c"CrossCAcxDeviceContext", acx_device_ctx);
 
@@ -895,6 +963,184 @@ unsafe fn disable_acx_value(key: WDFKEY) -> bool {
 
 /// `DisableAvrcpVolume` in the service Parameters key (read in `driver_init`).
 static AVRCP_VOLUME_OFF: AtomicBool = AtomicBool::new(false);
+
+// ---------------------------------------------------------------------------
+// Default format: registry and lock ("Default format" in the module docs)
+// ---------------------------------------------------------------------------
+
+/// A REG_DWORD of an open key; `None` if it is missing or unreadable.
+unsafe fn ulong_value(key: WDFKEY, name: &'static [u16]) -> Option<u32> {
+    unsafe {
+        let name = unicode(name);
+        let mut value: ULONG = 0;
+        let status = call_unsafe_wdf_function_binding!(WdfRegistryQueryULong, key, &raw const name, &raw mut value);
+        if nt_success(status) {
+            return Some(value);
+        }
+        if status != STATUS_OBJECT_NAME_NOT_FOUND {
+            trace!("acx: reading a default format value failed {:#x}", status);
+        }
+        None
+    }
+}
+
+/// The stored default ([`FORMATS`] index) from the device's hardware key.
+/// PASSIVE.
+unsafe fn read_default_index(device: WDFDEVICE) -> usize {
+    unsafe {
+        let mut key: WDFKEY = null_mut();
+        let st = call_unsafe_wdf_function_binding!(
+            WdfDeviceOpenRegistryKey,
+            device,
+            PLUGPLAY_REGKEY_DEVICE,
+            KEY_READ,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &raw mut key
+        );
+        if !nt_success(st) {
+            trace!("acx: device key not readable {:#x} - default format 48 kHz/24", st);
+            return 0;
+        }
+        let rate = ulong_value(key, &DEFAULT_SAMPLE_RATE_VALUE);
+        let bits = ulong_value(key, &DEFAULT_BITS_VALUE);
+        call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
+        let index = crate::audio_core::stored_default(rate, bits);
+        if rate.is_some() && rate != Some(FORMATS[index].samples_per_sec) {
+            trace!("acx: DefaultSampleRate {:?} is not offered - default format 48 kHz/24", rate);
+        }
+        index
+    }
+}
+
+/// Write the default ([`FORMATS`] index) to the device's hardware key, so
+/// the next PrepareHardware (also after a reboot) starts with it. PASSIVE.
+unsafe fn store_default_index(device: WDFDEVICE, index: usize) -> NTSTATUS {
+    unsafe {
+        let Some((rate, bits)) = crate::audio_core::stored_values(index) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let mut key: WDFKEY = null_mut();
+        let st = call_unsafe_wdf_function_binding!(
+            WdfDeviceOpenRegistryKey,
+            device,
+            PLUGPLAY_REGKEY_DEVICE,
+            KEY_SET_VALUE,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &raw mut key
+        );
+        if !nt_success(st) {
+            return st;
+        }
+        let rate_name = unicode(&DEFAULT_SAMPLE_RATE_VALUE);
+        let bits_name = unicode(&DEFAULT_BITS_VALUE);
+        let mut st = call_unsafe_wdf_function_binding!(WdfRegistryAssignULong, key, &raw const rate_name, rate);
+        if nt_success(st) {
+            st = call_unsafe_wdf_function_binding!(WdfRegistryAssignULong, key, &raw const bits_name, bits);
+        }
+        call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
+        st
+    }
+}
+
+/// Run `f` with the device's `fmt_lock` held. False (and `f` not run) if
+/// there is no lock. PASSIVE.
+unsafe fn with_fmt_lock(ctx: *mut AcxDeviceCtx, f: impl FnOnce()) -> bool {
+    unsafe {
+        if (*ctx).fmt_lock.is_null() {
+            return false;
+        }
+        // No timeout: waits (at PASSIVE) and then returns STATUS_SUCCESS.
+        let _ = call_unsafe_wdf_function_binding!(WdfWaitLockAcquire, (*ctx).fmt_lock, null_mut());
+        f();
+        call_unsafe_wdf_function_binding!(WdfWaitLockRelease, (*ctx).fmt_lock);
+        true
+    }
+}
+
+/// Make `index` the default of every live list of the circuit and tell
+/// ACX's clients. The caller holds `fmt_lock`.
+unsafe fn assign_default_locked(ctx: *mut AcxDeviceCtx, index: usize) -> NTSTATUS {
+    unsafe {
+        if (*ctx).host_pin.is_null() {
+            return STATUS_SUCCESS;
+        }
+        for l in 0..2 {
+            let list = (*ctx).fmt_lists[l];
+            let format = (*ctx).fmt_objs[l][index];
+            if list.is_null() || format.is_null() {
+                continue;
+            }
+            let st = acx!(
+                AcxDataFormatListAssignDefaultDataFormatTableIndex,
+                PFN_ACXDATAFORMATLISTASSIGNDEFAULTDATAFORMAT,
+                list,
+                format
+            );
+            if !nt_success(st) {
+                trace!("acx: AcxDataFormatListAssignDefaultDataFormat (list {}) failed {:#x}", l, st);
+                return st;
+            }
+        }
+        let st = acx!(AcxPinNotifyDataFormatChangeTableIndex, PFN_ACXPINNOTIFYDATAFORMATCHANGE, (*ctx).host_pin);
+        if !nt_success(st) {
+            // The lists have changed; the next stream gets the new default
+            // whether or not anybody heard of it now.
+            trace!("acx: AcxPinNotifyDataFormatChange failed {:#x}", st);
+        }
+        STATUS_SUCCESS
+    }
+}
+
+/// `IOCTL_AUDIO_SET_DEFAULT_FORMAT` (audio.rs, PASSIVE, after the admin
+/// check): make [`FORMATS`]`[index]` the host pin's default now if the
+/// circuit exists, and from the next PrepareHardware on in any case.
+pub unsafe fn set_default_format(device: WDFDEVICE, index: usize) -> NTSTATUS {
+    unsafe {
+        if index >= FORMATS.len() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let ctx = acx_device_ctx(device.cast());
+        if ctx.is_null() {
+            return STATUS_NOT_SUPPORTED;
+        }
+        let mut status = STATUS_SUCCESS;
+        let mut live = false;
+        let mut stored = STATUS_SUCCESS;
+        // The reported default and the stored one are written under the lock
+        // too: with two of these IOCTLs at once (the queue is parallel) the
+        // one that changed the lists last is also the one reported and
+        // stored. Both are fine at PASSIVE under a wait lock. Nothing that
+        // holds the audio spinlock takes `fmt_lock`, and nothing reached from
+        // here does: completing the parked WAIT_EVENT (a manual queue) does
+        // not dispatch from the default queue, whose parallel limit is off.
+        let locked = with_fmt_lock(ctx, || {
+            live = !(*ctx).host_pin.is_null();
+            status = assign_default_locked(ctx, index);
+            if nt_success(status) {
+                (*ctx).default_index = index;
+                audio::set_default_format(crate::device_ctx(device.cast()), OFFERED_FORMATS[index]);
+                // A lost write is not fatal: the service compares again
+                // whenever it attaches, and sends the choice again if the
+                // driver started with another default.
+                stored = store_default_index(device, index);
+            }
+        });
+        if !locked {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        if !nt_success(status) {
+            return status;
+        }
+        trace!(
+            "acx: default format {} Hz, {}-bit ({}; stored {:#x})",
+            FORMATS[index].samples_per_sec,
+            FORMATS[index].valid_bits_per_sample,
+            if live { "lists updated" } else { "no circuit, applies when it is built" },
+            stored
+        );
+        STATUS_SUCCESS
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Driver / device hooks (called from lib.rs)
@@ -1066,6 +1312,14 @@ pub unsafe fn device_created(device: WDFDEVICE) -> NTSTATUS {
                 (*ctx).avrcp_volume = false;
             }
         }
+        // Default format lock. Cannot fail the device either.
+        let mut attr = attributes();
+        attr.ParentObject = device.cast();
+        let st = call_unsafe_wdf_function_binding!(WdfWaitLockCreate, &raw mut attr, addr_of_mut!((*ctx).fmt_lock));
+        if !nt_success(st) {
+            trace!("acx: WdfWaitLockCreate failed {:#x} - the default format follows the registry only", st);
+            (*ctx).fmt_lock = null_mut();
+        }
         trace!("acx: device initialized (unified volume {})", if (*ctx).avrcp_volume { "on" } else { "off" });
         STATUS_SUCCESS
     }
@@ -1081,7 +1335,13 @@ pub unsafe extern "C" fn evt_prepare_hardware(device: WDFDEVICE, _raw: WDFCMRESL
         if ctx.is_null() || !(*ctx).render.is_null() || (*ctx).failed {
             return STATUS_SUCCESS;
         }
-        let mut built = add_render_circuit(device, (*ctx).avrcp_volume);
+        // The stored default format. An IOCTL that changes it while the
+        // circuit is being built is caught up with below.
+        let index = read_default_index(device);
+        if !with_fmt_lock(ctx, || (*ctx).default_index = index) {
+            (*ctx).default_index = index;
+        }
+        let mut built = add_render_circuit(device, (*ctx).avrcp_volume, index);
         if let Err(status) = built
             && (*ctx).avrcp_volume
         {
@@ -1090,9 +1350,9 @@ pub unsafe extern "C" fn evt_prepare_hardware(device: WDFDEVICE, _raw: WDFCMRESL
             // (a rebalance would only fail the same way).
             trace!("avrcp: circuit with the volume contract failed {:#x} - unified volume off, building it without", status);
             (*ctx).avrcp_volume = false;
-            built = add_render_circuit(device, false);
+            built = add_render_circuit(device, false, index);
         }
-        let Built { circuit, jack, vol } = match built {
+        let Built { circuit, jack, vol, formats } = match built {
             Ok(b) => b,
             Err(status) => {
                 trace!("acx: render circuit failed {:#x} - no endpoint", status);
@@ -1106,15 +1366,30 @@ pub unsafe extern "C" fn evt_prepare_hardware(device: WDFDEVICE, _raw: WDFCMRESL
         (*ctx).volume.store(vol.volume as usize, Ordering::SeqCst);
         (*ctx).mute.store(vol.mute as usize, Ordering::SeqCst);
         (*ctx).event.store(vol.event as usize, Ordering::SeqCst);
+        // The circuit's lists from now on; and the default the IOCTL may
+        // have chosen meanwhile.
+        let mut default = index;
+        with_fmt_lock(ctx, || {
+            (*ctx).host_pin = formats.pin;
+            (*ctx).fmt_lists = formats.lists;
+            (*ctx).fmt_objs = formats.objs;
+            if (*ctx).default_index != index && nt_success(assign_default_locked(ctx, (*ctx).default_index)) {
+                default = (*ctx).default_index;
+            }
+            (*ctx).default_index = default;
+        });
+        audio::set_default_format(dev, OFFERED_FORMATS[default]);
         let element = !vol.volume.is_null();
         audio::volume(dev, |v| v.set_element(element));
         // From here on the audio IOCTLs work (AUDIO_FLAG_ACX).
         audio::set_endpoint(dev, true);
         trace!(
-            "acx: render circuit added (jack: unplugged until a service sets the link; hardware volume {}, mute {}, AVRCP event {})",
+            "acx: render circuit added (jack: unplugged until a service sets the link; hardware volume {}, mute {}, AVRCP event {}; default format {} Hz, {}-bit)",
             element,
             !vol.mute.is_null(),
-            !vol.event.is_null()
+            !vol.event.is_null(),
+            FORMATS[default].samples_per_sec,
+            FORMATS[default].valid_bits_per_sample
         );
         STATUS_SUCCESS
     }
@@ -1142,6 +1417,13 @@ pub unsafe extern "C" fn evt_release_hardware(device: WDFDEVICE, _translated: WD
         if !(*ctx).vol_work.is_null() {
             call_unsafe_wdf_function_binding!(WdfWorkItemFlush, (*ctx).vol_work);
         }
+        // The lists and the pin go with the circuit: a SET_DEFAULT_FORMAT
+        // from here on only stores the choice.
+        with_fmt_lock(ctx, || {
+            (*ctx).host_pin = null_mut();
+            (*ctx).fmt_lists = [null_mut(); 2];
+            (*ctx).fmt_objs = [[null_mut(); FORMAT_COUNT]; 2];
+        });
         let dev = crate::device_ctx(device.cast());
         audio::volume(dev, |v| v.set_element(false));
         audio::set_endpoint(dev, false);
@@ -1175,11 +1457,21 @@ struct VolObjects {
 
 const NO_VOL: VolObjects = VolObjects { volume: null_mut(), mute: null_mut(), event: null_mut() };
 
+/// The host pin's format objects (see the `AcxDeviceCtx` fields of the
+/// same names); null where not created.
+#[derive(Clone, Copy)]
+struct FormatObjects {
+    pin: ACXPIN,
+    lists: [ACXDATAFORMATLIST; 2],
+    objs: [[ACXDATAFORMAT; FORMAT_COUNT]; 2],
+}
+
 /// A render circuit, ready for AcxDeviceAddCircuit.
 struct Built {
     circuit: ACXCIRCUIT,
     jack: ACXJACK,
     vol: VolObjects,
+    formats: FormatObjects,
 }
 
 /// Unified volume, before AcxCircuitCreate: the category list (ACX's own
@@ -1355,14 +1647,14 @@ unsafe fn add_volume_objects(device: WDFDEVICE, circuit: ACXCIRCUIT) -> VolObjec
 ///
 /// Without `avrcp` the behaviour is v0.1.1's: a failed circuit stays
 /// parented to the device and goes away with it.
-unsafe fn add_render_circuit(device: WDFDEVICE, avrcp: bool) -> Result<Built, NTSTATUS> {
+unsafe fn add_render_circuit(device: WDFDEVICE, avrcp: bool, default: usize) -> Result<Built, NTSTATUS> {
     unsafe {
         let discard = |circuit: ACXCIRCUIT| {
             if avrcp && !circuit.is_null() {
                 call_unsafe_wdf_function_binding!(WdfObjectDelete, circuit.cast());
             }
         };
-        let built = match create_render_circuit(device, avrcp) {
+        let built = match create_render_circuit(device, avrcp, default) {
             Ok(b) => b,
             Err((status, circuit)) => {
                 discard(circuit);
@@ -1386,8 +1678,12 @@ unsafe fn add_render_circuit(device: WDFDEVICE, avrcp: bool) -> Result<Built, NT
 
 /// `Err((status, circuit))`: `circuit` is the created circuit (never
 /// added), or null when the failure came before `AcxCircuitCreate`
-/// succeeded.
-unsafe fn create_render_circuit(device: WDFDEVICE, avrcp: bool) -> Result<Built, (NTSTATUS, ACXCIRCUIT)> {
+/// succeeded. `default`: index in [`FORMATS`] of the host pin's default.
+unsafe fn create_render_circuit(
+    device: WDFDEVICE,
+    avrcp: bool,
+    default: usize,
+) -> Result<Built, (NTSTATUS, ACXCIRCUIT)> {
     unsafe {
         // ---- circuit -------------------------------------------------------
         let mut init = acx!(AcxCircuitInitAllocateTableIndex, PFN_ACXCIRCUITINITALLOCATE, device);
@@ -1584,14 +1880,23 @@ unsafe fn create_render_circuit(device: WDFDEVICE, avrcp: bool) -> Result<Built,
             trace!("acx: AcxPinGetRawDataFormatList returned null");
             return Err((STATUS_INSUFFICIENT_RESOURCES, circuit));
         }
-        add_formats(device, circuit, list).map_err(|s| (s, circuit))?;
+        let mut formats = FormatObjects {
+            pin: pins[0],
+            lists: [list, null_mut()],
+            objs: [[null_mut(); FORMAT_COUNT]; 2],
+        };
+        formats.objs[0] = add_formats(device, circuit, list, default).map_err(|s| (s, circuit))?;
         if DEFAULT_MODE_LIST {
             // Without the DEFAULT list the pin is exactly what 1.0.0 offered
             // (RAW only), which plays; so a failure here is traced, not
             // fatal. A half-filled list was never assigned and goes away
             // with the circuit, its parent.
-            match add_default_mode_list(device, circuit, pins[0]) {
-                Ok(()) => trace!("acx: host pin modes: RAW, DEFAULT ({} formats each)", FORMATS.len()),
+            match add_default_mode_list(device, circuit, pins[0], default) {
+                Ok((list, objs)) => {
+                    formats.lists[1] = list;
+                    formats.objs[1] = objs;
+                    trace!("acx: host pin modes: RAW, DEFAULT ({} formats each)", FORMATS.len());
+                }
                 Err(status) => trace!("acx: no DEFAULT mode list ({:#x}); host pin modes: RAW", status),
             }
         } else {
@@ -1600,14 +1905,21 @@ unsafe fn create_render_circuit(device: WDFDEVICE, avrcp: bool) -> Result<Built,
 
         // ACX connects host pin -> (volume -> mute ->) bridge pin by default.
         check(acx!(AcxCircuitAddPinsTableIndex, PFN_ACXCIRCUITADDPINS, circuit, pins.as_mut_ptr(), 2), "AcxCircuitAddPins")?;
-        Ok(Built { circuit, jack, vol })
+        Ok(Built { circuit, jack, vol, formats })
     }
 }
 
-/// Add [`FORMATS`] to `list`, `FORMATS[0]` as its default. Each list gets
-/// its own ACXDATAFORMAT objects, parented to the circuit.
-unsafe fn add_formats(device: WDFDEVICE, circuit: ACXCIRCUIT, list: ACXDATAFORMATLIST) -> Result<(), NTSTATUS> {
+/// Add [`FORMATS`] to `list`, `FORMATS[default]` as its default. Each list
+/// gets its own ACXDATAFORMAT objects, parented to the circuit; they are
+/// returned in [`FORMATS`] order.
+unsafe fn add_formats(
+    device: WDFDEVICE,
+    circuit: ACXCIRCUIT,
+    list: ACXDATAFORMATLIST,
+    default: usize,
+) -> Result<[ACXDATAFORMAT; FORMAT_COUNT], NTSTATUS> {
     unsafe {
+        let mut objs: [ACXDATAFORMAT; FORMAT_COUNT] = [null_mut(); FORMAT_COUNT];
         for (i, ks) in FORMATS.iter().enumerate() {
             // ACX_DATAFORMAT_CONFIG_INIT_KS; ACX copies the KS format.
             let mut cfg: ACX_DATAFORMAT_CONFIG = zeroed();
@@ -1626,7 +1938,8 @@ unsafe fn add_formats(device: WDFDEVICE, circuit: ACXCIRCUIT, list: ACXDATAFORMA
                 acx!(AcxDataFormatListAddDataFormatTableIndex, PFN_ACXDATAFORMATLISTADDDATAFORMAT, list, format),
                 "AcxDataFormatListAddDataFormat",
             )?;
-            if i == 0 {
+            objs[i] = format;
+            if i == default {
                 check(
                     acx!(
                         AcxDataFormatListAssignDefaultDataFormatTableIndex,
@@ -1638,14 +1951,19 @@ unsafe fn add_formats(device: WDFDEVICE, circuit: ACXCIRCUIT, list: ACXDATAFORMA
                 )?;
             }
         }
-        Ok(())
+        Ok(objs)
     }
 }
 
 /// Give the host pin a list for `AUDIO_SIGNALPROCESSINGMODE_DEFAULT` with
-/// the same formats as its RAW list. The list is parented to the circuit;
-/// it is assigned to the pin only once it is complete.
-unsafe fn add_default_mode_list(device: WDFDEVICE, circuit: ACXCIRCUIT, pin: ACXPIN) -> Result<(), NTSTATUS> {
+/// the same formats and default as its RAW list. The list is parented to
+/// the circuit; it is assigned to the pin only once it is complete.
+unsafe fn add_default_mode_list(
+    device: WDFDEVICE,
+    circuit: ACXCIRCUIT,
+    pin: ACXPIN,
+    default: usize,
+) -> Result<(ACXDATAFORMATLIST, [ACXDATAFORMAT; FORMAT_COUNT]), NTSTATUS> {
     unsafe {
         // ACX_DATAFORMAT_LIST_CONFIG_INIT
         let mut cfg = ACX_DATAFORMAT_LIST_CONFIG { Size: size_of::<ACX_DATAFORMAT_LIST_CONFIG>() as ULONG, Flags: 0 };
@@ -1667,7 +1985,7 @@ unsafe fn add_default_mode_list(device: WDFDEVICE, circuit: ACXCIRCUIT, pin: ACX
             trace!("acx: AcxDataFormatListCreate(DEFAULT) returned no list");
             return Err(STATUS_INSUFFICIENT_RESOURCES);
         }
-        add_formats(device, circuit, list)?;
+        let objs = add_formats(device, circuit, list, default)?;
         check(
             acx!(
                 AcxPinAssignModeDataFormatListTableIndex,
@@ -1677,7 +1995,8 @@ unsafe fn add_default_mode_list(device: WDFDEVICE, circuit: ACXCIRCUIT, pin: ACX
                 list
             ),
             "AcxPinAssignModeDataFormatList(DEFAULT)",
-        )
+        )?;
+        Ok((list, objs))
     }
 }
 

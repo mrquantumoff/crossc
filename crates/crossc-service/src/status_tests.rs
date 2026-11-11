@@ -189,7 +189,7 @@ fn the_snapshot_follows_the_session() {
         d.driver,
         Some(DriverInfo {
             version: "0.1.0".into(),
-            protocol: 3
+            protocol: crossc_ioctl::PROTOCOL_VERSION
         })
     );
     assert_eq!(
@@ -454,6 +454,7 @@ fn hand_made() -> SessionStatus {
             avrcp: 127,
             ..VolumeState::default()
         },
+        default_format: fmt,
     };
     SessionStatus {
         phase: Phase::Streaming,

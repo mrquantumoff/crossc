@@ -592,7 +592,9 @@ enough; use the script.
 3. Its properties (Sound settings > the device > Output settings > Format)
    offer **24 bit, 48000 Hz** (default), **24 bit, 96000 Hz** and
    **16 bit, 48000 Hz**. 24-bit is carried as 24 valid bits in a 32-bit
-   container.
+   container. Windows plays at the endpoint's default format, which the
+   service sets to the one picked here (section 17); without the service
+   it stays at what was last stored (48 kHz/24 on a fresh install).
 4. Select it and play anything. It is **silent** (null sink), the player's
    progress bar advances at normal speed, and DebugView shows
 
@@ -616,7 +618,9 @@ enough; use the script.
    `packets` should be about 100 per second of playback (10 ms packets;
    the audio engine chooses the size), `frames` about 48000 per second, and
    `with signal` greater than 0 while something audible was playing. Switch
-   the format to 96 kHz and repeat: `frames` should be about 96000 per second.
+   the format to 96 kHz and repeat: `frames` should be about 96000 per second
+   (with the service running, section 17; without it the default stays at
+   48 kHz and so does the stream).
 5. The pipe still works next to it. From an elevated prompt, with `$cli` as
    in section 7:
 
@@ -1057,10 +1061,12 @@ earlier ones. Keep the service **stopped** until step 3
    Listen for clicks, repeats or drift over a few minutes.
 
 5. **Switch to 96 kHz / 24 bit.** Stop playback, set Format to **24 bit,
-   96000 Hz**, play again. Expected: the service log shows it reconfigure to
-   UHQ (if the buds offer it; otherwise it resamples), sound continues,
-   DebugView shows a new stream with `96000 Hz` and `tap ring 192000 bytes`.
-   Switch back to 48 kHz once and play again.
+   96000 Hz**, play again. Expected: the service log has `Windows device
+   format for ... is 96000 Hz/24: driver default set` and shows it
+   reconfigure to UHQ (if the buds offer it; otherwise it resamples), sound
+   continues, DebugView shows a new stream with `96000 Hz` and `tap ring
+   192000 bytes`. If the stream stays at 48 kHz, pause and resume playback
+   (section 17). Switch back to 48 kHz once and play again.
 
 6. **Stopping the service unplugs the device.** While music plays, press
    Ctrl+C in the service window. Expected, DebugView:
@@ -1635,7 +1641,7 @@ per minute on a link that sounds perfect, the threshold is too tight for
 this PC: send the log (15g) and use 15f meanwhile.
 
 Repeat at 96 kHz (Settings > Sound > the buds > Format **24 bit, 96000 Hz**,
-as in 12 step 5). Link up then logs
+as in 12 step 5; pause and resume if the stream does not switch, section 17). Link up then logs
 `adaptive bitrate: 584 / 291 (2 frames/packet) / 152 (2 frames/packet) kbps`
 and the statistics `rate=584kbps`.
 
@@ -1973,3 +1979,74 @@ exit with 0. Compare the values with `service.log`: the mode and bitrate of
 
 Audio does not depend on any of this: a service without a working status
 pipe streams exactly as before, and says so once in its log.
+
+---
+
+## 17. Choosing the format: HiFi or UHQ
+
+The format picked for the buds in **Settings > System > Sound > the buds >
+Output settings > Format** decides the rate Windows plays at, and with it
+the mode sent to the buds:
+
+| Format in the sound settings | Windows plays at | Sent to the buds (if they offer it) |
+|---|---|---|
+| **24 bit, 96000 Hz** | 96 kHz / 24 | UHQ |
+| **24 bit, 48000 Hz** | 48 kHz / 24 | Seamless HiFi |
+| **16 bit, 48000 Hz** | 48 kHz / 16 | Seamless HiFi (16-bit widened) |
+
+Why the service is involved at all: Windows does not open the endpoint's
+stream in the format picked there. It asks the endpoint for its *default*
+format and uses that (`docs/DESIGN.md`, "Format selection"). The service
+therefore watches the format picked in the sound settings and makes it the
+endpoint's default (driver protocol 4; an older driver always plays at
+48 kHz and the service says so once in its log).
+
+To pick UHQ: choose **24 bit, 96000 Hz**. The service log then has
+
+```
+... INFO  [AABBCCDDEEFF] Windows device format for AABBCCDDEEFF is 96000 Hz/24: driver default set
+```
+
+and DebugView `crossc: acx: default format 96000 Hz, 24-bit (lists updated; stored 0x0)`.
+The next stream Windows opens is at 96 kHz: the service reconfigures to UHQ
+(`configuring SEP ... for endpoint format 96000 Hz, ...: UHQ ...`).
+
+**If it does not switch** (the music keeps playing at 48 kHz), pause and
+resume playback. A stream that is already open keeps its format; whether
+Windows reopens it by itself on the change has not been seen yet. The
+service warns when this is the case:
+
+```
+... WARN  [AABBCCDDEEFF] Windows still renders at 48000 Hz/24 although the driver default is now 96000 Hz/24: the change applies when playback restarts (pause and resume playback)
+```
+
+If even a new stream comes at 48 kHz, wait until Windows closes the stream
+(a few seconds of silence; DebugView `stream stopped`) and play again. If it
+still does not switch, report it with the service log and the DebugView
+trace.
+
+The choice is also stored in the buds' device key (`DefaultSampleRate`,
+`DefaultBits` under `HKLM\SYSTEM\CurrentControlSet\Enum\<instance>\Device
+Parameters`), so the endpoint starts with it after a reboot or a reconnect,
+before the service runs. The service needs no setting for any of this.
+
+### 17a. Live test (user, service of this build installed)
+
+1. Pick **24 bit, 48000 Hz**, play music. Expected: HiFi, as before. The log
+   has `Windows device format for ... is 48000 Hz/24: driver default already
+   set` (or `... set`, the first time).
+2. Pick **24 bit, 96000 Hz** while the music plays. Note whether the stream
+   switches by itself (DebugView: a new `stream created: RAW mode, 96000 Hz`;
+   service: `UHQ`), or only after pause and resume, or the warning above
+   appears. All three are expected outcomes for now; which one it is, is
+   what this test is for.
+3. Pick **16 bit, 48000 Hz**, then **24 bit, 48000 Hz** again; each time a
+   `driver default set` line, and after a pause and resume the stream in
+   that format.
+4. Reboot (or disconnect and reconnect the buds) with 96000 Hz picked, and
+   play before anything else: the first stream should be at 96 kHz.
+5. `reg query "HKLM\SYSTEM\CurrentControlSet\Enum\<instance>\Device Parameters" /v DefaultSampleRate`
+   (admin) shows the last choice.
+
+Send: the service log lines of each step, and the DebugView lines with
+`default format` and `stream created`.

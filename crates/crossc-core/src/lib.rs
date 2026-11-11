@@ -20,6 +20,10 @@
 //!   the device, with the Bluetooth connection probe.
 //! * [`volume`]: who applies the endpoint volume (Windows, the buds over
 //!   AVRCP, or a software gain here) and the gain stage.
+//! * [`winformat`]: the format picked for the buds in the Windows sound
+//!   settings (where it is, how it is matched and parsed) and the decisions
+//!   that make the driver's default format follow it; [`format_watch`]
+//!   (Windows) watches it in the registry.
 //! * [`log`], [`stop`]: logging and shutdown seams.
 //! * [`fake`] (tests, or the `testing` feature): a fake AVDTP sink and a
 //!   fake driver.
@@ -31,6 +35,8 @@ pub mod device;
 pub mod driver;
 #[cfg(any(test, feature = "testing"))]
 pub mod fake;
+#[cfg(windows)]
+pub mod format_watch;
 pub mod hex;
 pub mod log;
 pub mod media;
@@ -49,3 +55,4 @@ pub mod ssc;
 pub mod stop;
 pub mod stream;
 pub mod volume;
+pub mod winformat;

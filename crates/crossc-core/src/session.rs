@@ -45,6 +45,14 @@
 //! * Stop request (any state): CLOSE the stream, close the channels,
 //!   AUDIO_SET_LINK(false), cancel ATTACH.
 //!
+//! With a [`FormatSource`] ([`Session::set_format_source`]) the session also
+//! makes the driver's default format follow the format picked for the buds
+//! in the Windows sound settings, in every state with the driver attached
+//! ([`crate::winformat`]): SET_DEFAULT_FORMAT once per change, one log line
+//! per change, and a warning when the engine is still rendering the old
+//! format [`crate::winformat::APPLY_GRACE`] after the default was set (it
+//! takes the new one with its next stream).
+//!
 //! Commands the sink sends on the signaling channel are answered in every
 //! state that has the channel open ([`crate::peer`]). Nothing here panics:
 //! every failure is logged and leads to one of the states above.
@@ -70,6 +78,7 @@ use crate::ssc::{SscSep, choose_ssc, local_caps};
 use crate::stop::StopSignal;
 use crate::stream::Pipeline;
 use crate::volume::{self, Decision, VolumeMode};
+use crate::winformat::{FormatSource, FormatSync, Step, short};
 
 /// How often the driver is retried while it cannot be attached.
 pub const DRIVER_RETRY: Duration = Duration::from_secs(10);
@@ -405,6 +414,10 @@ pub struct Session<D: Driver, P: LinkProbe, K: Clock> {
     driver: Option<(u32, u32)>,
     /// Why the session is where it is (see [`SessionStatus::reason`]).
     reason: String,
+    /// Where the Windows device format comes from, if anywhere.
+    formats: Option<Box<dyn FormatSource>>,
+    /// What to do about it.
+    fsync: FormatSync,
 }
 
 impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
@@ -446,7 +459,15 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             totals: Totals::default(),
             driver: None,
             reason: String::new(),
+            formats: None,
+            fsync: FormatSync::new(),
         }
+    }
+
+    /// Make the driver's default format follow what `source` reports (the
+    /// format picked for the buds in the Windows sound settings).
+    pub fn set_format_source(&mut self, source: Box<dyn FormatSource>) {
+        self.formats = Some(source);
     }
 
     /// Log stream statistics this often instead of every [`STATS_EVERY`].
@@ -536,6 +557,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             self.shutdown();
             return;
         }
+        self.sync_format();
         match self.phase {
             Phase::WaitDriver => self.step_wait_driver(),
             Phase::WaitLink => self.step_wait_link(),
@@ -588,6 +610,67 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             }
         } else {
             sig.trace.clear();
+        }
+    }
+
+    // -- the Windows device format ------------------------------------------
+
+    /// Take a new Windows format from the source, and act on it while the
+    /// driver is attached (see [`FormatSync`]). Cheap when nothing changed.
+    fn sync_format(&mut self) {
+        let Some(src) = self.formats.as_mut() else {
+            return;
+        };
+        if src.changed() {
+            let f = src.current();
+            self.fsync.report(f);
+        }
+        let Some((_, protocol)) = self.driver else {
+            return;
+        };
+        let id = self.name.clone();
+        match self.fsync.decide(protocol, self.audio.default_format) {
+            Step::Nothing => {}
+            Step::OldDriver(w) => self.warn(&format!(
+                "Windows device format for {id} is {}: this driver (protocol v{protocol}) cannot take it as its default, so Windows keeps playing at 48000 Hz; update the driver",
+                short(w)
+            )),
+            Step::NotOffered(w) => self.info(&format!(
+                "Windows device format for {id} is {}: the endpoint does not offer it; driver default left as it is",
+                short(w)
+            )),
+            Step::AlreadySet(t) => self.info(&format!(
+                "Windows device format for {id} is {}: driver default already set",
+                short(t)
+            )),
+            Step::Send(t) => match self.drv.set_default_format(t) {
+                Ok(()) => {
+                    // A later failure is news again, not a repeat.
+                    self.limiter.forget("default-format");
+                    self.fsync.applied(t);
+                    self.info(&format!(
+                        "Windows device format for {id} is {}: driver default set",
+                        short(t)
+                    ));
+                }
+                Err(e) => self.error_once(
+                    "default-format",
+                    &format!(
+                        "Windows device format for {id} is {}: setting the driver default failed: {e}",
+                        short(t)
+                    ),
+                ),
+            },
+        }
+        let now = self.clock.now();
+        if self.fsync.check(now, self.audio.stream, self.audio.format)
+            && let Some(t) = self.fsync.applying()
+        {
+            self.warn(&format!(
+                "Windows still renders at {} although the driver default is now {}: the change applies when playback restarts (pause and resume playback)",
+                short(self.audio.format),
+                short(t)
+            ));
         }
     }
 
@@ -794,6 +877,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
     fn on_detached(&mut self, why: &str) {
         self.reason = format!("the driver detached the session ({why})");
         self.driver = None;
+        self.fsync.driver_lost();
         // The stream it was reported for is gone.
         self.last_delay = None;
         self.error_once(
@@ -1169,6 +1253,9 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             }
         } else if running {
             timeout = timeout.min(link.next_start.saturating_sub(now));
+        }
+        if let Some(t) = self.fsync.deadline() {
+            timeout = timeout.min(t.saturating_sub(now));
         }
         let interest = Interest {
             signaling: Some(link.sig.ch.id),

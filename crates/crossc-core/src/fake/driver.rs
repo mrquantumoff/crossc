@@ -27,6 +27,7 @@ use crate::channel::{ChanError, SduChannel};
 use crate::driver::{Driver, Interest, LinkProbe, PcmChunk, Wake};
 use crate::pace::Clock;
 use crate::stop::StopSignal;
+use crate::winformat::FormatSource;
 
 /// Calls at one instant of virtual time before the fake declares a livelock.
 const SPIN_LIMIT: u32 = 20_000;
@@ -58,6 +59,17 @@ pub struct FakeState {
     pub link_calls: Vec<(Duration, bool)>,
     /// Fail SET_LINK with this Win32 code.
     pub set_link_error: Option<u32>,
+    /// Every SET_DEFAULT_FORMAT, with its time.
+    pub default_calls: Vec<(Duration, PcmFormat)>,
+    /// Fail SET_DEFAULT_FORMAT with this Win32 code.
+    pub default_error: Option<u32>,
+    /// The Windows device format the format source reports, and a counter
+    /// of its changes ([`FakeState::set_windows_format`]).
+    pub windows_format: Option<PcmFormat>,
+    windows_changes: u64,
+    /// A change of it ends the next wait early, as the real format
+    /// watcher's event does (`RealDriver::set_wake`).
+    windows_wake: bool,
     /// Endpoint period: one PCM chunk of this length while running.
     pub period: Duration,
     /// Chunks the driver's ring holds for a slow reader. When it is full
@@ -177,11 +189,17 @@ impl FakeState {
             state: AudioState {
                 seq: 1,
                 flags: AUDIO_FLAG_ACX,
+                default_format: FMT_48K_24,
                 ..AudioState::default()
             },
             detached: None,
             link_calls: Vec::new(),
             set_link_error: None,
+            default_calls: Vec::new(),
+            default_error: None,
+            windows_format: None,
+            windows_changes: 0,
+            windows_wake: false,
             period: Duration::from_millis(10),
             ring_chunks: 16,
             pcm_next: Duration::ZERO,
@@ -294,6 +312,21 @@ impl FakeState {
         }
         self.state.stream = stream;
         self.state.format = format;
+        self.bump();
+    }
+
+    /// The format picked in the Windows sound settings changes (what the
+    /// format source reports, see [`FakeDriver::format_source`]).
+    pub fn set_windows_format(&mut self, f: Option<PcmFormat>) {
+        self.windows_format = f;
+        self.windows_changes += 1;
+        self.windows_wake = true;
+    }
+
+    /// The driver restarts with `f` as its default (as after a reboot with
+    /// the choice stored), or a v3 driver (all zero).
+    pub fn set_default_format(&mut self, f: PcmFormat) {
+        self.state.default_format = f;
         self.bump();
     }
 
@@ -593,6 +626,14 @@ impl FakeDriver {
     pub fn clock(&self) -> FakeClock {
         FakeClock(self.clone())
     }
+
+    /// The Windows format source that goes with this driver.
+    pub fn format_source(&self) -> FakeFormats {
+        FakeFormats {
+            drv: self.clone(),
+            seen: 0,
+        }
+    }
 }
 
 impl Driver for FakeDriver {
@@ -678,6 +719,27 @@ impl Driver for FakeDriver {
         s.link_calls.push((now, connected));
         if s.link() != connected {
             s.state.flags ^= AUDIO_FLAG_LINK;
+            s.bump();
+        }
+        Ok(())
+    }
+
+    fn set_default_format(&self, format: PcmFormat) -> Result<(), ChanError> {
+        let mut s = self.0.borrow_mut();
+        s.record(format!("set_default({})", format.sample_rate));
+        if s.protocol_version < 4 {
+            return Err(os(1, "DeviceIoControl"));
+        }
+        let now = s.now;
+        s.default_calls.push((now, format));
+        if let Some(code) = s.default_error {
+            return Err(os(code, "DeviceIoControl"));
+        }
+        if ioc::audio::offered_index(&format).is_none() {
+            return Err(os(87, "DeviceIoControl"));
+        }
+        if s.state.default_format != format {
+            s.state.default_format = format;
             s.bump();
         }
         Ok(())
@@ -840,6 +902,9 @@ impl Driver for FakeDriver {
             if let Some(e) = s.detached.take() {
                 return Wake::Detached(e);
             }
+            if std::mem::take(&mut s.windows_wake) {
+                return Wake::Timeout;
+            }
             if let Some(id) = interest.signaling {
                 match s.channel_kind(id) {
                     Some(true) => {
@@ -907,6 +972,24 @@ impl LinkProbe for FakeLink {
             return Err("no radio".into());
         }
         Ok(s.connected)
+    }
+}
+
+/// [`FormatSource`] answering from the fake's `windows_format`.
+pub struct FakeFormats {
+    drv: FakeDriver,
+    seen: u64,
+}
+
+impl FormatSource for FakeFormats {
+    fn changed(&mut self) -> bool {
+        let n = self.drv.0.borrow().windows_changes;
+        let changed = n != self.seen;
+        self.seen = n;
+        changed
+    }
+    fn current(&self) -> Option<PcmFormat> {
+        self.drv.0.borrow().windows_format
     }
 }
 

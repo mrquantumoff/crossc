@@ -9,6 +9,7 @@ use std::thread::JoinHandle;
 
 use crossc_core::device::{self, Device};
 use crossc_core::driver::LinkProbe;
+use crossc_core::format_watch::FormatWatch;
 use crossc_core::log::{Level, Log};
 use crossc_core::pace::WallClock;
 use crossc_core::real::{BluetoothLink, RealDriver, device_name};
@@ -61,6 +62,21 @@ fn session_thread(path: String, stop: StopSignal, settings: Settings, log: Arc<d
     let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) };
     let run = AssertUnwindSafe(|| {
         let driver = RealDriver::new(&path, stop.clone());
+        // The format picked for the buds in the sound settings, watched on
+        // a helper thread; the driver's waits end when it changes.
+        let watch = match FormatWatch::start(&path, log.clone(), &name) {
+            Ok(w) => {
+                driver.set_wake(w.wake_event());
+                Some(w)
+            }
+            Err(e) => {
+                log.log(
+                    Level::Error,
+                    &format!("[{name}] the Windows device format is not followed: {e}"),
+                );
+                None
+            }
+        };
         let mut session = Session::new(
             driver,
             BluetoothLink,
@@ -70,6 +86,9 @@ fn session_thread(path: String, stop: StopSignal, settings: Settings, log: Arc<d
             stop.clone(),
             &name,
         );
+        if let Some(w) = watch {
+            session.set_format_source(Box::new(w));
+        }
         // The buds' Bluetooth name, as Windows has it (asked at the start
         // and when the buds have been seen, never while audio streams).
         let addr = addr_from_path(&path);
@@ -170,8 +189,16 @@ pub fn fmt_audio(s: &AudioState) -> String {
             s.format.container_bits
         ),
     };
+    let default = if s.default_format.is_valid() {
+        format!(
+            ", default format {} Hz/{}",
+            s.default_format.sample_rate, s.default_format.valid_bits
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "endpoint {}, service attached: {}, link: {}, stream: {stream}, frames rendered {} / dropped {}; volume: {}",
+        "endpoint {}{default}, service attached: {}, link: {}, stream: {stream}, frames rendered {} / dropped {}; volume: {}",
         if s.acx() { "on" } else { "off (ACX disabled)" },
         yes_no(s.attached()),
         if s.link() { "up" } else { "down" },
@@ -271,10 +298,11 @@ mod tests {
             frames_rendered: 1000,
             frames_dropped: 7,
             volume: Default::default(),
+            default_format: crossc_ioctl::audio::OFFERED_FORMATS[1],
         };
         assert_eq!(
             fmt_audio(&s),
-            "endpoint on, service attached: yes, link: up, stream: running (96000 Hz, 2 ch, 24-bit in 32), frames rendered 1000 / dropped 7; volume: no hardware volume (Windows scales the PCM)"
+            "endpoint on, default format 96000 Hz/24, service attached: yes, link: up, stream: running (96000 Hz, 2 ch, 24-bit in 32), frames rendered 1000 / dropped 7; volume: no hardware volume (Windows scales the PCM)"
         );
         let idle = fmt_audio(&AudioState::default());
         assert!(

@@ -525,6 +525,17 @@ impl Device {
         .map(|_| ())
     }
 
+    /// AUDIO_SET_DEFAULT_FORMAT (protocol 4; any admin handle).
+    pub fn set_default_format(&self, format: audio::PcmFormat) -> Result<(), ChanError> {
+        self.ioctl(
+            audio::IOCTL_AUDIO_SET_DEFAULT_FORMAT,
+            &audio::SetDefaultFormatRequest { format }.encode(),
+            &mut [],
+            Some(Duration::from_secs(5)),
+        )
+        .map(|_| ())
+    }
+
     /// AUDIO_WAIT_EVENT, left pending: completes once the state's sequence
     /// number differs from `seq`. Decode the reply with [`decode_state`].
     pub fn start_wait_event(&self, seq: u32) -> Result<Pending, ChanError> {

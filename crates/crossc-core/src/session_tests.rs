@@ -248,7 +248,7 @@ fn happy_path_48k_hifi() {
         stats[0].1
     );
     assert!(r.logged("link up: HiFi 48 kHz/24: config 0x0c, 229 kbps") == 1);
-    assert!(r.logged("attached: driver 0.1.0 (protocol v3), buds AA:BB:CC:DD:EE:FF") == 1);
+    assert!(r.logged("attached: driver 0.1.0 (protocol v4), buds AA:BB:CC:DD:EE:FF") == 1);
 }
 
 #[test]
@@ -2848,7 +2848,7 @@ mod status {
             (Phase::Ready, Some(true), false)
         );
         assert_eq!(st.reason, "");
-        assert_eq!(st.driver, Some((1 << 16, 3)));
+        assert_eq!(st.driver, Some((1 << 16, 4)));
         // The fake driver's state names a format from the start.
         assert_eq!(st.endpoint, Some(FMT_48K_24));
         let l = st.link.expect("a link");
@@ -3162,4 +3162,212 @@ mod status {
         assert_eq!(r.s.status().reason, "");
         r.run_to(r.fake.now().as_secs_f64() + 1.0);
     }
+}
+
+// -- the Windows device format ------------------------------------------------
+
+/// A rig whose session follows the fake's Windows format.
+fn rig_formats() -> Rig {
+    let mut r = rig();
+    let src = r.fake.format_source();
+    r.s.set_format_source(Box::new(src));
+    r
+}
+
+fn default_calls(r: &Rig) -> Vec<(u64, u32)> {
+    r.fake.with(|s| {
+        s.default_calls
+            .iter()
+            .map(|(t, f)| (t.as_millis() as u64, f.sample_rate))
+            .collect()
+    })
+}
+
+#[test]
+fn the_windows_format_becomes_the_driver_default_once_per_change() {
+    let mut r = rig_formats();
+    r.fake.with(|s| s.set_windows_format(Some(FMT_96K_24)));
+    // The same choice reported again, then 48 kHz, then 16-bit, then the
+    // endpoint gone (nothing to do), then 16-bit again (already set).
+    r.at(3.0, |s| s.set_windows_format(Some(FMT_96K_24)))
+        .at(5.0, |s| s.set_windows_format(Some(FMT_48K_24)))
+        .at(7.0, |s| s.set_windows_format(Some(FMT_48K_16)))
+        .at(8.0, |s| s.set_windows_format(None))
+        .at(9.0, |s| s.set_windows_format(Some(FMT_48K_16)));
+    r.run_to(12.0);
+    assert_eq!(
+        default_calls(&r),
+        [(0, 96000), (5000, 48000), (7000, 48000)],
+        "{}",
+        r.log.text()
+    );
+    assert_eq!(r.fake.with(|s| s.state.default_format), FMT_48K_16);
+    let set = r.log.find(": driver default set");
+    assert_eq!(set.len(), 3, "{set:?}");
+    assert!(
+        set[0]
+            .1
+            .ends_with("Windows device format for buds is 96000 Hz/24: driver default set"),
+        "{set:?}"
+    );
+    assert!(set[2].1.contains("48000 Hz/16"), "{set:?}");
+    assert_eq!(r.log.find("driver default already set").len(), 1);
+    // The session never waited on it: everything else ran as usual.
+    assert_eq!(r.s.phase(), Phase::Stopped);
+}
+
+#[test]
+fn without_a_source_nothing_is_sent() {
+    let mut r = rig();
+    r.fake.with(|s| s.set_windows_format(Some(FMT_96K_24)));
+    r.run_to(3.0);
+    assert!(default_calls(&r).is_empty());
+    assert!(r.log.find("Windows device format").is_empty());
+}
+
+#[test]
+fn a_v3_driver_is_used_without_the_default_and_said_once() {
+    let mut r = rig_formats();
+    r.fake.with(|s| {
+        s.protocol_version = 3;
+        s.set_default_format(PcmFormat::default());
+        s.set_windows_format(Some(FMT_96K_24));
+    });
+    r.stream(1.0, Running, FMT_48K_24)
+        .at(2.0, |s| s.set_windows_format(Some(FMT_48K_16)));
+    r.run_to(6.0);
+    assert!(default_calls(&r).is_empty());
+    let said = r.log.find("cannot take it as its default");
+    assert_eq!(said.len(), 1, "{}", r.log.text());
+    assert!(said[0].1.contains("protocol v3"), "{said:?}");
+    // It still plays.
+    assert_eq!(r.count("START"), 1);
+}
+
+#[test]
+fn a_v3_driver_with_windows_at_its_format_is_not_warned_about() {
+    let mut r = rig_formats();
+    r.fake.with(|s| {
+        s.protocol_version = 3;
+        s.set_default_format(PcmFormat::default());
+        s.set_windows_format(Some(FMT_48K_24));
+    });
+    // Played, detached and attached again: still quiet.
+    r.stream(1.0, Running, FMT_48K_24)
+        .at(2.0, |s| s.force_detach(995));
+    r.run_to(16.0);
+    assert!(default_calls(&r).is_empty());
+    assert!(
+        r.log.find("cannot take it as its default").is_empty(),
+        "{}",
+        r.log.text()
+    );
+    assert_eq!(
+        r.transitions()
+            .iter()
+            .filter(|t| t.1 == "wait-driver -> wait-link")
+            .count(),
+        2,
+        "{}",
+        r.log.text()
+    );
+}
+
+#[test]
+fn a_failed_default_is_not_retried_until_something_changes() {
+    let mut r = rig_formats();
+    r.fake.with(|s| {
+        s.default_error = Some(31);
+        s.set_windows_format(Some(FMT_96K_24));
+    });
+    r.stream(1.0, Running, FMT_48K_24);
+    r.run_to(8.0);
+    assert_eq!(default_calls(&r), [(0, 96000)], "{}", r.log.text());
+    assert_eq!(r.log.find("setting the driver default failed").len(), 1);
+    // A new attach compares again: sent once more, and it works now.
+    let mut r = rig_formats();
+    r.fake.with(|s| {
+        s.default_error = Some(31);
+        s.set_windows_format(Some(FMT_96K_24));
+    });
+    r.at(1.0, |s| {
+        s.default_error = None;
+        s.force_detach(995);
+    });
+    r.run_to(12.0);
+    assert_eq!(default_calls(&r), [(0, 96000), (11000, 96000)]);
+    assert_eq!(r.fake.with(|s| s.state.default_format), FMT_96K_24);
+}
+
+#[test]
+fn a_failure_after_a_success_is_logged_on_its_own() {
+    let mut r = rig_formats();
+    r.fake.with(|s| {
+        s.default_error = Some(31);
+        s.set_windows_format(Some(FMT_96K_24));
+    });
+    r.at(2.0, |s| {
+        s.default_error = None;
+        s.set_windows_format(Some(FMT_48K_16));
+    })
+    .at(4.0, |s| {
+        s.default_error = Some(31);
+        s.set_windows_format(Some(FMT_96K_24));
+    });
+    r.run_to(6.0);
+    assert_eq!(
+        default_calls(&r),
+        [(0, 96000), (2000, 48000), (4000, 96000)],
+        "{}",
+        r.log.text()
+    );
+    let failed = r.log.find("setting the driver default failed");
+    assert_eq!(failed.len(), 2, "{}", r.log.text());
+    assert!(!failed[1].1.contains("repeated"), "{failed:?}");
+}
+
+#[test]
+fn a_driver_that_kept_the_choice_is_left_alone_after_a_reattach() {
+    let mut r = rig_formats();
+    r.fake.with(|s| s.set_windows_format(Some(FMT_96K_24)));
+    // Detached, and back with the stored default (the device restarted).
+    r.at(1.0, |s| s.force_detach(995));
+    r.run_to(13.0);
+    assert_eq!(default_calls(&r), [(0, 96000)], "{}", r.log.text());
+    assert_eq!(
+        r.transitions()
+            .iter()
+            .filter(|t| t.1 == "wait-driver -> wait-link")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn an_engine_that_keeps_the_old_format_is_reported_once() {
+    let mut r = rig_formats();
+    r.fake.with(|s| s.set_windows_format(Some(FMT_48K_24)));
+    r.stream(1.0, Running, FMT_48K_24)
+        .at(2.0, |s| s.set_windows_format(Some(FMT_96K_24)))
+        // Playback restarted: the new stream has the new default.
+        .stream(12.0, Paused, FMT_48K_24)
+        .stream(12.5, Running, FMT_96K_24);
+    r.run_to(20.0);
+    assert_eq!(default_calls(&r), [(2000, 96000)], "{}", r.log.text());
+    let warned = r.log.find("Windows still renders at");
+    assert_eq!(warned.len(), 1, "{}", r.log.text());
+    // Five seconds after the default was set, not later.
+    assert_eq!(warned[0].0, 7000, "{warned:?}");
+    assert!(
+        warned[0].1.contains(
+            "48000 Hz/24 although the driver default is now 96000 Hz/24: the change applies when playback restarts"
+        ),
+        "{warned:?}"
+    );
+    // Following at once: never a word.
+    let mut r = rig_formats();
+    r.fake.with(|s| s.set_windows_format(Some(FMT_96K_24)));
+    r.stream(1.0, Running, FMT_96K_24);
+    r.run_to(10.0);
+    assert!(r.log.find("Windows still renders").is_empty());
 }
