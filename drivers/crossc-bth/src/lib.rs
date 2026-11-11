@@ -109,7 +109,7 @@ use wdk_sys::*;
 
 /// Driver version reported by GET_INFO: `major << 24 | minor << 16 | patch`
 /// (keep in sync with Cargo.toml `version`).
-const DRIVER_VERSION: u32 = (1 << 16) | 1; // 0.1.1
+const DRIVER_VERSION: u32 = 2 << 16; // 0.2.0
 const INCOMING_QUEUE_DEPTH: u8 = 50;
 /// Max forwarded requests (open/read/write) in flight per channel.
 const MAX_PENDING_PER_CHANNEL: u32 = 32;
