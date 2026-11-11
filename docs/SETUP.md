@@ -1518,3 +1518,359 @@ it back on.
 
 The DebugView log from node start through 14c-14g, `service.log`, the output
 of `& $cli info`, and the `pnputil` output of 14b.
+
+## 15. Adaptive bitrate live test
+
+**What this build adds.** The service no longer sends one fixed bitrate. It
+starts at the configured rate and steps down a ladder while the Bluetooth
+link is congested, then back up when the link is clean again:
+
+| Mode | Rates, kbps | Packets |
+|---|---|---|
+| HiFi 48 kHz/24 | 192 / 128 / 88 | 496 / 336 / 236 bytes, one every 18 ms |
+| UHQ 96 kHz/24 | 584 / 291 / 152 | 672 bytes every 9 ms, then two frames per packet: 672 / 360 bytes every 18 ms |
+| plain SSC (older buds) | 229 / 128 / 88 | 588 / 336 / 236 bytes |
+
+The rate is in every SSC frame, so a change needs no reconfiguration and
+the stream does not stop. Design, signals and constants: `docs/DESIGN.md`,
+"Adaptive bitrate". **Only the service and `crossc-cli` changed. The driver
+is not touched: keep the 0.2.0 driver that is installed.**
+
+**Not tested live.** The controller and the session pass their tests against
+a simulated link (a fake driver whose WRITEs block when the link carries less
+than the stream). Three things only real buds can show, and this section is
+there to find them out:
+
+1. Whether a congested link shows up as slow WRITEs at all. The controller's
+   one congestion signal is the time a media WRITE takes; the assumption is
+   that the Bluetooth stack holds a WRITE while the radio has no buffer free.
+   If it does not, no rate change is ever made (one rate, as 0.2.0 sent)
+   and 15d says how to tell.
+2. Whether the buds take two frames per packet at UHQ 291 / 152 kbps from
+   this stack, and switch rates without a click.
+3. Whether the thresholds fit: no step down on a good link, a step down
+   before the audio breaks up on a bad one.
+4. Whether the service can tell catching up from congestion. After one
+   stalled WRITE, or at START, it sends what has piled up back to back;
+   WRITEs that then take up to a packet time are the link doing what it
+   can and must not step the rate down. It recognises that by not having
+   had to wait for the audio (less than 1/8 of a packet time, 1.1 ms in
+   UHQ). 15b and 15d say what to look for.
+
+Settings, replacing the table in 11d (`HKLM\SOFTWARE\crossc`, read when the
+service starts):
+
+| Value | Type | Default | Meaning |
+|---|---|---|---|
+| `AdaptiveBitrate` | DWORD | `1` | `1`: the bitrate follows the link. `0`: one fixed rate, the configured one (after the two rules below). |
+| `HifiBitrate` | DWORD | `192` | Highest HiFi rate in kbps: 88, 96, 128, 192 or 229. 256 and 328 are no longer sent (the buds' decoder takes 229 at most at 48 kHz): they give 229. |
+| `UhqBitrate` | DWORD | `584` | Highest UHQ rate in kbps: 152, 291 or 584. 250, 308 and 442 are no longer sent (not known to be decoded): they give the next rate below, 152 or 291. |
+| `UhqConfig`, `LogLevel` | | | as in 11d |
+
+A rate that is lowered this way is named in a warning in the log
+(`... is not a rate the buds are known to decode; using 291 kbps, the next
+one below`). Anything else that is not valid is ignored with a warning, and
+the default is used, as before. The same list of rates is used when a
+packet does not fit the media MTU: UHQ then falls back from 584 to 291 kbps
+(0.2.0 took 442). Both rules apply with `AdaptiveBitrate = 0` too.
+
+### 15a. Install the service (admin)
+
+```powershell
+cd C:\src\crossc
+cargo build --release -p crossc-service -p crossc-cli
+$svc = "C:\src\crossc\target\release\crossc-service.exe"
+$cli = "C:\src\crossc\target\release\crossc-cli.exe"
+& $svc uninstall; & $svc install --start
+Get-Content C:\ProgramData\crossc\service.log -Tail 40 -Wait
+```
+
+Take the buds out of the case. New lines at start and at link up:
+
+```
+... INFO  crossc-service x.y.z starting as a service; settings: UhqConfig=0x0a HifiBitrate=192 UhqBitrate=584 AdaptiveBitrate=1 LogLevel=info
+... INFO  [AABBCCDDEEFF] adaptive bitrate: 192 / 128 / 88 kbps
+... INFO  [AABBCCDDEEFF] link up: HiFi 48 kHz/24: config 0x0c, 192 kbps, 1 frame(s)/packet, 496-byte packets, input I24
+```
+
+### 15b. Baseline: a good link must stay at the top (user)
+
+Play music for three minutes with the buds in your ears, sitting at the PC.
+The statistics line (once a minute) now ends with the bitrate fields:
+
+```
+... stats: packets=3333 frames_in=2880000 dropped=0 discontinuities=0 write avg=180us max=950us sink_delay=250.0ms rate=192kbps at[192k=60.0s 128k=0.0s 88k=0.0s] rate_changes=0 slow_writes=0 late_max=3ms
+```
+
+| Field | Meaning | Expected here |
+|---|---|---|
+| `rate` | the bitrate at the time of the line | `192kbps` |
+| `at[...]` | seconds of audio sent at each rate since the last line | all at the top rate |
+| `rate_changes` | changes since the last line | `0` |
+| `slow_writes` | WRITEs that took a quarter of a packet's audio time or more (4.5 ms for HiFi, 2.25 ms for UHQ at 584 kbps), whether or not they counted as congestion | `0`, or a handful |
+| `late_max` | the furthest the service was behind the endpoint's clock while it rendered (a pause does not count) | a few ms |
+
+No `bitrate` line may appear, also not in the first seconds after playback
+starts or resumes, and not after pausing and resuming the player a few
+times (pauses under 3 s do not suspend the stream). Note `write avg` and
+`max`: they are the healthy figures the rest is compared with. If `slow_writes` is in the dozens
+per minute on a link that sounds perfect, the threshold is too tight for
+this PC: send the log (15g) and use 15f meanwhile.
+
+Repeat at 96 kHz (Settings > Sound > the buds > Format **24 bit, 96000 Hz**,
+as in 12 step 5). Link up then logs
+`adaptive bitrate: 584 / 291 (2 frames/packet) / 152 (2 frames/packet) kbps`
+and the statistics `rate=584kbps`.
+
+### 15c. Provoke congestion (user)
+
+Keep the log tail of 15a open and music playing. Use something with steady
+high-frequency content (cymbals, applause): a lower rate is easiest to hear
+there. Try these in order, each for a minute or two, and note the time when
+you start and stop:
+
+1. **Walk away.** Leave the room with the buds in, close the door, go on
+   until the audio starts to stutter, stay a few steps short of that point
+   for a minute, then walk back.
+2. **Cover the buds.** Close both hands over your ears, or put the buds into
+   a closed fist or a pocket on the far side of your body from the PC. The
+   body absorbs 2.4 GHz well; this is a weak link without leaving the desk.
+3. **2.4 GHz Wi-Fi load.** Connect the PC to a 2.4 GHz Wi-Fi network (not
+   5 or 6 GHz) and run a large download or a speed test while the music
+   plays. A USB 3 disk or hub in use next to the Bluetooth adapter does the
+   same to it.
+4. **All of it at 96 kHz** (UHQ needs three times the air time of HiFi and
+   gives way first).
+
+What the log shows when it works, here walking away at 14:02:10 and coming
+back at 14:02:40:
+
+```
+... 14:02:11.297 INFO  [AABBCCDDEEFF] bitrate 192 -> 128 kbps: link congested (WRITE blocked 123 ms in 5 slow packets); 336-byte packets
+... 14:02:11.610 INFO  [AABBCCDDEEFF] bitrate 128 -> 88 kbps: link congested (WRITE blocked 106 ms in 4 slow packets); 236-byte packets
+... 14:02:22.590 INFO  [AABBCCDDEEFF] bitrate 88 -> 128 kbps: link clean for 10 s; 336-byte packets
+... 14:02:23.261 INFO  [AABBCCDDEEFF] bitrate 128 -> 88 kbps: link congested (WRITE blocked 112 ms in 5 slow packets); 236-byte packets
+... 14:02:43.510 INFO  [AABBCCDDEEFF] bitrate 88 -> 128 kbps: link clean for 20 s; 336-byte packets
+... 14:02:53.520 INFO  [AABBCCDDEEFF] bitrate 128 -> 192 kbps: link clean for 10 s; 496-byte packets
+... 14:03:00.000 INFO  [AABBCCDDEEFF] stats: packets=3333 ... write avg=1742us max=33066us ... rate=192kbps at[192k=17.8s 128k=11.0s 88k=31.2s] rate_changes=6 slow_writes=101 late_max=131ms
+```
+
+* Down is fast: within about 0.2 s of the WRITEs starting to block, one
+  rung at a time, the second no sooner than 0.3 s after the first and only
+  if the link is slower than the lower rate as well (WRITEs as long as a
+  packet plays).
+* Up is slow: one rung after 10 s of clean link. The third and fourth line
+  are a probe that failed (128 kbps was still too much); the next try for
+  that rate then waits 20 s, then 40, at most 80. Each rate keeps its own
+  wait (192 kbps was never refused here, so it follows after 10 s), and a
+  wait halves again for every 15 s the stream holds that rate. So a link
+  that stays bad settles at a lower rate, with a probe now and then.
+* At 96 kHz the first step reads
+  `bitrate 584 -> 291 kbps, 2 frame(s)/packet: link congested (...); 672-byte packets`.
+* Other reasons that can appear: `audio was dropped while WRITEs blocked`
+  (a stall that cost audio), and after
+  `link down: media write failed: timed out` the next link says
+  `a media write timed out on the last link: starting at 88 kbps`. Any
+  other `media write failed` (the buds went into the case or out of range
+  for good) leaves the next link at the top rate.
+
+Listen for: fewer and shorter dropouts at the edge of the range than with
+`AdaptiveBitrate = 0` (15f; do the same walk both ways), no click or gap at
+the moment of a `bitrate` line, and at 96 kHz normal sound after the step to
+two frames per packet.
+
+### 15d. Reading the result
+
+| What you see | What it means |
+|---|---|
+| `bitrate` lines while the link is bad, the rate back at the top some 10 to 30 s after it is good again | It works. |
+| Dropouts, but no `bitrate` line, `slow_writes=0` and `write max` as in 15b | The Bluetooth stack does not hold WRITEs when the link is congested: the signal is not there, the service behaves like 0.2.0, and a driver change is needed to see the link. Send the log. |
+| Dropouts, `slow_writes` well above 0, but no or late `bitrate` lines | WRITEs do block, the thresholds are too lax for this link. Send the log; the `stats` lines have what is needed. |
+| `bitrate` lines on a link that sounds perfect, or the rate going up and down every few seconds | Thresholds too tight, or something else on the PC stalls the WRITEs. Send the log, use 15f. |
+| A `bitrate ... link congested` line within a second or two after playback starts, or right after a single hiccup, on a link that is otherwise fine | Catching up was taken for congestion (point 4 above): reading and encoding a packet takes longer on this PC than assumed. Send the log with `LogLevel` set to `debug`. |
+| The rate goes down one rung and never comes back although the link sounds perfect, `slow_writes` in the hundreds per minute and `write avg` of several ms | WRITEs are slow for a reason that does not depend on the bitrate. The lower rate buys nothing here: use 15f and send the log. |
+| At 96 kHz the audio is garbled, silent or stutters right after `584 -> 291 kbps, 2 frame(s)/packet`, and is fine again after `291 -> 584` | The buds do not take two frames per packet from this stack. Set `AdaptiveBitrate` to `0` (15f) and report it. |
+| A click or a short gap exactly at a `bitrate` line | The buds do not switch rates seamlessly. Report at which step (which two rates). |
+| `link down: media write failed` | The WRITE itself failed (5 s without completing, or the link or channel is gone). The link is rebuilt as in 0.2.0; the new one starts at the lowest rate only after `timed out`. |
+
+### 15e. The same controller in `crossc-cli play` (admin)
+
+For a controlled signal instead of music. Stop the service first (one
+source at a time):
+
+```powershell
+Stop-Service crossc
+& $cli play --adaptive --seconds 120                 # HiFi, 192 / 128 / 88
+& $cli play --mode uhq --adaptive --seconds 120      # UHQ, 584 / 291 / 152
+& $cli play --bitrate 192 --seconds 120              # fixed rate, for comparison
+Start-Service crossc
+```
+
+`--adaptive` prints the ladder at the start, every change as it happens and a
+summary at the end:
+
+```
+adaptive bitrate: 192 / 128 / 88 kbps (down while WRITEs block, up after 10 s of clean link; changes are printed)
+[  41.310] bitrate 192 -> 128 kbps: link congested (WRITE blocked 118 ms in 6 slow packets); 336-byte packets
+[  52.140] bitrate 128 -> 192 kbps: link clean for 10 s; 496-byte packets
+bitrate: 2 change(s); audio sent at 192k=109.2s 128k=10.8s 88k=0.0s
+```
+
+Differences from the service: `play` keeps one frame per packet at every
+rate (also in UHQ, unless `--frames-per-packet` says otherwise), and the few
+packets it has already encoded still go out at the old rate. `--bitrate`
+and `--adaptive` exclude each other: `--bitrate` is exactly that rate.
+`-v` adds `rate=` to its statistics lines.
+
+### 15f. Turn it off, or lower the top (admin)
+
+```powershell
+reg add "HKLM\SOFTWARE\crossc" /v AdaptiveBitrate /t REG_DWORD /d 0 /f
+Restart-Service crossc
+```
+
+The log then has `AdaptiveBitrate=0` in the settings line and, at link up,
+`adaptive bitrate is off (AdaptiveBitrate=0): always 192 kbps`: one fixed
+rate, as 0.2.0 sent. The stream is 0.2.0's byte for byte, with two
+exceptions that do not depend on this switch (see the settings table
+above): a `HifiBitrate` or `UhqBitrate` the buds are not known to decode is
+lowered, and on a media MTU too small for 584 kbps UHQ falls back to 291
+instead of 442 kbps. Back on:
+
+```powershell
+reg delete "HKLM\SOFTWARE\crossc" /v AdaptiveBitrate /f
+Restart-Service crossc
+```
+
+To keep it on but start lower (for a place where the top rate never holds),
+set the top of the ladder instead, for example HiFi 128 / 88:
+
+```powershell
+reg add "HKLM\SOFTWARE\crossc" /v HifiBitrate /t REG_DWORD /d 128 /f
+Restart-Service crossc
+```
+
+### 15g. What to send
+
+`C:\ProgramData\crossc\service.log` covering 15b and 15c, with the times you
+started and stopped each of the four ways of spoiling the link, what you
+heard at each (`bitrate` line or not), the buds' model, and whether the PC's
+Bluetooth adapter is built in or a USB dongle. For 15e the console output.
+
+## 16. Tray app
+
+`crossc-tray.exe` is an icon in the notification area that shows what the
+service is sending to the buds, with a details window. It runs as the
+logged-on user, not elevated, and only reads: everything it shows comes from
+the service over the named pipe `\.\pipe\crossc-status` (the driver's IOCTLs
+are admin-only, so the tray never talks to the driver). It changes nothing
+about the stream.
+
+> The service publishes its status from the version that includes the status
+> pipe (see `crates/crossc-status/INTEGRATION.md`). With an older service the
+> tray runs and says "Service not running".
+
+### 16a. Run it
+
+```powershell
+cd $repo
+cargo build --release -p crossc-tray
+& .\target\release\crossc-tray.exe                 # the icon; starting it twice does nothing
+& .\target\release\crossc-tray.exe --print-once    # one status as text, then exit (0: got one)
+& .\target\release\crossc-tray.exe --demo          # made-up states, no service needed
+```
+
+`--demo` runs a script (no service, waiting, HiFi, UHQ, adaptive step down,
+reconnecting, two pairs of buds, version mismatch) so the icon and the window
+can be looked at without buds. `--demo-state <name>` holds one of `off`,
+`waiting`, `hifi`, `uhq`, `adaptive`, `reconnect`, `two`, `mismatch`,
+`nobuds`.
+
+### 16b. The icon
+
+Three ascending bars, a quality meter. New icons start in the overflow area
+(the `^` next to the clock); drag it onto the taskbar to keep it visible.
+
+| Icon | Meaning |
+|---|---|
+| bars dim, red cross | the service is not running (or has no status pipe) |
+| bars dim, amber dot | a problem that waiting does not fix: the service speaks another status protocol version, access denied, unreadable status |
+| bars dim | the service runs, no stream is open: buds not connected, driver not ready, reconnecting |
+| 1 / 2 / 3 bars lit in the taskbar's text colour | a stream is open and idle: plain SSC / Seamless HiFi / UHQ |
+| 1 / 2 / 3 bars lit green | audio is streaming in that mode |
+
+With two pairs of buds the one that plays gives the icon. The tooltip has one
+line per pair, for example `Buds4 Pro — UHQ 96 kHz/24 · 584 kbps`, or says
+what is wrong (`crossc — service not running`). The icon follows the taskbar's
+light or dark mode and its DPI, and comes back by itself after Explorer
+restarts.
+
+### 16c. The details window
+
+Left click (or Enter on the icon, or "Open details"): a window next to the
+notification area, one card per pair of buds, updated live (twice a second
+while audio streams). It closes when you click elsewhere, press Esc, or click
+the icon again. It has no taskbar button.
+
+| Field | Meaning |
+|---|---|
+| Title, badge | the buds' Bluetooth name (their address-based id if the name is unknown) and the link state |
+| Mode | UHQ (96 kHz / 24-bit), Seamless HiFi (48 kHz / 24-bit) or SSC (16-bit), with the SSC configuration octet sent to the buds |
+| Windows format | the format of the Windows endpoint: what you chose under Sound > Properties > Format. "nothing played yet" until the first stream |
+| Sent to the buds | rate and depth of the audio as sent. Underneath, if they differ from the Windows format: "resampled from ...", "16-bit input widened", "24-bit input dithered down" |
+| Bitrate | the bitrate in use now. Underneath: `fixed` (`AdaptiveBitrate=0`), `adaptive · ladder 584 / 291 / 152` (at the top; these are the steps), or in amber `stepped down · step 2 of 3 · top 584` while the link carries less |
+| Delay | the playback delay the buds reported (AVDTP delay report); "not reported" if they have not |
+| Volume | the level in percent, who applies the Windows slider, and "muted". `Buds (AVRCP)`: the buds themselves (hardware volume). `Software gain`: the service scales the audio because the buds do not answer. `Windows`: Windows scales the audio (`DisableAvrcpVolume`, or an older driver) |
+| State | waiting for the driver / buds not connected / ready / streaming / reconnecting, with the reason underneath (what the driver lacks, why the link went down, when the next attempt is) |
+| Packet | size of a media packet in bytes and the SSC frames in it; underneath the media MTU limit in use ("Copy details" also has how the limit was derived) |
+| Buds offer | the SSC capability octet of the buds (`0x3e` on Buds4 Pro) |
+| Driver | version of `crossc_bth` and the IOCTL protocol it speaks |
+| Packets sent, PCM frames | media packets sent, and PCM frames taken from the endpoint, since the service started this device's session |
+| Dropped frames | PCM frames the driver dropped because the service did not read them in time. Should stay 0 |
+| Discontinuities | gaps in the PCM the driver reported (a stream that stopped and started) |
+| Write errors | media writes that failed (each one takes the link down) |
+| Late packets | packets sent later than their schedule allows (40 ms or more behind the endpoint) |
+| Write latency | average and longest time a media write took in the current stream. Normally well under a millisecond; tens of milliseconds mean the link is congested |
+| Streaming for | how long the current stream has been running |
+| Reconnects | how often the link was set up again after a failure |
+| Amber / red line | the last warning or error of this device from the service's log, and how long ago |
+| Footer | the service's version, how long it has been running, the status protocol version |
+
+When there is no card the window says why: service not running, version
+mismatch (install the `crossc-tray.exe` that came with the service), access
+denied, or no buds with the crossc driver present.
+
+### 16d. The menu
+
+Right click:
+
+* **Open details**: the window of 16c.
+* **Copy details**: everything of 16c as text on the clipboard (plus the
+  bitrate ladder and how the MTU limit was derived). Paste it into a report.
+* **Open service log folder**: `%ProgramData%\crossc` in Explorer (the folder
+  the service names; only a plain local folder is ever opened).
+* **Start with Windows**: toggles the value `crossc-tray` under
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, pointing at this exe.
+  Per user, no elevation, nothing under HKLM. Ticked when the value points at
+  the exe that is running; if you move the exe, tick it again. To check or
+  remove it by hand:
+
+  ```powershell
+  reg query  "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v crossc-tray
+  reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v crossc-tray /f
+  ```
+
+* **Exit**: removes the icon and ends the tray (the service and the stream
+  are not touched).
+
+### 16e. What to expect
+
+* Idle, the tray is one small Win32 process (about 2 MB private memory) that
+  wakes when the service sends a status: every 2 s when nothing changes,
+  every 500 ms while audio streams, at once when the state changes. Without
+  the service it looks for the pipe every 5 s.
+* The details window is a second process of the same exe (`--flyout`) that
+  exists only while the window is open (about 65 MB working set).
+* Stop the service (`sc stop crossc`, admin): within a second the icon gets
+  the red cross and the tooltip says `crossc — service not running`. Start it
+  again: the icon follows within 5 s, without restarting the tray.

@@ -12,6 +12,8 @@
 //!   conversion (offline and streaming).
 //! * [`plan`], [`settings`]: which SSC mode a given endpoint format is sent
 //!   in, and the registry settings that tune it.
+//! * [`abr`]: the adaptive bitrate controller (which rate the next frame is
+//!   encoded at, from what the sender observes per packet).
 //! * [`driver`], [`stream`], [`session`]: the seam to the driver, the PCM to
 //!   packets pipeline, and the state machine that turns the endpoint's audio
 //!   into an SSC stream. [`real`] (Windows) is the seam's implementation on
@@ -22,6 +24,7 @@
 //! * [`fake`] (tests, or the `testing` feature): a fake AVDTP sink and a
 //!   fake driver.
 
+pub mod abr;
 pub mod channel;
 #[cfg(windows)]
 pub mod device;

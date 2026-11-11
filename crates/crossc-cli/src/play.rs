@@ -15,8 +15,18 @@
 //! frames back to back. No payload header octet, no fragmentation. The RTP
 //! timestamp advances by 1 per packet (what Samsung's stack is reported to do)
 //! or by the samples per packet (`--ts samples`).
+//!
+//! `--adaptive`: the bitrate follows the link with the service's controller
+//! ([`crossc_core::abr`]), from the mode's top rate down its ladder. The
+//! pacing thread tells the controller how long each WRITE took, how long it
+//! waited for the packet's send time and how late the packet went out; the
+//! producer encodes each packet at the rate the controller is at. Packets
+//! already encoded (at most [`ADAPTIVE_QUEUE`], plus the one in hand) still
+//! go out at the old rate, and the frames per packet stay as given, so the
+//! pacing schedule does not change with the rate. `--bitrate` is the
+//! opposite: exactly that rate, whatever happens.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -25,6 +35,7 @@ use avdtp::codec::SscFlags;
 use avdtp::msg;
 use avdtp::rtp::RtpHeader;
 use avdtp::signal::{MessageType, SignalId};
+use crossc_core::abr::{Abr, Ladder, Obs, Rate, write_error_is_congestion};
 use crossc_core::peer::{LocalStream, PeerEvent};
 pub use crossc_core::rtp::{KNOWN_BUDS_MEDIA_MTU, Packetizer, TsMode, packet_deadline};
 use crossc_core::ssc::{choose_ssc, local_caps};
@@ -133,13 +144,19 @@ pub struct PlayArgs {
     pub force_mtu: Option<usize>,
     pub force_config: bool,
     pub dry_run: bool,
+    /// The bitrate follows the link, from `bitrate` down the mode's ladder.
+    pub adaptive: bool,
 }
+
+/// Packets the producer may have encoded ahead in adaptive mode (16
+/// otherwise): this many more go out at the old rate after a change.
+pub const ADAPTIVE_QUEUE: usize = 2;
 
 pub const DEFAULT_SECONDS: f64 = 20.0;
 pub const DEFAULT_LEAD: u32 = 3;
 
 pub const PLAY_USAGE: &str =
-    "play [--mode hifi|uhq|ssc48|ssc44] [--config 0xNN] [--bitrate KBPS] [--frames-per-packet N]
+    "play [--mode hifi|uhq|ssc48|ssc44] [--config 0xNN] [--bitrate KBPS | --adaptive] [--frames-per-packet N]
      [--ts packets|samples] [--seconds S] [--tone HZ [--level DBFS] | --sweep | --wav PATH]
      [--no-delay-report] [--lead N] [--force-mtu N] [--force-config] [--dry-run]";
 
@@ -170,6 +187,7 @@ pub fn parse_play_args(args: &[String]) -> Result<PlayArgs, String> {
     let mut force_mtu = None;
     let mut force_config = false;
     let mut dry_run = false;
+    let mut adaptive = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = |what: &str| -> Result<u32, String> {
@@ -229,6 +247,7 @@ pub fn parse_play_args(args: &[String]) -> Result<PlayArgs, String> {
             "--force-mtu" => force_mtu = Some(val("--force-mtu")? as usize),
             "--force-config" => force_config = true,
             "--dry-run" => dry_run = true,
+            "--adaptive" => adaptive = true,
             o => {
                 return Err(format!(
                     "play: unknown argument {o:?}\nusage: crossc-cli {PLAY_USAGE}"
@@ -251,7 +270,22 @@ pub fn parse_play_args(args: &[String]) -> Result<PlayArgs, String> {
             dbfs: level,
         },
     };
+    if adaptive && kbps.is_some() {
+        return Err(
+            "--bitrate forces a fixed rate and --adaptive lets it follow the link: pick one".into(),
+        );
+    }
     let bitrate = match kbps {
+        // The ladder starts at the highest rate the buds are known to
+        // decode in the mode (plain SSC: 229, not the fixed default 328).
+        None if adaptive => {
+            let top = crossc_core::abr::decodable(mode.encoder_mode())[0];
+            if top.bps() < mode.default_bitrate().bps() {
+                top
+            } else {
+                mode.default_bitrate()
+            }
+        }
         None => mode.default_bitrate(),
         Some(k) => Bitrate::from_bps(k.saturating_mul(1000)).ok_or_else(|| {
             let all: Vec<String> = Bitrate::ALL
@@ -274,6 +308,7 @@ pub fn parse_play_args(args: &[String]) -> Result<PlayArgs, String> {
         force_mtu,
         force_config,
         dry_run,
+        adaptive,
     })
 }
 
@@ -292,6 +327,22 @@ impl PlayArgs {
     }
     pub fn packet_duration(&self) -> Duration {
         packet_deadline(1, self.fpp, self.mode.sample_rate())
+    }
+    /// The rates the stream may use: `bitrate` alone, or with `--adaptive`
+    /// the mode's ladder under it (every rung at `fpp` frames per packet,
+    /// so each fits wherever the top rate fits).
+    pub fn ladder(&self) -> Ladder {
+        let top = Rate {
+            bitrate: self.bitrate,
+            frames_per_packet: self.fpp,
+        };
+        Ladder::new(
+            self.mode.encoder_mode(),
+            top,
+            usize::MAX,
+            self.adaptive,
+            false,
+        )
     }
     /// Bitrate/mode combinations outside what is known to work.
     pub fn warnings(&self) -> Vec<String> {
@@ -479,13 +530,16 @@ impl EncodeStats {
     }
 }
 
-/// Generate and encode `total_frames` into `tx`, `fpp` frames per payload.
+/// Generate and encode `total_frames` into `tx`, `fpp` frames per payload,
+/// each payload at the rate of `ladder` that `rung` names when it is begun.
 /// Stops early when the receiver hangs up.
 fn produce(
     args: &PlayArgs,
     mut source: Source,
     total_frames: u64,
     tx: mpsc::SyncSender<Payload>,
+    ladder: &Ladder,
+    rung: &AtomicUsize,
 ) -> Result<EncodeStats, String> {
     let mut enc = Encoder::new_boxed(args.mode.encoder_mode(), source.channels())
         .map_err(|e| format!("encoder: {e}"))?;
@@ -498,11 +552,13 @@ fn produce(
             bytes: Vec::with_capacity(args.fpp * args.frame_bytes()),
             frames: 0,
         };
+        let rungs = ladder.rungs();
+        let bitrate = rungs[rung.load(Ordering::Relaxed).min(rungs.len() - 1)].bitrate;
         for _ in 0..args.fpp {
             source.fill(&mut buf); // past the end: silence (buffer zeroed)
             let t0 = Instant::now();
             let n = enc
-                .encode_frame(buf.pcm(), args.bitrate, &mut frame)
+                .encode_frame(buf.pcm(), bitrate, &mut frame)
                 .map_err(|e| format!("encoder: {e}"))?;
             st.encode_time += t0.elapsed();
             st.frames += 1;
@@ -604,6 +660,10 @@ pub struct Outcome {
     pub stats: Stats,
     pub encode: EncodeStats,
     pub delays: Vec<u16>,
+    /// Bitrate changes the controller made (`--adaptive`).
+    pub rate_changes: u32,
+    /// Audio sent at each rate of the ladder: "192k=12.3s 128k=7.7s".
+    pub rates: String,
 }
 
 impl Outcome {
@@ -615,6 +675,8 @@ impl Outcome {
             stats: Stats::default(),
             encode: EncodeStats::default(),
             delays,
+            rate_changes: 0,
+            rates: String::new(),
         }
     }
 }
@@ -652,7 +714,17 @@ pub fn stream_packets<M: SduChannel, K: Clock>(
     let total = args.total_frames(&source);
     let rate = args.mode.sample_rate();
     let lead = packet_deadline(u64::from(args.lead), args.fpp, rate);
-    let (tx, rx) = mpsc::sync_channel::<Payload>(16);
+    let ladder = args.ladder();
+    // What the producer has encoded ahead goes out at the rate it was
+    // encoded at: keep that short when the rate is to follow the link.
+    let depth = if ladder.is_adaptive() {
+        ADAPTIVE_QUEUE
+    } else {
+        16
+    };
+    let (tx, rx) = mpsc::sync_channel::<Payload>(depth);
+    let mut abr = Abr::new(ladder);
+    let rung = AtomicUsize::new(0);
     let mut stats = Stats::default();
     let mut delays = Vec::new();
     let mut reason = EndReason::Completed;
@@ -665,12 +737,15 @@ pub fn stream_packets<M: SduChannel, K: Clock>(
         // Owned by this closure so a panic below drops it (unblocking the
         // producer) before the scope joins.
         let rx = rx;
-        let producer = s.spawn(move || produce(args, source, total, tx));
+        let (ladder, rung) = (&ladder, &rung);
+        let producer = s.spawn(move || produce(args, source, total, tx, ladder, rung));
         let mut next_stats = STATS_EVERY;
         let mut consecutive_errors = 0u32;
         let mut k = 0u64;
         let mut anchor = start;
         let mut anchor_k = 0u64;
+        // When the WRITE before returned.
+        let mut last_write: Option<Duration> = None;
         'outer: loop {
             if stop.load(Ordering::Relaxed) {
                 reason = EndReason::Interrupted;
@@ -719,6 +794,13 @@ pub fn stream_packets<M: SduChannel, K: Clock>(
             let burst = deadline.saturating_sub(lead) <= anchor;
             clock.sleep_until(target);
             let now = clock.now();
+            // How late the packet goes out, for the bitrate controller
+            // (burst packets have no send time to be late for).
+            let late = if burst {
+                Duration::ZERO
+            } else {
+                now.saturating_sub(target)
+            };
             if !burst && now > target + LATE_TOLERANCE {
                 stats.late += 1;
                 stats.max_late = stats.max_late.max(now - target);
@@ -735,9 +817,35 @@ pub fn stream_packets<M: SduChannel, K: Clock>(
                 anchor_k = k;
             }
             pk.build(&p.bytes, &mut pkt);
-            let w0 = Instant::now();
+            // Timed with the pacing clock (the wall clock on a device), so
+            // that a test's virtual WRITE time is seen as well.
+            let w0 = clock.now();
             let r = media.send(&pkt);
-            let w = w0.elapsed();
+            let after = clock.now();
+            let w = after.saturating_sub(w0);
+            // Waiting for its send time (or for the producer) since the
+            // WRITE before: next to nothing for a packet of a burst.
+            let waited = w0.saturating_sub(last_write.unwrap_or(Duration::ZERO));
+            last_write = Some(after);
+            let change = match &r {
+                Ok(()) => abr.on_packet(Obs {
+                    now: after,
+                    write: w,
+                    late,
+                    waited,
+                }),
+                // Only a WRITE that timed out speaks of the link's capacity.
+                Err(e) if write_error_is_congestion(e) => abr.on_write_error(after),
+                Err(_) => None,
+            };
+            if let Some(c) = change {
+                rung.store(abr.rung(), Ordering::Relaxed);
+                log(format!(
+                    "[{:8.3}] {c}; {}-byte packets",
+                    (after - start).as_secs_f64(),
+                    c.to.packet_bytes(args.mode.encoder_mode())
+                ));
+            }
             match r {
                 Ok(()) => {
                     if verbose && stats.packets == 0 {
@@ -775,7 +883,11 @@ pub fn stream_packets<M: SduChannel, K: Clock>(
             let t = clock.now() - start;
             if verbose && t >= next_stats {
                 next_stats = t + STATS_EVERY;
-                log(format!("stats: {}", stats.render(t)));
+                log(format!(
+                    "stats: {} rate={}kbps",
+                    stats.render(t),
+                    abr.rate().kbps()
+                ));
             }
         }
         if reason == EndReason::Completed && k > 0 {
@@ -807,6 +919,8 @@ pub fn stream_packets<M: SduChannel, K: Clock>(
         stats,
         encode,
         delays,
+        rate_changes: abr.changes(),
+        rates: abr.describe_times(&Default::default()),
     }
 }
 
@@ -1160,6 +1274,12 @@ where
     out.delays = delays;
     log(describe_end(&out.reason, out.elapsed));
     log(format!("final: {}", out.stats.render(out.elapsed)));
+    if args.adaptive {
+        log(format!(
+            "bitrate: {} change(s); audio sent at {}",
+            out.rate_changes, out.rates
+        ));
+    }
     log(format!(
         "encoder: {} frames in {:.3} s = {:.1}x realtime",
         out.encode.frames,
@@ -1279,6 +1399,42 @@ mod tests {
             args(&["--wav", "a.wav"]).source,
             SourceSpec::Wav("a.wav".into())
         );
+    }
+
+    #[test]
+    fn adaptive_args_and_ladders() {
+        let kbps = |a: &PlayArgs| -> Vec<(u32, usize)> {
+            a.ladder()
+                .rungs()
+                .iter()
+                .map(|r| (r.kbps(), r.frames_per_packet))
+                .collect()
+        };
+        // Not asked for: the one rate, as ever.
+        let a = args(&[]);
+        assert!(!a.adaptive);
+        assert_eq!(kbps(&a), [(192, 1)]);
+        assert_eq!(kbps(&args(&["--bitrate", "128"])), [(128, 1)]);
+        assert_eq!(args(&["--mode", "ssc48"]).bitrate, Bitrate::K328);
+        // Asked for: the mode's ladder from its top rate.
+        let a = args(&["--adaptive"]);
+        assert!(a.adaptive);
+        assert_eq!(kbps(&a), [(192, 1), (128, 1), (88, 1)]);
+        let a = args(&["--mode", "uhq", "--adaptive"]);
+        assert_eq!(kbps(&a), [(584, 1), (291, 1), (152, 1)]);
+        // Plain SSC starts at what the buds decode, not at the fixed 328.
+        for m in ["ssc48", "ssc44"] {
+            let a = args(&["--mode", m, "--adaptive"]);
+            assert_eq!(kbps(&a), [(229, 1), (128, 1), (88, 1)]);
+            assert!(a.warnings().is_empty(), "{:?}", a.warnings());
+        }
+        // The frames per packet are the user's at every rate.
+        let a = args(&["--mode", "uhq", "--adaptive", "--frames-per-packet", "2"]);
+        assert_eq!(kbps(&a), [(584, 2), (291, 2), (152, 2)]);
+        // --bitrate is the fixed rate: not both.
+        let e = parse_play_args(&s(&["--adaptive", "--bitrate", "192"])).unwrap_err();
+        assert!(e.contains("pick one"), "{e}");
+        assert!(PLAY_USAGE.contains("--bitrate KBPS | --adaptive"));
     }
 
     #[test]
@@ -2128,6 +2284,157 @@ mod tests {
         // Back on the original schedule right after.
         assert_eq!(sent[11].0, Duration::from_millis(11 * 18 - 54));
         assert_eq!(out.elapsed, Duration::from_millis(56 * 18));
+    }
+
+    /// What `SlowMedia` records of a packet: time, sequence, length, rate code.
+    type Sent = (Duration, u16, usize, u8);
+
+    /// A link that is slow for a while: WRITEs number `slow.0 .. slow.1`
+    /// take `took` of the shared virtual time. Records (time, sequence,
+    /// length, rate code) of every packet.
+    struct SlowMedia {
+        clock: SharedClock,
+        slow: (usize, usize),
+        took: Duration,
+        fail_at: Option<usize>,
+        sent: Vec<Sent>,
+    }
+
+    impl SduChannel for SlowMedia {
+        fn send(&mut self, sdu: &[u8]) -> Result<(), ChanError> {
+            let n = self.sent.len();
+            if self.fail_at == Some(n) {
+                self.fail_at = None;
+                return Err(ChanError::Os {
+                    code: 121,
+                    what: "IOCTL",
+                });
+            }
+            let seq = RtpHeader::decode(sdu).unwrap().0.sequence;
+            assert_eq!(sdu[12], 0xFF);
+            self.sent.push((self.clock.now(), seq, sdu.len(), sdu[15]));
+            let d = if (self.slow.0..self.slow.1).contains(&n) {
+                self.took
+            } else {
+                Duration::from_micros(200)
+            };
+            *self.clock.0.lock().unwrap() += d;
+            Ok(())
+        }
+        fn recv(&mut self, _: Duration) -> Result<Vec<u8>, ChanError> {
+            Err(ChanError::Timeout)
+        }
+        fn out_mtu(&self) -> usize {
+            1005
+        }
+    }
+
+    fn slow_run(
+        argv: &[&str],
+        slow: (usize, usize),
+        fail_at: Option<usize>,
+    ) -> (Outcome, Vec<Sent>, Vec<String>) {
+        let a = args(argv);
+        let clock = SharedClock::default();
+        let mut m = SlowMedia {
+            clock: clock.clone(),
+            slow,
+            took: Duration::from_millis(20),
+            fail_at,
+            sent: Vec::new(),
+        };
+        let mut logs = Vec::new();
+        let out = stream_packets(
+            &a,
+            a.build_source().unwrap(),
+            &mut m,
+            &mut clock.clone(),
+            &AtomicBool::new(false),
+            None,
+            false,
+            &mut |l| logs.push(l),
+        );
+        assert_eq!(out.reason, EndReason::Completed);
+        (out, m.sent, logs)
+    }
+
+    /// The packet lengths in the order they first appear.
+    fn length_runs(sent: &[Sent]) -> Vec<usize> {
+        let mut runs: Vec<usize> = Vec::new();
+        for s in sent {
+            if runs.last() != Some(&s.2) {
+                runs.push(s.2);
+            }
+        }
+        runs
+    }
+
+    #[test]
+    fn adaptive_follows_write_latency_and_bitrate_stays_fixed() {
+        // HiFi, 25 s; WRITEs 100..150 take 20 ms each (a packet plays 18).
+        let (out, sent, logs) = slow_run(&["--seconds", "25", "--adaptive"], (100, 150), None);
+        let changes: Vec<&String> = logs.iter().filter(|l| l.contains("bitrate ")).collect();
+        assert_eq!(changes.len(), 4, "{logs:?}");
+        assert!(changes[0].contains("bitrate 192 -> 128 kbps: link congested"));
+        assert!(changes[0].ends_with("; 336-byte packets"), "{}", changes[0]);
+        assert!(changes[1].contains("bitrate 128 -> 88 kbps: link congested"));
+        assert!(changes[2].contains("bitrate 88 -> 128 kbps: link clean for 10 s"));
+        assert!(changes[3].contains("bitrate 128 -> 192 kbps: link clean for 10 s"));
+        // One RTP sequence, one frame per packet at every rate, nothing lost.
+        let seqs: Vec<u16> = sent.iter().map(|s| s.1).collect();
+        assert_eq!(seqs, (0..sent.len() as u16).collect::<Vec<_>>());
+        assert_eq!(sent.len() as u64, out.stats.packets);
+        assert_eq!(length_runs(&sent), [496, 336, 236, 336, 496]);
+        for s in &sent {
+            let code = match s.2 {
+                496 => Bitrate::K192,
+                336 => Bitrate::K128,
+                _ => Bitrate::K88,
+            }
+            .code();
+            assert_eq!(s.3, code, "length {} carries its own rate code", s.2);
+        }
+        // The first lower-rate packet is on the wire within the packets
+        // that were already encoded: the queue, the one in hand, the one
+        // being encoded.
+        let first_low = sent.iter().position(|s| s.2 == 336).unwrap();
+        assert!((106..=112).contains(&first_low), "{first_low}");
+        assert_eq!(out.rate_changes, 4);
+        assert!(
+            out.rates.starts_with("192k=") && out.rates.contains(" 88k=1"),
+            "{}",
+            out.rates
+        );
+        // The same link with a fixed rate: nothing changes.
+        for argv in [
+            &["--seconds", "25"][..],
+            &["--seconds", "25", "--bitrate", "192"][..],
+        ] {
+            let (out, sent, logs) = slow_run(argv, (100, 150), None);
+            assert!(!logs.iter().any(|l| l.contains("bitrate ")), "{logs:?}");
+            assert_eq!(length_runs(&sent), [496]);
+            assert_eq!(out.rate_changes, 0);
+            assert!(out.stats.write_max >= Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn adaptive_goes_to_the_lowest_rate_after_a_failed_write() {
+        let (out, sent, logs) = slow_run(&["--seconds", "5", "--adaptive"], (0, 0), Some(50));
+        assert_eq!(out.stats.write_errors, 1);
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("bitrate 192 -> 88 kbps: a WRITE timed out")),
+            "{logs:?}"
+        );
+        assert_eq!(length_runs(&sent), [496, 236]);
+        // UHQ: the ladder keeps one frame per packet here.
+        let (_, sent, _) = slow_run(
+            &["--mode", "uhq", "--seconds", "5", "--adaptive"],
+            (100, 200),
+            None,
+        );
+        assert_eq!(length_runs(&sent), [672, 342, 186]);
     }
 
     #[test]

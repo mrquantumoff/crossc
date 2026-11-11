@@ -11,6 +11,10 @@
 //!                                      no CMDs = read commands from stdin)
 //! crossc-cli play [OPTS]               stream live-encoded SSC (tone, sweep or
 //!                                      WAV) to the buds; see play::PLAY_USAGE.
+//!                                      --bitrate KBPS: exactly that rate;
+//!                                      --adaptive: the rate follows the link
+//!                                      (the service's controller), each
+//!                                      change is printed
 //!                                      --dry-run: no device, encode as fast as
 //!                                      possible and print the encoder speed
 //! global: --device N | --path \\?\...  pick interface (default: first)
@@ -247,7 +251,7 @@ volume     {}",
 }
 
 const USAGE: &str = "usage: crossc-cli [--device N | --path PATH] [-v] [--secure] [--in-mtu N] [--out-mtu-max N] [--seid N (media only)] <info|list|probe|media|raw [CMD]...|play [OPTS]>
-play OPTS: [--mode hifi|uhq|ssc48|ssc44] [--config 0xNN] [--bitrate KBPS] [--frames-per-packet N]
+play OPTS: [--mode hifi|uhq|ssc48|ssc44] [--config 0xNN] [--bitrate KBPS | --adaptive] [--frames-per-packet N]
            [--ts packets|samples] [--seconds S] [--tone HZ [--level DBFS] | --sweep | --wav PATH]
            [--no-delay-report] [--lead N] [--force-mtu N] [--force-config] [--dry-run]
 raw CMDs: \"open <psm> [in_mtu] [secure]\" \"send <ch> <hex>\" \"recv <ch> [ms]\" \"close <ch>\" \"sleep <ms>\" \"quit\"
@@ -302,6 +306,12 @@ fn print_play_settings(a: &play::PlayArgs, source: &pcm::Source) {
         source.new_buf().name(),
         source.channels()
     );
+    if a.adaptive {
+        println!(
+            "adaptive bitrate: {} (down while WRITEs block, up after 10 s of clean link; changes are printed)",
+            a.ladder().describe()
+        );
+    }
     if let pcm::Source::Wav { wav, .. } = source {
         println!("WAV: {}", wav.describe());
     }

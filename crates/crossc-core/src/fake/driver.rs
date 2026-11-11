@@ -107,6 +107,23 @@ pub struct FakeState {
     pub media_disconnected: bool,
     /// Virtual time each media WRITE takes.
     pub write_delay: Duration,
+    /// One-off stalls: media WRITE number `.0` (counted from 0, as in
+    /// `packets`) takes `.1` longer than `write_delay`.
+    pub write_stalls: Vec<(usize, Duration)>,
+    /// How long each media WRITE took, in order.
+    pub write_times: Vec<Duration>,
+    /// A link of limited capacity under the media channel: it sends this
+    /// many bits per second out of a buffer of `link_buffer` bytes, and a
+    /// media WRITE blocks while its SDU does not fit the buffer (as when
+    /// the controller has no ACL buffer free). `None`: no limit.
+    pub link_bps: Option<u32>,
+    pub link_buffer: usize,
+    link_queued: f64,
+    link_at: Duration,
+    /// The next `wait` first lets this much time pass without looking at
+    /// anything, as when the reader's thread does not get to run: a
+    /// backlog builds up in the ring without a single slow WRITE.
+    pub wait_stall: Duration,
     /// Virtual time each signaling SDU we send takes (the air round trip
     /// of a request).
     pub request_delay: Duration,
@@ -190,6 +207,13 @@ impl FakeState {
             write_error: None,
             media_disconnected: false,
             write_delay: Duration::ZERO,
+            write_stalls: Vec::new(),
+            write_times: Vec::new(),
+            wait_stall: Duration::ZERO,
+            link_bps: None,
+            link_buffer: 2000,
+            link_queued: 0.0,
+            link_at: Duration::ZERO,
             request_delay: Duration::ZERO,
             calls: Vec::new(),
             script: Vec::new(),
@@ -203,6 +227,25 @@ impl FakeState {
         self.now = self.now.max(t);
         self.clock_us
             .store(self.now.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// How long a WRITE of `len` bytes blocks on the limited link.
+    fn link_take(&mut self, len: usize) -> Duration {
+        let Some(bps) = self.link_bps else {
+            self.link_queued = 0.0;
+            return Duration::ZERO;
+        };
+        let rate = f64::from(bps.max(1)) / 8.0;
+        let since = self.now.saturating_sub(self.link_at).as_secs_f64();
+        self.link_queued = (self.link_queued - since * rate).max(0.0);
+        self.link_at = self.now;
+        self.link_queued += len as f64;
+        let over = self.link_queued - self.link_buffer as f64;
+        if over > 0.0 {
+            Duration::from_secs_f64(over / rate)
+        } else {
+            Duration::ZERO
+        }
     }
 
     fn bump(&mut self) {
@@ -728,10 +771,20 @@ impl Driver for FakeDriver {
                     return Err(os(code, "IOCTL"));
                 }
                 let now = s.now;
+                let n = s.packets.len();
                 s.packets.push(sdu.to_vec());
                 s.packet_times.push(now);
-                let t = now + s.write_delay;
-                s.advance_to(t);
+                // The delay is fixed when the WRITE begins, like a packet
+                // that is handed to a link in the state it is in then.
+                let stall: Duration = s
+                    .write_stalls
+                    .iter()
+                    .filter(|(k, _)| *k == n)
+                    .map(|(_, d)| *d)
+                    .sum();
+                let took = s.write_delay + stall + s.link_take(sdu.len());
+                s.write_times.push(took);
+                s.advance_to(now + took);
                 Ok(())
             }
             None => Err(os(6, "IOCTL")),
@@ -773,6 +826,11 @@ impl Driver for FakeDriver {
     fn wait(&self, interest: &Interest, timeout: Duration) -> Wake {
         let mut s = self.0.borrow_mut();
         s.call("wait");
+        let stall = std::mem::take(&mut s.wait_stall);
+        if stall > Duration::ZERO {
+            let t = s.now + stall;
+            s.advance_to(t);
+        }
         let deadline = s.now + timeout;
         s.settle();
         loop {

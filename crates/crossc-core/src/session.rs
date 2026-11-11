@@ -22,7 +22,13 @@
 //! * **Ready**: the stream is open and the endpoint shows as plugged in.
 //!   When the audio engine starts rendering: START.
 //! * **Streaming**: read PCM, assemble 864-sample frames, encode, send one
-//!   RTP packet per frame as it completes. PCM the driver still holds from
+//!   RTP packet per frame as it completes. The bitrate of each packet is
+//!   the adaptive controller's ([`crate::abr`]): it is told how long every
+//!   WRITE took, how long the session waited for the packet's audio and
+//!   how late the PCM was, and steps down a ladder under the configured
+//!   rate while the link is congested (setting `AdaptiveBitrate`; a new
+//!   stream configuration starts a new controller at the top). PCM the
+//!   driver still holds from
 //!   before the START is skipped, unless the endpoint started rendering
 //!   less than half a second earlier (then it is the start of the audio). [`IDLE_SUSPEND`] after rendering
 //!   stops: SUSPEND, back to Ready. A sink SUSPEND is honoured, and START is
@@ -50,18 +56,19 @@ use avdtp::caps;
 use crossc_ioctl as ioc;
 use crossc_ioctl::audio::{AudioState, PCM_FLAG_DISCONTINUITY, PcmFormat, StreamState};
 
+use crate::abr::{Abr, Change, Ladder, Lateness, MAX_RUNGS, Obs, Rate, write_error_is_congestion};
 use crate::driver::{Driver, DriverChannel, Interest, LinkProbe, PcmChunk, Wake};
 use crate::log::{Level, Log, RateLimit};
 use crate::media::{self, Choice, INT_SEID, StepError};
 use crate::pace::Clock;
 use crate::peer::{LocalStream, PeerEvent};
-use crate::plan::{Plan, select_plan};
+use crate::plan::{Plan, SscMode, select_plan};
 use crate::rtp::media_mtu_limit;
 use crate::settings::Settings;
 use crate::signaling::{self, Signaling};
 use crate::ssc::{SscSep, choose_ssc, local_caps};
 use crate::stop::StopSignal;
-use crate::stream::{PipeError, Pipeline};
+use crate::stream::Pipeline;
 use crate::volume::{self, Decision, VolumeMode};
 
 /// How often the driver is retried while it cannot be attached.
@@ -90,6 +97,14 @@ pub const UNSUPPORTED_RETRY: Duration = Duration::from_secs(60);
 pub const MAX_START_FAILURES: u32 = 5;
 /// The same error is logged at most once per this period.
 pub const ERROR_LOG_PERIOD: Duration = Duration::from_secs(60);
+/// At most this many bitrate changes are logged per [`ERROR_LOG_PERIOD`]
+/// (the controller itself makes no more than that on any link; the limit
+/// is for the log's sake should it ever). Changes held back are counted in
+/// the next line, and the statistics line always has the current rate.
+pub const RATE_LOG_BURST: u32 = 8;
+/// A link that is rebuilt within this time after a media WRITE timed out
+/// starts at the lowest bitrate of the same mode.
+pub const WRITE_ERROR_MEMORY: Duration = Duration::from_secs(60);
 /// in_mtu requested for both channels: what `crossc-cli play` uses, so the
 /// media MTU rule sees the values it was validated with.
 pub const REQUESTED_IN_MTU: u16 = 1021;
@@ -138,6 +153,33 @@ struct Stats {
     write_max: Duration,
     /// The driver's dropped-frames counter at the start of the interval.
     dropped_base: u64,
+    /// Worst lateness of the PCM against the endpoint clock.
+    late_max: Duration,
+    /// The controller's counters at the start of the interval.
+    times_base: [Duration; MAX_RUNGS],
+    changes_base: u32,
+    slow_base: u64,
+}
+
+impl Stats {
+    /// A new interval: the driver's and the controller's counters as they
+    /// are now.
+    fn begin(dropped: u64, abr: &Abr) -> Self {
+        Stats {
+            dropped_base: dropped,
+            times_base: abr.time_at(),
+            changes_base: abr.changes(),
+            slow_base: abr.slow_packets(),
+            ..Stats::default()
+        }
+    }
+
+    /// The interval goes on with another controller.
+    fn rebase(&mut self, abr: &Abr) {
+        self.times_base = abr.time_at();
+        self.changes_base = abr.changes();
+        self.slow_base = abr.slow_packets();
+    }
 }
 
 /// An open, configured stream to the buds.
@@ -149,6 +191,13 @@ struct Link<D: Driver> {
     /// The endpoint format `plan` and `pipe` are for.
     fmt: PcmFormat,
     pipe: Pipeline,
+    /// Which rate of the ladder under `plan.bitrate` packets are built at.
+    abr: Abr,
+    /// How far the PCM is behind the endpoint clock.
+    late: Lateness,
+    /// How long the session has waited (with nothing to send) since the
+    /// last packet: next to nothing while it works off a backlog.
+    waited: Duration,
     mtu_limit: usize,
     started: bool,
     /// PCM rendered before this position predates the current START and is
@@ -260,6 +309,11 @@ pub struct Session<D: Driver, P: LinkProbe, K: Clock> {
     volume: Decision,
     /// Mode and mute last logged.
     volume_logged: Option<(VolumeMode, bool)>,
+    /// A media WRITE timed out in this mode at this time.
+    write_error: Option<(SscMode, Duration)>,
+    /// Bitrate changes logged in the period that began at `.0`, and held
+    /// back since the last one logged.
+    rate_log: (Duration, u32, u32),
 }
 
 impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
@@ -296,6 +350,8 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             stats_every: STATS_EVERY,
             volume: volume::decide(&AudioState::default()),
             volume_logged: None,
+            write_error: None,
+            rate_log: (Duration::ZERO, 0, 0),
         }
     }
 
@@ -311,6 +367,11 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
     /// The plan of the current link, if there is one.
     pub fn plan(&self) -> Option<Plan> {
         self.link.as_ref().map(|l| l.plan)
+    }
+
+    /// The rate the current link's packets are built at.
+    pub fn rate(&self) -> Option<Rate> {
+        self.link.as_ref().map(|l| l.abr.rate())
     }
 
     /// Last delay the sink reported, in 1/10 ms.
@@ -534,6 +595,66 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
         Ok(p)
     }
 
+    /// The bitrate controller for a stream configured as `plan`: at the top
+    /// of the ladder, or at the bottom if a WRITE of the same mode timed
+    /// out a moment ago.
+    fn new_abr(&mut self, plan: &Plan, mtu_limit: usize) -> Abr {
+        let top = Rate {
+            bitrate: plan.bitrate,
+            frames_per_packet: plan.frames_per_packet,
+        };
+        let ladder = Ladder::new(plan.encoder, top, mtu_limit, self.settings.adaptive, true);
+        let mut abr = Abr::new(ladder);
+        let now = self.clock.now();
+        if !self.settings.adaptive {
+            self.info(&format!(
+                "adaptive bitrate is off (AdaptiveBitrate=0): always {} kbps",
+                top.kbps()
+            ));
+        } else if !ladder.is_adaptive() {
+            self.info(&format!(
+                "adaptive bitrate: {} kbps is the lowest rate of {}, nothing to adapt",
+                top.kbps(),
+                plan.mode.name()
+            ));
+        } else {
+            self.info(&format!("adaptive bitrate: {}", ladder.describe()));
+            // Once: the link after the failure, not every one for a minute.
+            let recent = self.write_error.take().is_some_and(|(mode, at)| {
+                mode == plan.mode && now.saturating_sub(at) < WRITE_ERROR_MEMORY
+            });
+            if recent && let Some(c) = abr.on_write_error(now) {
+                self.info(&format!(
+                    "a media write timed out on the last link: starting at {} kbps",
+                    c.to.kbps()
+                ));
+            }
+        }
+        abr
+    }
+
+    /// Log a bitrate change (see [`RATE_LOG_BURST`]).
+    fn log_rate_change(&mut self, c: &Change, bytes: usize, now: Duration) {
+        let (since, logged, held) = &mut self.rate_log;
+        if now.saturating_sub(*since) >= ERROR_LOG_PERIOD {
+            *since = now;
+            *logged = 0;
+        }
+        if *logged >= RATE_LOG_BURST {
+            *held += 1;
+            self.say(Level::Debug, &format!("{c} (not in the info log)"));
+            return;
+        }
+        *logged += 1;
+        let held = std::mem::take(held);
+        let more = if held > 0 {
+            format!(" ({held} change(s) before this one were not logged)")
+        } else {
+            String::new()
+        };
+        self.info(&format!("{c}; {bytes}-byte packets{more}"));
+    }
+
     /// The driver ended the session (or its audio requests fail): drop
     /// everything and start over at WaitDriver.
     fn on_detached(&mut self, why: &str) {
@@ -681,13 +802,15 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             unsupported: true,
         })?;
         let (media, plan, mtu_limit) = self.open_stream(&mut sig, &sep, fmt, plan)?;
-        let pipe = match self.new_pipeline(fmt, &plan) {
+        let mut pipe = match self.new_pipeline(fmt, &plan) {
             Ok(p) => p,
             Err(e) => {
                 self.release(&mut sig, sep.seid);
                 return Err(fail(e));
             }
         };
+        let abr = self.new_abr(&plan, mtu_limit);
+        pipe.set_rate(abr.rate());
         if let Err(e) = self.drv.set_link(true) {
             self.release(&mut sig, sep.seid);
             return Err(fail(format!("AUDIO_SET_LINK: {e}")));
@@ -700,6 +823,10 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             plan,
             fmt,
             pipe,
+            stats: Stats::begin(0, &abr),
+            abr,
+            late: Lateness::new(),
+            waited: Duration::ZERO,
             mtu_limit,
             started: false,
             skip_before: 0,
@@ -709,7 +836,6 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             next_start: now,
             start_failures: 0,
             sink_suspended: false,
-            stats: Stats::default(),
             next_stats: now,
         })
     }
@@ -872,6 +998,9 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             if running {
                 link.idle_since = None;
             } else {
+                // The endpoint stands still: whatever comes next is not
+                // late for that (a pause too short for a SUSPEND).
+                link.late.reset();
                 let since = *link.idle_since.get_or_insert(now);
                 if now >= since + IDLE_SUSPEND {
                     return self.suspend(link);
@@ -898,10 +1027,11 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             seq: Some(self.audio.seq),
             pcm: link.started,
         };
-        match self
+        let wake = self
             .drv
-            .wait(&interest, timeout.max(Duration::from_millis(1)))
-        {
+            .wait(&interest, timeout.max(Duration::from_millis(1)));
+        link.waited += self.clock.now().saturating_sub(now);
+        match wake {
             Wake::Timeout | Wake::Stop => Flow::Keep,
             Wake::Detached(e) | Wake::StateError(e) => Flow::Detached(e.to_string()),
             Wake::State(s) => self.on_state(link, s),
@@ -977,10 +1107,11 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             st.frames_rendered
         };
         link.skipped = 0;
-        link.stats = Stats {
-            dropped_base: st.frames_dropped,
-            ..Stats::default()
-        };
+        // The rate stays where the controller left it: a stream that was
+        // suspended has learnt nothing new about the link.
+        link.late.reset();
+        link.waited = Duration::ZERO;
+        link.stats = Stats::begin(st.frames_dropped, &link.abr);
         link.next_stats = now + self.stats_every;
         self.limiter.forget("start");
         self.set_phase(Phase::Streaming);
@@ -1116,10 +1247,16 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
         let sep = link.sep.clone();
         match self.open_stream(&mut link.sig, &sep, fmt, plan) {
             Ok((media, plan, limit)) => {
-                let pipe = match self.new_pipeline(fmt, &plan) {
+                let mut pipe = match self.new_pipeline(fmt, &plan) {
                     Ok(p) => p,
                     Err(e) => return down(e, true),
                 };
+                // Another mode, another ladder: the controller starts anew.
+                let abr = self.new_abr(&plan, limit);
+                pipe.set_rate(abr.rate());
+                link.stats.rebase(&abr);
+                link.abr = abr;
+                link.late.reset();
                 link.media = media;
                 link.plan = plan;
                 link.mtu_limit = limit;
@@ -1162,11 +1299,19 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
         }
         if h.flags & PCM_FLAG_DISCONTINUITY != 0 {
             link.pipe.flush();
+            link.late.reset();
             link.stats.discontinuities += 1;
             self.say(
                 Level::Debug,
                 &format!("discontinuity before frame {}", h.first_frame),
             );
+            // The driver dropped audio we did not fetch in time. Next to
+            // WRITEs that blocked that is the link's doing.
+            let now = self.clock.now();
+            if let Some(c) = link.abr.on_discontinuity(now) {
+                link.pipe.set_rate(c.to);
+                self.log_rate_change(&c, c.to.packet_bytes(link.plan.encoder), now);
+            }
         }
         // A chunk that straddles the START position: its tail is fresh.
         let cut = (stale as usize).saturating_mul(h.format.frame_bytes());
@@ -1180,26 +1325,49 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             link.skipped = 0;
         }
         link.stats.frames_in += u64::from(h.frames).saturating_sub(stale);
-        let clock = &self.clock;
-        let media = &mut link.media;
-        let stats = &mut link.stats;
-        let r = link.pipe.push(data, &mut |pkt| {
+        // How far behind the endpoint this chunk is taken up.
+        let late = link
+            .late
+            .observe(self.clock.now(), end, h.format.sample_rate);
+        link.stats.late_max = link.stats.late_max.max(late);
+        link.pipe.feed(data);
+        loop {
             use crate::channel::SduChannel;
-            let t0 = clock.now();
-            let r = media.send(pkt);
-            let dt = clock.now().saturating_sub(t0);
-            if r.is_ok() {
-                stats.packets += 1;
-                stats.write_total += dt;
-                stats.write_max = stats.write_max.max(dt);
+            let pkt = match link.pipe.next_packet() {
+                Ok(Some(pkt)) => pkt,
+                Ok(None) => return Flow::Keep,
+                Err(e) => return down(e.to_string(), true),
+            };
+            let t0 = self.clock.now();
+            let r = link.media.send(pkt);
+            let now = self.clock.now();
+            if let Err(e) = r {
+                // A WRITE that did not complete in time is a link that
+                // carries too little; a channel or a link that went away
+                // says nothing of the kind.
+                if write_error_is_congestion(&e) {
+                    self.write_error = Some((link.plan.mode, now));
+                }
+                // The signaling channel may well be alive: give the stream
+                // back.
+                return down(format!("media write failed: {e}"), true);
             }
-            r
-        });
-        match r {
-            Ok(_) => Flow::Keep,
-            // The signaling channel may well be alive: give the stream back.
-            Err(PipeError::Send(e)) => down(format!("media write failed: {e}"), true),
-            Err(e @ PipeError::Encoder(_)) => down(e.to_string(), true),
+            let write = now.saturating_sub(t0);
+            link.stats.packets += 1;
+            link.stats.write_total += write;
+            link.stats.write_max = link.stats.write_max.max(write);
+            // The rate of the next packet follows this one's fate.
+            let waited = std::mem::take(&mut link.waited);
+            let obs = Obs {
+                now,
+                write,
+                late,
+                waited,
+            };
+            if let Some(c) = link.abr.on_packet(obs) {
+                link.pipe.set_rate(c.to);
+                self.log_rate_change(&c, c.to.packet_bytes(link.plan.encoder), now);
+            }
         }
     }
 
@@ -1220,7 +1388,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
         };
         let avg = s.write_total.as_micros() / u128::from(s.packets.max(1));
         self.info(&format!(
-            "stats: packets={} frames_in={} dropped={dropped} discontinuities={} write avg={avg}us max={}us{}",
+            "stats: packets={} frames_in={} dropped={dropped} discontinuities={} write avg={avg}us max={}us{} rate={}kbps at[{}] rate_changes={} slow_writes={} late_max={}ms",
             s.packets,
             s.frames_in,
             s.discontinuities,
@@ -1228,12 +1396,14 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             match self.last_delay {
                 Some(d) => format!(" sink_delay={}.{}ms", d / 10, d % 10),
                 None => String::new(),
-            }
+            },
+            link.abr.rate().kbps(),
+            link.abr.describe_times(&s.times_base),
+            link.abr.changes() - s.changes_base,
+            link.abr.slow_packets() - s.slow_base,
+            s.late_max.as_millis()
         ));
-        link.stats = Stats {
-            dropped_base: link.stats.dropped_base,
-            ..Stats::default()
-        };
+        link.stats = Stats::begin(link.stats.dropped_base, &link.abr);
     }
 
     /// The link is gone or unusable: unplug the endpoint, give the stream

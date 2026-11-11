@@ -1210,10 +1210,10 @@ fn media_mtu_limits_the_bitrate() {
     r.stream(1.0, Running, FMT_96K_24);
     r.run_to(1.2);
     assert_eq!(
-        r.logged("584 kbps does not fit the media MTU limit 600; using 442 kbps"),
+        r.logged("584 kbps does not fit the media MTU limit 600; using 291 kbps"),
         1
     );
-    assert!(r.packets().iter().all(|p| p.len() == 512));
+    assert!(r.packets().iter().all(|p| p.len() == 342));
     assert!(!r.packets().is_empty());
     // Nothing fits: no link.
     let mut r = rig();
@@ -1738,5 +1738,904 @@ mod volume {
         })
         .packets();
         assert_eq!(p, silent, "mute == slider at the bottom == silence");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive bitrate
+// ---------------------------------------------------------------------------
+
+mod adaptive {
+    use super::*;
+    use crate::abr::{DOWN_SETTLE, UP_HOLD_MIN};
+
+    /// A healthy WRITE.
+    const FAST: Duration = Duration::from_micros(200);
+
+    fn fast_rig(settings: Settings) -> Rig {
+        let r = rig_with(settings);
+        r.fake.with(|s| s.write_delay = FAST);
+        r
+    }
+
+    /// Bitrate changes logged, as (ms, from kbps, to kbps).
+    fn changes(r: &Rig) -> Vec<(u64, u32, u32)> {
+        r.log
+            .find("bitrate ")
+            .into_iter()
+            .filter_map(|(t, m)| {
+                let m = m.split("bitrate ").nth(1)?;
+                let mut w = m.split_whitespace();
+                let from = w.next()?.parse().ok()?;
+                let to = w.nth(1)?.parse().ok()?;
+                Some((t, from, to))
+            })
+            .collect()
+    }
+
+    /// What every packet is: (sequence, kbps, frames). Checks that each is
+    /// a whole number (1 or 2) of SSC frames of one rate, of the size that
+    /// rate has, and that the RTP timestamp equals the sequence number.
+    fn dissect(packets: &[Vec<u8>]) -> Vec<(u16, u32, usize)> {
+        packets
+            .iter()
+            .enumerate()
+            .map(|(k, p)| {
+                let (h, off) = RtpHeader::decode(p).unwrap();
+                assert_eq!((off, h.payload_type), (12, 96), "packet {k}");
+                assert_eq!(h.timestamp, u32::from(h.sequence), "packet {k}");
+                let code = p[15];
+                let rate = if code & 0x1F < 0x10 {
+                    Bitrate::from_code(0xE0 | (code & 0x1F))
+                } else {
+                    Bitrate::from_code(code)
+                }
+                .unwrap_or_else(|| panic!("packet {k}: rate code {code:#04x}"));
+                let mode = if rate.is_e_family() {
+                    ssc_enc::Mode::Uhq96k
+                } else {
+                    ssc_enc::Mode::Hifi48k
+                };
+                let fb = ssc_enc::frame_size(mode, rate);
+                let payload = &p[12..];
+                assert_eq!(payload.len() % fb, 0, "packet {k}: {} bytes", p.len());
+                let frames = payload.len() / fb;
+                assert!((1..=2).contains(&frames), "packet {k}: {frames} frames");
+                for f in payload.chunks(fb) {
+                    assert_eq!(f[0], 0xFF, "packet {k}: sync byte");
+                    assert_eq!(f[3] & 0x1F, code & 0x1F, "packet {k}: one rate");
+                }
+                assert!(p.len() <= 1005, "packet {k}");
+                (h.sequence, rate.bps() / 1000, frames)
+            })
+            .collect()
+    }
+
+    /// The (kbps, frames per packet) the stream went through, in order.
+    fn rate_runs(d: &[(u16, u32, usize)]) -> Vec<(u32, usize)> {
+        let mut runs: Vec<(u32, usize)> = Vec::new();
+        for &(_, kbps, frames) in d {
+            if runs.last() != Some(&(kbps, frames)) {
+                runs.push((kbps, frames));
+            }
+        }
+        runs
+    }
+
+    fn assert_continuous(d: &[(u16, u32, usize)]) {
+        for (k, x) in d.iter().enumerate() {
+            assert_eq!(usize::from(x.0), k, "RTP sequence at packet {k}");
+        }
+    }
+
+    #[test]
+    fn a_good_link_stays_at_the_configured_rate() {
+        for (fmt, kbps, bytes, ladder) in [
+            (FMT_48K_24, 192, 496, "192 / 128 / 88 kbps"),
+            (
+                FMT_96K_24,
+                584,
+                672,
+                "584 / 291 (2 frames/packet) / 152 (2 frames/packet) kbps",
+            ),
+        ] {
+            let mut r = fast_rig(Settings::default());
+            r.s.set_stats_period(Duration::from_secs(10));
+            r.fake.with(|s| s.set_stream(Paused, fmt));
+            r.stream(1.0, Running, fmt);
+            r.run_to(31.5);
+            assert!(changes(&r).is_empty(), "{}", r.log.text());
+            let d = dissect(&r.packets());
+            assert_continuous(&d);
+            assert_eq!(rate_runs(&d), [(kbps, 1)]);
+            assert!(r.packets().iter().all(|p| p.len() == bytes));
+            assert_eq!(r.logged(&format!("adaptive bitrate: {ladder}")), 1);
+            let stats = r.log.find("stats:");
+            assert!(stats.len() >= 3);
+            for (_, line) in &stats[..3] {
+                assert!(
+                    line.contains(&format!("rate={kbps}kbps at[{kbps}k=10.0s "))
+                        && line.contains("rate_changes=0 slow_writes=0 late_max=0ms"),
+                    "{line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sustained_write_latency_steps_down_and_recovery_steps_up() {
+        let mut r = fast_rig(Settings::default());
+        r.s.set_stats_period(Duration::from_secs(5));
+        // Every WRITE takes 20 ms from 3.0 to 4.0 s: more than a packet
+        // plays (18 ms).
+        r.stream(1.0, Running, FMT_48K_24)
+            .at(3.0, |s| s.write_delay = Duration::from_millis(20))
+            .at(4.0, |s| s.write_delay = FAST);
+        r.run_to(30.0);
+        let c = changes(&r);
+        let steps: Vec<(u32, u32)> = c.iter().map(|x| (x.1, x.2)).collect();
+        assert_eq!(
+            steps,
+            [(192, 128), (128, 88), (88, 128), (128, 192)],
+            "{}",
+            r.log.text()
+        );
+        // Down within 200 ms of the first slow WRITE, and again once the
+        // new rate had its chance.
+        assert!((3060..=3200).contains(&c[0].0), "{c:?}");
+        let settle = DOWN_SETTLE.as_millis() as u64;
+        assert!((c[0].0 + settle..=c[0].0 + 500).contains(&c[1].0), "{c:?}");
+        // Up one rung per 10 s of clean audio after the link recovered (the
+        // backlog of the slow second is caught up first).
+        let hold = UP_HOLD_MIN.as_millis() as u64;
+        assert!((3900 + hold..=4300 + hold).contains(&c[2].0), "{c:?}");
+        assert!(
+            (c[2].0 + hold..=c[2].0 + hold + 50).contains(&c[3].0),
+            "{c:?}"
+        );
+        assert_eq!(
+            r.logged("bitrate 192 -> 128 kbps: link congested (WRITE blocked"),
+            1
+        );
+        assert_eq!(r.logged("; 336-byte packets"), 2);
+        assert_eq!(r.logged("bitrate 88 -> 128 kbps: link clean for 10 s"), 1);
+        // The stream itself: one RTP sequence through every change, every
+        // packet one frame of the size its rate has.
+        let d = dissect(&r.packets());
+        assert_continuous(&d);
+        assert_eq!(
+            rate_runs(&d),
+            [(192, 1), (128, 1), (88, 1), (128, 1), (192, 1)]
+        );
+        let sizes: Vec<usize> = r.packets().iter().map(Vec::len).collect();
+        assert!(sizes.iter().all(|n| [496, 336, 236].contains(n)));
+        // No audio was lost on the way: the slow second fits the ring.
+        assert_eq!(r.fake.with(|s| s.state.frames_dropped), 0);
+        assert_eq!(r.logged("link down"), 0);
+        // The statistics say where the time went.
+        let stats = r.log.find("stats:");
+        assert!(
+            stats[0].1.contains("rate=88kbps at[192k=2.")
+                && stats[0].1.contains("rate_changes=2 slow_writes="),
+            "{}",
+            stats[0].1
+        );
+        assert!(
+            stats[1].1.contains(
+                "rate=88kbps at[192k=0.0s 128k=0.0s 88k=5.0s] rate_changes=0 slow_writes=0"
+            ),
+            "{}",
+            stats[1].1
+        );
+        assert_eq!(r.s.rate(), None, "stopped");
+    }
+
+    #[test]
+    fn a_link_too_small_for_the_top_rate_is_probed_ever_more_rarely() {
+        // The link carries 170 kbps from 5 s on: HiFi at 192 kbps is 220
+        // on the wire, at 128 kbps it is 149.
+        let mut r = fast_rig(Settings::default());
+        r.stream(1.0, Running, FMT_48K_24)
+            .at(5.0, |s| s.link_bps = Some(170_000));
+        r.run_to(85.0);
+        let c = changes(&r);
+        let steps: Vec<(u32, u32)> = c.iter().map(|x| (x.1, x.2)).collect();
+        assert!(steps.len() >= 7, "{c:?}");
+        for (k, s) in steps.iter().enumerate() {
+            let want = if k % 2 == 0 { (192, 128) } else { (128, 192) };
+            assert_eq!(*s, want, "{c:?}");
+        }
+        // Down about a second after the link shrank (its buffer has to
+        // fill first), and within a second of every probe.
+        assert!((5200..=6500).contains(&c[0].0), "{c:?}");
+        let secs = |a: u64, b: u64| ((b - a) as f64 / 1000.0).round() as u64;
+        let holds: Vec<u64> = (1..c.len())
+            .step_by(2)
+            .map(|k| secs(c[k - 1].0, c[k].0))
+            .collect();
+        assert_eq!(&holds[..3], [10, 20, 40], "{c:?}");
+        for k in (2..c.len()).step_by(2) {
+            assert!(c[k].0 - c[k - 1].0 <= 1500, "{c:?}");
+        }
+        // Never more than a few changes in any minute.
+        for (i, x) in c.iter().enumerate() {
+            let n = c[i..].iter().take_while(|y| y.0 < x.0 + 60_000).count();
+            assert!(n <= 6, "{n} changes in the minute from {} ms: {c:?}", x.0);
+        }
+        // The probes cost no audio.
+        assert_eq!(r.fake.with(|s| s.state.frames_dropped), 0);
+        let d = dissect(&r.packets());
+        assert_continuous(&d);
+        assert!(d.iter().all(|x| x.1 >= 128), "128 kbps was enough");
+    }
+
+    #[test]
+    fn uhq_steps_down_to_two_frames_per_packet() {
+        // 400 kbps of link: UHQ at 584 kbps does not fit, 291 kbps does.
+        let mut r = fast_rig(Settings::default());
+        r.fake.with(|s| s.set_stream(Paused, FMT_96K_24));
+        r.stream(1.0, Running, FMT_96K_24)
+            .at(3.0, |s| s.link_bps = Some(400_000))
+            .at(6.0, |s| s.link_bps = None);
+        r.run_to(20.0);
+        let c = changes(&r);
+        let steps: Vec<(u32, u32)> = c.iter().map(|x| (x.1, x.2)).collect();
+        assert_eq!(steps, [(584, 291), (291, 584)], "{}", r.log.text());
+        assert!((3050..=3600).contains(&c[0].0), "{c:?}");
+        assert_eq!(
+            r.logged("bitrate 584 -> 291 kbps, 2 frame(s)/packet: link congested"),
+            1
+        );
+        assert_eq!(
+            r.logged("bitrate 291 -> 584 kbps, 1 frame(s)/packet: link clean"),
+            1
+        );
+        let d = dissect(&r.packets());
+        assert_continuous(&d);
+        assert_eq!(rate_runs(&d), [(584, 1), (291, 2), (584, 1)]);
+        // 672 bytes either way: one frame of 660, or two of 330.
+        assert!(r.packets().iter().all(|p| p.len() == 672));
+        // Half as many packets while two frames share one.
+        let two = d.iter().filter(|x| x.2 == 2).count();
+        assert!((540..=600).contains(&two), "{two}");
+        assert_eq!(r.fake.with(|s| s.state.frames_dropped), 0);
+        assert_eq!(r.configs(), [0x0A], "no reconfiguration for a rate");
+    }
+
+    #[test]
+    fn single_stalls_change_nothing() {
+        let mut r = fast_rig(Settings::default());
+        // One WRITE of 30, 80 and 150 ms, seconds apart.
+        r.fake.with(|s| {
+            s.write_stalls = vec![
+                (100, Duration::from_millis(30)),
+                (400, Duration::from_millis(80)),
+                (700, Duration::from_millis(150)),
+            ]
+        });
+        r.s.set_stats_period(Duration::from_secs(30));
+        r.stream(1.0, Running, FMT_48K_24);
+        r.run_to(31.5);
+        assert!(changes(&r).is_empty(), "{}", r.log.text());
+        let d = dissect(&r.packets());
+        assert_continuous(&d);
+        assert_eq!(rate_runs(&d), [(192, 1)]);
+        let stats = r.log.find("stats:");
+        assert!(
+            stats[0].1.contains("max=150200us")
+                && stats[0].1.contains("rate=192kbps")
+                && stats[0]
+                    .1
+                    .contains("rate_changes=0 slow_writes=3 late_max=1"),
+            "{}",
+            stats[0].1
+        );
+    }
+
+    #[test]
+    fn a_stall_that_loses_audio_steps_down_once() {
+        // 300 ms in one WRITE: more than the driver keeps for a slow
+        // reader, so audio is dropped and the next chunk says so.
+        let mut r = fast_rig(Settings::default());
+        r.fake
+            .with(|s| s.write_stalls = vec![(100, Duration::from_millis(300))]);
+        r.stream(1.0, Running, FMT_48K_24);
+        r.run_to(8.0);
+        let c = changes(&r);
+        assert_eq!(c.len(), 1, "{}", r.log.text());
+        assert_eq!((c[0].1, c[0].2), (192, 128));
+        assert_eq!(
+            r.logged("bitrate 192 -> 128 kbps: audio was dropped while WRITEs blocked"),
+            1
+        );
+        assert!(r.fake.with(|s| s.state.frames_dropped) > 0);
+        // A discontinuity without a slow WRITE is not the link's doing.
+        let mut r = fast_rig(Settings::default());
+        r.stream(1.0, Running, FMT_48K_24)
+            .at(2.005, |s| s.drop_frames(5000))
+            .at(3.005, |s| s.drop_frames(5000));
+        r.run_to(8.0);
+        assert!(changes(&r).is_empty(), "{}", r.log.text());
+    }
+
+    #[test]
+    fn a_backlog_without_slow_writes_does_not_step_down_but_delays_the_step_up() {
+        // The reader does not get to run for 120 ms, every 4 s.
+        let mut r = fast_rig(Settings::default());
+        r.s.set_stats_period(Duration::from_secs(30));
+        r.stream(1.0, Running, FMT_48K_24);
+        for k in 0..12 {
+            r.at(2.0 + 4.0 * f64::from(k), |s| {
+                s.wait_stall = Duration::from_millis(120)
+            });
+        }
+        r.run_to(32.0);
+        assert!(changes(&r).is_empty(), "{}", r.log.text());
+        let stats = r.log.find("stats:");
+        assert!(
+            stats[0].1.contains("slow_writes=0 late_max=1"),
+            "{}",
+            stats[0].1
+        );
+        // The same while the rate is down: no step up before the sender
+        // keeps up for 10 s.
+        let mut r = fast_rig(Settings::default());
+        r.stream(1.0, Running, FMT_48K_24)
+            .at(3.0, |s| s.write_delay = Duration::from_millis(20))
+            .at(3.3, |s| s.write_delay = FAST);
+        for k in 0..6 {
+            r.at(5.0 + 6.0 * f64::from(k), |s| {
+                s.wait_stall = Duration::from_millis(120)
+            });
+        }
+        r.run_to(60.0);
+        let c = changes(&r);
+        let steps: Vec<(u32, u32)> = c.iter().map(|x| (x.1, x.2)).collect();
+        assert_eq!(steps, [(192, 128), (128, 192)], "{}", r.log.text());
+        // The last stall is at 35 s.
+        assert!((45_000..=45_400).contains(&c[1].0), "{c:?}");
+    }
+
+    #[test]
+    fn a_mode_switch_starts_the_controller_anew() {
+        let mut r = fast_rig(Settings::default());
+        r.stream(1.0, Running, FMT_48K_24)
+            .at(2.0, |s| s.write_delay = Duration::from_millis(20))
+            .at(3.0, |s| s.write_delay = FAST)
+            .stream(4.0, Running, FMT_96K_24)
+            .stream(6.0, Running, FMT_48K_24);
+        r.run_to(8.0);
+        let c = changes(&r);
+        let steps: Vec<(u32, u32)> = c.iter().map(|x| (x.1, x.2)).collect();
+        assert_eq!(steps, [(192, 128), (128, 88)], "{}", r.log.text());
+        assert_eq!(r.configs(), [0x0C, 0x0A, 0x0C]);
+        assert_eq!(r.logged("adaptive bitrate: 192 / 128 / 88 kbps"), 2);
+        assert_eq!(r.logged("adaptive bitrate: 584 / 291"), 1);
+        // HiFi down to 88, UHQ from its top, HiFi from its top again. Each
+        // stream configuration has its own RTP sequence.
+        let d = dissect(&r.packets());
+        assert_eq!(
+            rate_runs(&d),
+            [(192, 1), (128, 1), (88, 1), (584, 1), (192, 1)]
+        );
+        let restarts = d.iter().filter(|x| x.0 == 0).count();
+        assert_eq!(restarts, 3);
+        for w in d.windows(2) {
+            assert!(w[1].0 == w[0].0 + 1 || w[1].0 == 0, "{w:?}");
+        }
+    }
+
+    #[test]
+    fn a_format_change_within_the_mode_keeps_the_rate() {
+        let mut r = fast_rig(Settings::default());
+        r.stream(1.0, Running, FMT_48K_24)
+            .at(2.0, |s| s.write_delay = Duration::from_millis(20))
+            .at(3.0, |s| s.write_delay = FAST)
+            .stream(4.0, Running, FMT_48K_16)
+            .stream(5.0, Running, FMT_48K_24);
+        r.run_to(6.0);
+        assert_eq!(r.cmds(), ["SET_CONFIG", "OPEN", "START", "CLOSE"]);
+        assert!(r.logged("same stream") >= 2);
+        assert_eq!(r.logged("adaptive bitrate:"), 1);
+        let d = dissect(&r.packets());
+        assert_eq!(rate_runs(&d), [(192, 1), (128, 1), (88, 1)]);
+        // The sequence goes on; only the frame cut at each change is lost.
+        assert_continuous(&d);
+        assert_eq!(changes(&r).len(), 2);
+    }
+
+    #[test]
+    fn suspend_and_resume_keep_the_rate_and_idle_is_not_clean_time() {
+        let mut r = fast_rig(Settings::default());
+        r.stream(1.0, Running, FMT_48K_24)
+            .at(2.0, |s| s.write_delay = Duration::from_millis(20))
+            .at(3.0, |s| s.write_delay = FAST)
+            .stream(8.0, Paused, FMT_48K_24)
+            .stream(100.0, Running, FMT_48K_24);
+        r.run_to(112.0);
+        assert_eq!(r.count("SUSPEND"), 1);
+        let c = changes(&r);
+        let steps: Vec<(u32, u32)> = c.iter().map(|x| (x.1, x.2)).collect();
+        // 5 s of clean audio before the pause, 5 more after it, then 10.
+        assert_eq!(steps, [(192, 128), (128, 88), (88, 128)], "{c:?}");
+        assert!((104_800..=105_400).contains(&c[2].0), "{c:?}");
+        let d = dissect(&r.packets());
+        assert_continuous(&d);
+    }
+
+    #[test]
+    fn adaptive_off_keeps_the_configured_rate_whatever_the_link_does() {
+        let mut r = fast_rig(Settings {
+            adaptive: false,
+            ..Settings::default()
+        });
+        r.stream(1.0, Running, FMT_48K_24)
+            .at(2.0, |s| s.write_delay = Duration::from_millis(20))
+            .at(6.0, |s| s.write_delay = FAST);
+        r.run_to(8.0);
+        assert!(changes(&r).is_empty());
+        assert_eq!(
+            r.logged("adaptive bitrate is off (AdaptiveBitrate=0): always 192 kbps"),
+            1
+        );
+        let d = dissect(&r.packets());
+        assert_eq!(rate_runs(&d), [(192, 1)]);
+        assert!(r.packets().iter().all(|p| p.len() == 496));
+    }
+
+    #[test]
+    fn the_configured_bitrate_is_the_top_of_the_ladder() {
+        let mut r = fast_rig(Settings {
+            hifi_bitrate: Bitrate::K128,
+            uhq_bitrate: Bitrate::K152,
+            ..Settings::default()
+        });
+        r.stream(1.0, Running, FMT_48K_24)
+            .at(2.0, |s| s.write_delay = Duration::from_millis(20))
+            .at(3.0, |s| s.write_delay = FAST)
+            .stream(40.0, Running, FMT_96K_24)
+            .at(41.0, |s| s.write_delay = Duration::from_millis(20))
+            .at(42.0, |s| s.write_delay = FAST);
+        r.run_to(44.0);
+        assert_eq!(r.logged("adaptive bitrate: 128 / 88 kbps"), 1);
+        assert_eq!(
+            r.logged(
+                "adaptive bitrate: 152 kbps is the lowest rate of UHQ 96 kHz/24, nothing to adapt"
+            ),
+            1
+        );
+        let c = changes(&r);
+        let steps: Vec<(u32, u32)> = c.iter().map(|x| (x.1, x.2)).collect();
+        assert_eq!(steps, [(128, 88), (88, 128)], "{}", r.log.text());
+        let d = dissect(&r.packets());
+        assert_eq!(rate_runs(&d), [(128, 1), (88, 1), (128, 1), (152, 1)]);
+        assert!(d.iter().all(|x| x.1 <= 152));
+    }
+
+    #[test]
+    fn a_small_media_mtu_shapes_the_ladder() {
+        // 600 bytes: UHQ starts at 291 kbps (342-byte packets), and two
+        // frames of 152 kbps (360 bytes) fit below it.
+        let mut r = fast_rig(Settings::default());
+        r.fake.with(|s| {
+            s.report_mtus = Some((600, 65535));
+            s.set_stream(Paused, FMT_96K_24);
+        });
+        r.stream(1.0, Running, FMT_96K_24)
+            .at(2.0, |s| s.write_delay = Duration::from_millis(20));
+        r.run_to(4.0);
+        assert_eq!(
+            r.logged("adaptive bitrate: 291 / 152 (2 frames/packet) kbps"),
+            1
+        );
+        let d = dissect(&r.packets());
+        assert_eq!(rate_runs(&d), [(291, 1), (152, 2)]);
+        assert!(r.packets().iter().all(|p| p.len() <= 600));
+    }
+
+    #[test]
+    fn a_write_that_timed_out_makes_the_next_link_start_low() {
+        // Win32 error 121 (a WRITE that timed out) on the 100th packet.
+        let mut r = fast_rig(Settings::default());
+        r.fake.with(|s| s.write_error = Some((100, 121)));
+        r.stream(1.0, Running, FMT_48K_24)
+            .at(3.0, |s| s.write_error = None);
+        r.run_to(30.0);
+        assert_eq!(r.logged("link down: media write failed"), 1);
+        assert_eq!(
+            r.logged("a media write timed out on the last link: starting at 88 kbps"),
+            1
+        );
+        let d = dissect(&r.packets());
+        // Up again after 20 and 20 clean seconds (a WRITE that timed out
+        // doubles the wait for every rung).
+        assert_eq!(rate_runs(&d), [(192, 1), (88, 1), (128, 1)]);
+        let c = changes(&r);
+        assert_eq!(c.len(), 1);
+        assert_eq!((c[0].1, c[0].2), (88, 128));
+        // A channel that just went away is no reason for that.
+        let mut r = fast_rig(Settings::default());
+        r.stream(1.0, Running, FMT_48K_24)
+            .at(2.0, |s| s.media_disconnected = true);
+        r.run_to(6.0);
+        assert_eq!(r.logged("link down: media write failed"), 1);
+        assert_eq!(r.logged("starting at 88 kbps"), 0);
+        let d = dissect(&r.packets());
+        assert_eq!(rate_runs(&d), [(192, 1)]);
+        // Nor is a link that went away under the WRITE (the buds into the
+        // case): not connected, aborted, a stale channel, anything else.
+        for code in [1167, 1236, 6, 31] {
+            let mut r = fast_rig(Settings::default());
+            r.fake.with(|s| s.write_error = Some((100, code)));
+            r.stream(1.0, Running, FMT_48K_24)
+                .at(3.0, |s| s.write_error = None);
+            r.run_to(8.0);
+            assert_eq!(r.logged("link down: media write failed"), 1, "{code}");
+            assert_eq!(r.logged("starting at 88 kbps"), 0, "{code}");
+            let d = dissect(&r.packets());
+            assert_eq!(rate_runs(&d), [(192, 1)], "{code}");
+            assert!(d.len() > 200, "{code}: the link came back");
+        }
+    }
+
+    #[test]
+    fn rate_changes_are_rate_limited_in_the_log() {
+        use crate::abr::{Change, Rate, Why};
+        let mut r = rig();
+        let c = Change {
+            from: Rate {
+                bitrate: Bitrate::K192,
+                frames_per_packet: 1,
+            },
+            to: Rate {
+                bitrate: Bitrate::K128,
+                frames_per_packet: 1,
+            },
+            why: Why::Dropout,
+        };
+        let s = Duration::from_secs;
+        for k in 0..20 {
+            r.s.log_rate_change(&c, 336, s(k));
+        }
+        assert_eq!(r.logged("bitrate 192 -> 128 kbps"), 20, "debug has all");
+        let info = |r: &Rig| {
+            r.log
+                .lines
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.1 == Level::Info && l.2.contains("bitrate 192"))
+                .count()
+        };
+        assert_eq!(info(&r), RATE_LOG_BURST as usize);
+        r.s.log_rate_change(&c, 336, s(60));
+        assert_eq!(info(&r), RATE_LOG_BURST as usize + 1);
+        assert_eq!(
+            r.logged("(12 change(s) before this one were not logged)"),
+            1
+        );
+    }
+
+    /// A link whose capacity jumps around for two minutes, with stalls and
+    /// format switches thrown in: the session survives, every packet is
+    /// sound, and the rate does not flap.
+    #[test]
+    fn a_wild_link_never_makes_the_rate_flap() {
+        for seed in [11u32, 12] {
+            let mut r = fast_rig(Settings::default());
+            let mut x = seed.wrapping_mul(2_654_435_761).max(1);
+            let mut rnd = move |n: u32| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x % n
+            };
+            let fmts = [FMT_48K_24, FMT_96K_24, FMT_48K_16];
+            r.stream(1.0, Running, FMT_48K_24);
+            let mut t = 1.0;
+            let mut switches = Vec::new();
+            while t < 120.0 {
+                t += 0.2 + f64::from(rnd(6000)) / 1000.0;
+                match rnd(8) {
+                    0..=3 => {
+                        let bps = [
+                            None,
+                            Some(60_000),
+                            Some(120_000),
+                            Some(170_000),
+                            Some(400_000),
+                        ][rnd(5) as usize];
+                        r.at(t, move |s| s.link_bps = bps);
+                    }
+                    4 => {
+                        let ms = u64::from(20 + rnd(400));
+                        r.at(t, move |s| {
+                            let n = s.packets.len() + 2;
+                            s.write_stalls.push((n, Duration::from_millis(ms)));
+                        });
+                    }
+                    5 => {
+                        let ms = u64::from(20 + rnd(200));
+                        r.at(t, move |s| s.wait_stall = Duration::from_millis(ms));
+                    }
+                    6 => {
+                        let fmt = fmts[rnd(3) as usize];
+                        r.stream(t, Running, fmt);
+                        switches.push((t * 1000.0) as u64);
+                    }
+                    _ => {
+                        let d = Duration::from_micros(u64::from(100 + rnd(3000)));
+                        r.at(t, move |s| s.write_delay = d);
+                    }
+                }
+            }
+            r.run_to(122.0);
+            let d = dissect(&r.packets());
+            for w in d.windows(2) {
+                assert!(w[1].0 == w[0].0.wrapping_add(1) || w[1].0 == 0, "{w:?}");
+            }
+            // Between two mode switches (each starts a new controller at
+            // the top) no minute has more than a handful of changes.
+            let c = changes(&r);
+            for (i, a) in c.iter().enumerate() {
+                let next_switch = switches
+                    .iter()
+                    .copied()
+                    .find(|s| *s > a.0)
+                    .unwrap_or(u64::MAX);
+                let n = c[i..]
+                    .iter()
+                    .take_while(|b| b.0 < a.0 + 60_000 && b.0 < next_switch)
+                    .count();
+                assert!(n <= 7, "seed {seed}: {n} changes from {} ms: {c:?}", a.0);
+            }
+            assert!(!c.is_empty(), "seed {seed}: the link was bad at times");
+        }
+    }
+
+    /// Most bitrate changes in any 60 s.
+    fn worst_minute(c: &[(u64, u32, u32)]) -> usize {
+        (0..c.len())
+            .map(|i| c[i..].iter().take_while(|y| y.0 < c[i].0 + 60_000).count())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn steps(c: &[(u64, u32, u32)]) -> Vec<(u32, u32)> {
+        c.iter().map(|x| (x.1, x.2)).collect()
+    }
+
+    /// A rig whose driver keeps 250 ms of PCM, like the real one.
+    fn real_ring_rig(fmt: PcmFormat) -> Rig {
+        let r = fast_rig(Settings::default());
+        r.fake.with(|s| {
+            s.set_stream(Paused, fmt);
+            s.ring_chunks = 25;
+        });
+        r
+    }
+
+    #[test]
+    fn a_link_that_carries_the_middle_rate_settles_there() {
+        // The link carries the middle rate (HiFi 128 kbps is 149.3 on the
+        // wire, UHQ 291 kbps 298.7) but not the top one. When a probe of
+        // the top fails, its backlog goes out back to back at the middle
+        // rate into a link whose buffer is full; those WRITEs take most of
+        // a packet time each and are the link doing what it can, not a
+        // reason to go on to the bottom rate.
+        for (fmt, bps, top, mid) in [
+            (FMT_48K_24, 160_000u32, 192, 128),
+            (FMT_96K_24, 330_000, 584, 291),
+        ] {
+            let mut r = real_ring_rig(fmt);
+            r.stream(1.0, Running, fmt)
+                .at(5.0, move |s| s.link_bps = Some(bps));
+            r.run_to(305.0);
+            let c = changes(&r);
+            let ctx = format!("{bps} bps: {c:?}");
+            for (k, s) in steps(&c).iter().enumerate() {
+                let want = if k % 2 == 0 { (top, mid) } else { (mid, top) };
+                assert_eq!(*s, want, "{ctx}");
+            }
+            // The top is tried after 10, 20, 40 and then every 80 s (and
+            // the second or two in which the backlog of the probe goes out).
+            let holds: Vec<u64> = (1..c.len())
+                .step_by(2)
+                .map(|k| (c[k].0 - c[k - 1].0) / 1000)
+                .collect();
+            assert_eq!(holds.len(), 5, "{ctx}");
+            for (h, want) in holds.iter().zip([10, 20, 40, 80, 80]) {
+                assert!((want..want + 3).contains(h), "{ctx}");
+            }
+            assert!(worst_minute(&c) <= 6, "{ctx}");
+            let d = dissect(&r.packets());
+            assert_continuous(&d);
+            assert!(d.iter().all(|x| x.1 >= mid), "{ctx}");
+            let at_top: usize = d[300..].iter().filter(|x| x.1 == top).map(|x| x.2).sum();
+            let all: usize = d[300..].iter().map(|x| x.2).sum();
+            assert!(at_top * 20 < all, "{ctx}: {at_top} of {all} frames");
+            assert_eq!(r.fake.with(|s| s.state.frames_dropped), 0, "{ctx}");
+        }
+    }
+
+    #[test]
+    fn one_stall_on_a_good_but_limited_link_changes_nothing() {
+        // A link with room to spare, but not without limit, and one
+        // stalled WRITE. The backlog then goes out back to back, every
+        // WRITE waiting for room in the link's buffer: a sender catching
+        // up, not a congested link.
+        for (fmt, bps, stall, n) in [
+            (FMT_96K_24, 2_000_000u32, 150u64, 600usize),
+            (FMT_96K_24, 1_400_000, 80, 600),
+            (FMT_96K_24, 1_000_000, 80, 600),
+            (FMT_96K_24, 700_000, 200, 600),
+            (FMT_48K_24, 700_000, 150, 300),
+            (FMT_48K_24, 1_000_000, 150, 300),
+            (FMT_48K_24, 260_000, 200, 300),
+        ] {
+            for buffer in [2000usize, 8000] {
+                let mut r = real_ring_rig(fmt);
+                r.fake.with(|s| {
+                    s.link_bps = Some(bps);
+                    s.link_buffer = buffer;
+                    s.write_stalls = vec![(n, Duration::from_millis(stall))];
+                });
+                r.s.set_stats_period(Duration::from_secs(20));
+                r.stream(1.0, Running, fmt);
+                r.run_to(30.0);
+                let ctx = format!(
+                    "{} Hz, {bps} bps, buffer {buffer}, {stall} ms: {}",
+                    fmt.sample_rate,
+                    r.log.text()
+                );
+                assert!(changes(&r).is_empty(), "{ctx}");
+                assert_eq!(r.fake.with(|s| s.state.frames_dropped), 0, "{ctx}");
+                let stats = r.log.find("stats:");
+                assert!(stats[0].1.contains("rate_changes=0 slow_writes="), "{ctx}");
+                assert!(!stats[0].1.contains("slow_writes=0 "), "{ctx}");
+            }
+        }
+    }
+
+    #[test]
+    fn audio_waiting_at_start_is_sent_without_stepping_down() {
+        // The signaling requests take time, so the driver's ring holds up
+        // to 250 ms when START is accepted: that goes out back to back.
+        for (fmt, bps, buf, delay) in [
+            (FMT_96K_24, 1_400_000u32, 2000usize, 250u64),
+            (FMT_96K_24, 1_000_000, 2000, 150),
+            (FMT_96K_24, 1_000_000, 8000, 250),
+            (FMT_96K_24, 700_000, 8000, 150),
+            (FMT_96K_24, 700_000, 2000, 250),
+            (FMT_96K_24, 2_000_000, 2000, 250),
+            (FMT_48K_24, 260_000, 2000, 250),
+            (FMT_48K_24, 700_000, 8000, 250),
+        ] {
+            let mut r = real_ring_rig(fmt);
+            r.fake.with(|s| {
+                s.link_bps = Some(bps);
+                s.link_buffer = buf;
+                s.request_delay = Duration::from_millis(delay);
+            });
+            r.stream(1.0, Running, fmt);
+            r.run_to(30.0);
+            let ctx = format!(
+                "{} Hz, {bps} bps, buffer {buf}, {delay} ms",
+                fmt.sample_rate
+            );
+            assert!(changes(&r).is_empty(), "{ctx}: {}", r.log.text());
+            assert_eq!(r.logged("link down"), 0, "{ctx}");
+        }
+    }
+
+    #[test]
+    fn a_short_first_write_into_a_full_ring_is_not_congestion() {
+        // The ring is full at START; the first WRITE takes 20 or 30 ms (as
+        // seen on real buds) and audio is dropped. That is not the link.
+        for (fmt, delay, k, stall) in [
+            (FMT_48K_24, 300u64, 0usize, 30u64),
+            (FMT_48K_24, 300, 2, 30),
+            (FMT_96K_24, 300, 0, 20),
+            (FMT_96K_24, 300, 3, 25),
+            (FMT_48K_24, 300, 0, 60),
+        ] {
+            let mut r = real_ring_rig(fmt);
+            r.fake.with(|s| {
+                s.request_delay = Duration::from_millis(delay);
+                s.write_stalls = vec![(k, Duration::from_millis(stall))];
+            });
+            r.stream(1.0, Running, fmt);
+            r.run_to(8.0);
+            let ctx = format!("{} Hz, WRITE {k} takes {stall} ms", fmt.sample_rate);
+            assert!(changes(&r).is_empty(), "{ctx}: {}", r.log.text());
+        }
+    }
+
+    #[test]
+    fn stray_slow_writes_do_not_keep_the_rate_down() {
+        // One second of congestion, then a perfect link with one WRITE of
+        // 5 ms every 9 s. That never moves a stream at the top, and must
+        // not hold one at the bottom.
+        let stray = |r: &Rig| {
+            for k in 0..30 {
+                r.at(6.0 + 9.0 * f64::from(k), |s| {
+                    let n = s.packets.len();
+                    s.write_stalls.push((n + 1, Duration::from_millis(5)));
+                });
+            }
+        };
+        let mut r = fast_rig(Settings::default());
+        r.stream(1.0, Running, FMT_48K_24)
+            .at(3.0, |s| s.write_delay = Duration::from_millis(20))
+            .at(4.0, |s| s.write_delay = FAST);
+        stray(&r);
+        r.run_to(240.0);
+        let c = changes(&r);
+        assert_eq!(
+            steps(&c),
+            [(192, 128), (128, 88), (88, 128), (128, 192)],
+            "{}",
+            r.log.text()
+        );
+        // Each stray WRITE costs a quarter of a second of the 10 s.
+        assert!((14_000..=15_500).contains(&c[2].0), "{c:?}");
+        assert!((24_000..=26_500).contains(&c[3].0), "{c:?}");
+        // The same without the congestion.
+        let mut r = fast_rig(Settings::default());
+        r.stream(1.0, Running, FMT_48K_24);
+        stray(&r);
+        r.run_to(240.0);
+        assert!(changes(&r).is_empty());
+    }
+
+    #[test]
+    fn a_link_that_is_busy_half_of_the_time_steps_down_without_a_backlog() {
+        // Every WRITE takes 9 ms of the 18 ms a packet plays: the sender
+        // keeps up, nothing is late, and the rate still gives way.
+        let mut r = fast_rig(Settings::default());
+        r.s.set_stats_period(Duration::from_secs(5));
+        r.stream(1.0, Running, FMT_48K_24)
+            .at(3.0, |s| s.write_delay = Duration::from_millis(9));
+        r.run_to(20.0);
+        let c = changes(&r);
+        // One rung: at the lower rate the WRITEs still take 9 ms, less
+        // than a packet plays, so nothing says that it is too much.
+        assert_eq!(steps(&c), [(192, 128)], "{}", r.log.text());
+        assert!((3100..=4000).contains(&c[0].0), "{c:?}");
+        assert_eq!(r.fake.with(|s| s.state.frames_dropped), 0);
+        let stats = r.log.find("stats:");
+        assert!(stats[1].1.contains("late_max=0ms"), "{}", stats[1].1);
+    }
+
+    #[test]
+    fn a_pause_too_short_for_a_suspend_is_not_lateness() {
+        // The player pauses for a moment (a track change, scrubbing, a UI
+        // sound ending): the endpoint stands still for less than the 3 s
+        // after which the stream is suspended. The audio after it is not
+        // late, and the pauses do not keep the rate from coming back.
+        for pause in [1.0, 0.1] {
+            let mut r = fast_rig(Settings::default());
+            r.s.set_stats_period(Duration::from_secs(20));
+            r.stream(1.0, Running, FMT_48K_24)
+                .at(3.0, |s| s.write_delay = Duration::from_millis(20))
+                .at(3.3, |s| s.write_delay = FAST);
+            for k in 0..12 {
+                let t = 8.0 + 9.0 * f64::from(k);
+                r.stream(t, Paused, FMT_48K_24)
+                    .stream(t + pause, Running, FMT_48K_24);
+            }
+            r.run_to(120.0);
+            assert_eq!(r.count("SUSPEND"), 0);
+            let c = changes(&r);
+            assert_eq!(steps(&c), [(192, 128), (128, 192)], "{}", r.log.text());
+            // 10 s of audio after the congestion, and one or two pauses.
+            let up = 13_300 + (2.0 * pause * 1000.0) as u64;
+            assert!((13_300..=up + 300).contains(&c[1].0), "{pause}: {c:?}");
+            let stats = r.log.find("stats:");
+            assert!(stats.len() >= 5);
+            for (_, line) in &stats[1..] {
+                assert!(line.contains("late_max=0ms"), "{pause}: {line}");
+            }
+        }
     }
 }

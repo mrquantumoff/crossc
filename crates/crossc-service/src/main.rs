@@ -53,7 +53,7 @@ const USAGE: &str = "usage: crossc-service <command>
                             device's state
   service                   entry point used by the service control manager
 Log of the service: %ProgramData%\\crossc\\service.log. Settings: HKLM\\SOFTWARE\\crossc
-(UhqConfig, HifiBitrate, UhqBitrate, LogLevel).";
+(UhqConfig, HifiBitrate, UhqBitrate, AdaptiveBitrate, LogLevel).";
 
 fn parse_args(args: &[String]) -> Result<Cmd, String> {
     let mut it = args.iter().map(String::as_str);
@@ -310,6 +310,7 @@ mod tests {
             "UhqConfig",
             "HifiBitrate",
             "UhqBitrate",
+            "AdaptiveBitrate",
             "LogLevel",
         ] {
             assert!(USAGE.contains(w), "{w}");

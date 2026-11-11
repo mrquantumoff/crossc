@@ -3,10 +3,17 @@
 //! first if the plan says so), assembles 864-sample frames, encodes them and
 //! wraps them in RTP. A packet goes out as soon as its frames are complete,
 //! so the endpoint's own clock paces the stream.
+//!
+//! The bitrate and the frames per packet are the plan's until
+//! [`Pipeline::set_rate`] says otherwise (adaptive bitrate, [`crate::abr`]):
+//! the SSC frame header carries the rate, so it can change between any two
+//! packets while the encoder, the RTP sequence and the AVDTP configuration
+//! stay as they are.
 
 use crossc_ioctl::audio::PcmFormat;
 use ssc_enc::{Encoder, FRAME_SAMPLES, MAX_FRAME_BYTES};
 
+use crate::abr::Rate;
 use crate::channel::ChanError;
 use crate::pcm::{self, Dither, FrameBuf};
 use crate::plan::Plan;
@@ -49,6 +56,10 @@ pub struct Pipeline {
     /// Encoded frames of the packet being filled.
     payload: Vec<u8>,
     payload_frames: usize,
+    /// What the packet being filled is built with.
+    rate: Rate,
+    /// What the next packet is built with, if not `rate`.
+    next_rate: Option<Rate>,
     pk: Packetizer,
     pkt: Vec<u8>,
     frames: u64,
@@ -79,10 +90,17 @@ impl Pipeline {
             acc: plan.input.new_buf(),
             enc,
             frame: vec![0; MAX_FRAME_BYTES],
-            payload: Vec::new(),
+            // Room for the largest packet of any rate, so that a rate
+            // change never allocates on the packet path.
+            payload: Vec::with_capacity(PAYLOAD_CAPACITY),
             payload_frames: 0,
+            rate: Rate {
+                bitrate: plan.bitrate,
+                frames_per_packet: plan.frames_per_packet,
+            },
+            next_rate: None,
             pk: Packetizer::new(TsMode::Packets, plan.frames_per_packet),
-            pkt: Vec::new(),
+            pkt: Vec::with_capacity(PAYLOAD_CAPACITY + 12),
             frames: 0,
             packets: 0,
             gain: Gain::unity(),
@@ -100,16 +118,45 @@ impl Pipeline {
         &self.gain
     }
 
+    /// The bitrate and frames per packet from the next packet on. A packet
+    /// that is partly filled is finished at the old rate first, so every
+    /// packet holds frames of one rate.
+    pub fn set_rate(&mut self, rate: Rate) {
+        let rate = Rate {
+            frames_per_packet: rate.frames_per_packet.max(1),
+            ..rate
+        };
+        if self.payload_frames == 0 {
+            self.rate = rate;
+            self.next_rate = None;
+        } else {
+            self.next_rate = (rate != self.rate).then_some(rate);
+        }
+    }
+
+    /// What packets are being built with (a rate set while a packet was
+    /// partly filled shows once that packet is complete).
+    pub fn rate(&self) -> Rate {
+        self.rate
+    }
+
     /// The endpoint format changed but the stream configuration did not
-    /// (`plan.same_stream`): keep the encoder and the RTP sequence, convert
-    /// the input differently from now on.
+    /// (`plan.same_stream`): keep the encoder, the RTP sequence and the
+    /// current rate, convert the input differently from now on.
     pub fn retarget(&mut self, fmt: PcmFormat, plan: &Plan) {
         self.fmt = fmt;
         self.plan = *plan;
         self.resampler = resampler_for(fmt, plan);
         self.acc = plan.input.new_buf();
+        self.drop_partial_packet();
+    }
+
+    fn drop_partial_packet(&mut self) {
         self.payload.clear();
         self.payload_frames = 0;
+        if let Some(r) = self.next_rate.take() {
+            self.rate = r;
+        }
     }
 
     pub fn format(&self) -> PcmFormat {
@@ -119,7 +166,8 @@ impl Pipeline {
     pub fn frames(&self) -> u64 {
         self.frames
     }
-    /// Packets handed to `send` so far.
+    /// Packets sent ([`Self::push`]) or handed out ([`Self::next_packet`])
+    /// so far.
     pub fn packets(&self) -> u64 {
         self.packets
     }
@@ -132,8 +180,7 @@ impl Pipeline {
     /// partial frame, the partial packet and the resampler's history.
     pub fn flush(&mut self) {
         self.acc.clear();
-        self.payload.clear();
-        self.payload_frames = 0;
+        self.drop_partial_packet();
         if let Some(r) = &mut self.resampler {
             r.reset();
         }
@@ -147,6 +194,30 @@ impl Pipeline {
         data: &[u8],
         send: &mut dyn FnMut(&[u8]) -> Result<(), ChanError>,
     ) -> Result<usize, PipeError> {
+        self.feed(data);
+        let mut sent = 0;
+        while self.build_packet()? {
+            send(&self.pkt).map_err(PipeError::Send)?;
+            self.packets += 1;
+            sent += 1;
+        }
+        Ok(sent)
+    }
+
+    /// The next complete packet of what was fed, or `None` when less than
+    /// a packet is left. Between two calls the caller may [`Self::set_rate`]
+    /// (which is how the rate follows each packet's fate).
+    pub fn next_packet(&mut self) -> Result<Option<&[u8]>, PipeError> {
+        if !self.build_packet()? {
+            return Ok(None);
+        }
+        self.packets += 1;
+        Ok(Some(&self.pkt))
+    }
+
+    /// Take in one chunk of endpoint PCM (`data` in the pipeline's format):
+    /// volume, conversion to the encoder's input format, resampling.
+    pub fn feed(&mut self, data: &[u8]) {
         // Software volume first, at 32-bit precision; skipped entirely at
         // unity so that path stays bit-exact.
         let (data, fmt) = if self.gain.is_unity() {
@@ -165,28 +236,33 @@ impl Pipeline {
             }
             None => pcm::append_chunk(data, fmt, &mut self.dither, &mut self.acc),
         }
-        let mut sent = 0;
+    }
+
+    /// Encode frames until a packet is complete (then in `self.pkt`) or the
+    /// accumulated PCM runs out.
+    fn build_packet(&mut self) -> Result<bool, PipeError> {
         while let Some(frame) = self.acc.head(FRAME_LEN) {
             let n = self
                 .enc
-                .encode_frame(frame, self.plan.bitrate, &mut self.frame)
+                .encode_frame(frame, self.rate.bitrate, &mut self.frame)
                 .map_err(|e| PipeError::Encoder(e.to_string()))?;
             self.acc.discard(FRAME_LEN);
             self.frames += 1;
             self.payload.extend_from_slice(&self.frame[..n]);
             self.payload_frames += 1;
-            if self.payload_frames >= self.plan.frames_per_packet {
+            if self.payload_frames >= self.rate.frames_per_packet {
                 self.pk.build(&self.payload, &mut self.pkt);
-                self.payload.clear();
-                self.payload_frames = 0;
-                send(&self.pkt).map_err(PipeError::Send)?;
-                self.packets += 1;
-                sent += 1;
+                self.drop_partial_packet();
+                return Ok(true);
             }
         }
-        Ok(sent)
+        Ok(false)
     }
 }
+
+/// Bytes the payload buffer starts with: two frames of the largest rate the
+/// buds decode (584 kbps UHQ, 660 bytes), rounded up.
+const PAYLOAD_CAPACITY: usize = 2048;
 
 #[cfg(test)]
 mod tests {
@@ -361,6 +437,142 @@ mod tests {
         assert_eq!(p.packets(), 0);
     }
 
+    /// (sequence, timestamp, payload length, rate code of every frame).
+    fn dissect(pkt: &[u8], frame_bytes: usize) -> (u16, u32, usize, Vec<u8>) {
+        let (h, off) = RtpHeader::decode(pkt).unwrap();
+        let payload = &pkt[off..];
+        assert_eq!(payload.len() % frame_bytes, 0, "whole frames");
+        let codes = payload
+            .chunks(frame_bytes)
+            .map(|f| {
+                assert_eq!(f[0], 0xFF, "SSC sync byte at every frame start");
+                f[3]
+            })
+            .collect();
+        (h.sequence, h.timestamp, payload.len(), codes)
+    }
+
+    #[test]
+    fn every_rung_of_every_ladder_gives_the_right_packets() {
+        use crate::abr::Ladder;
+        for (f, caps) in [
+            (fmt(48000, 32, 24, 2), 0x3Eu8), // HiFi
+            (fmt(96000, 32, 24, 2), 0x3E),   // UHQ
+            (fmt(48000, 32, 24, 2), 0x30),   // SSC 48 kHz
+            (fmt(48000, 32, 24, 2), 0x20),   // SSC 44.1 kHz (resampled)
+        ] {
+            let plan = select_plan(f, SscFlags(caps), &Settings::default()).unwrap();
+            let top = Rate {
+                bitrate: plan.bitrate,
+                frames_per_packet: plan.frames_per_packet,
+            };
+            let ladder = Ladder::new(plan.encoder, top, 1005, true, true);
+            assert!(ladder.is_adaptive(), "{}", plan.mode.name());
+            let mut p = Pipeline::new(f, &plan).unwrap();
+            let cap = (p.payload.capacity(), p.pkt.capacity());
+            let mut pos = 0;
+            let mut seq = 0u16;
+            // Down the ladder and up again, eight packets at every rung.
+            let down = ladder.rungs().iter();
+            let up = ladder.rungs().iter().rev().skip(1);
+            for rate in down.chain(up) {
+                p.set_rate(*rate);
+                assert_eq!(p.rate(), *rate);
+                let fb = ssc_enc::frame_size(plan.encoder, rate.bitrate);
+                let mut got = 0;
+                while got < 8 {
+                    p.feed(&tone(f, pos, 480));
+                    pos += 480;
+                    while let Some(pkt) = p.next_packet().unwrap() {
+                        assert_eq!(pkt.len(), rate.packet_bytes(plan.encoder));
+                        let (s, ts, len, codes) = dissect(pkt, fb);
+                        assert_eq!((s, ts), (seq, u32::from(seq)), "RTP goes on");
+                        assert_eq!(len, rate.frames_per_packet * fb);
+                        let mask = if rate.bitrate.is_e_family() {
+                            0x1F
+                        } else {
+                            0xFF
+                        };
+                        for c in codes {
+                            assert_eq!(c & mask, rate.bitrate.code() & mask);
+                        }
+                        seq += 1;
+                        got += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                (p.payload.capacity(), p.pkt.capacity()),
+                cap,
+                "no rate needed a larger buffer"
+            );
+            assert_eq!(p.packets(), u64::from(seq));
+        }
+    }
+
+    #[test]
+    fn a_rate_change_waits_for_the_packet_boundary() {
+        // UHQ at 291 kbps with two frames per packet, then back to 584 / 1
+        // while the first frame of a packet is already encoded.
+        let f = fmt(96000, 32, 24, 2);
+        let plan = select_plan(f, SscFlags(0x3E), &Settings::default()).unwrap();
+        let mut p = Pipeline::new(f, &plan).unwrap();
+        let two = Rate {
+            bitrate: Bitrate::K291,
+            frames_per_packet: 2,
+        };
+        let one = Rate {
+            bitrate: Bitrate::K584,
+            frames_per_packet: 1,
+        };
+        p.set_rate(two);
+        p.feed(&tone(f, 0, 864));
+        assert!(p.next_packet().unwrap().is_none(), "half a packet");
+        p.set_rate(one);
+        assert_eq!(p.rate(), two, "not before the packet is complete");
+        p.feed(&tone(f, 864, 2 * 864));
+        let fb291 = ssc_enc::frame_size(plan.encoder, Bitrate::K291);
+        let a = p.next_packet().unwrap().unwrap().to_vec();
+        assert_eq!(a.len(), 12 + 2 * fb291, "both frames at the old rate");
+        assert_eq!(dissect(&a, fb291).3.len(), 2);
+        assert_eq!(p.rate(), one);
+        let b = p.next_packet().unwrap().unwrap().to_vec();
+        assert_eq!(b.len(), 672);
+        assert_eq!((dissect(&a, fb291).0, dissect(&b, 660).0), (0, 1));
+        assert_eq!((p.frames(), p.packets()), (3, 2));
+        // A flush drops the half packet and takes the pending rate.
+        p.set_rate(two);
+        p.feed(&tone(f, 0, 864));
+        assert!(p.next_packet().unwrap().is_none());
+        p.set_rate(one);
+        p.flush();
+        assert_eq!(p.rate(), one);
+        p.feed(&tone(f, 0, 864));
+        assert_eq!(p.next_packet().unwrap().unwrap().len(), 672);
+        // Setting the rate that is already in use is nothing.
+        p.set_rate(one);
+        assert_eq!(p.rate(), one);
+    }
+
+    #[test]
+    fn push_and_next_packet_give_the_same_stream() {
+        let f = fmt(48000, 32, 24, 2);
+        let (_, a) = run(f, 0x3E, 5000, 480);
+        let plan = select_plan(f, SscFlags(0x3E), &Settings::default()).unwrap();
+        let mut p = Pipeline::new(f, &plan).unwrap();
+        let mut b = Vec::new();
+        let mut pos = 0;
+        while pos < 5000 {
+            let n = 480.min(5000 - pos);
+            p.feed(&tone(f, pos, n));
+            while let Some(pkt) = p.next_packet().unwrap() {
+                b.push(pkt.to_vec());
+            }
+            pos += n;
+        }
+        assert_eq!(a, b);
+    }
+
     #[test]
     fn retarget_keeps_the_rtp_sequence() {
         let f24 = fmt(48000, 32, 24, 2);
@@ -380,5 +592,13 @@ mod tests {
         assert_eq!((p.format(), p.pending()), (f16, 0));
         p.push(&tone(f16, 0, 864), &mut send).unwrap();
         assert_eq!(seqs, vec![0, 1]);
+        // ... and the rate the stream is at.
+        let low = Rate {
+            bitrate: Bitrate::K88,
+            frames_per_packet: 1,
+        };
+        p.set_rate(low);
+        p.retarget(f24, &plan);
+        assert_eq!(p.rate(), low);
     }
 }

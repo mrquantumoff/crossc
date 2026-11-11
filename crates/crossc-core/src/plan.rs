@@ -76,27 +76,9 @@ impl SscMode {
         }
     }
     /// Rates to fall back to when a packet does not fit the media MTU,
-    /// highest first.
+    /// highest first: the ones the buds are known to decode.
     fn ladder(self) -> &'static [Bitrate] {
-        match self {
-            SscMode::Uhq => &[
-                Bitrate::K584,
-                Bitrate::K442,
-                Bitrate::K308,
-                Bitrate::K291,
-                Bitrate::K250,
-                Bitrate::K152,
-            ],
-            _ => &[
-                Bitrate::K328,
-                Bitrate::K256,
-                Bitrate::K229,
-                Bitrate::K192,
-                Bitrate::K128,
-                Bitrate::K96,
-                Bitrate::K88,
-            ],
-        }
+        crate::abr::decodable(self.encoder_mode())
     }
 }
 
@@ -107,8 +89,10 @@ pub struct Plan {
     /// SSC configuration octet for SET_CONFIGURATION.
     pub config: u8,
     pub encoder: Mode,
+    /// The configured bitrate: what the stream is sent at, and with
+    /// adaptive bitrate the highest it is sent at ([`crate::abr`]).
     pub bitrate: Bitrate,
-    /// SSC frames per media packet.
+    /// SSC frames per media packet (at `bitrate`).
     pub frames_per_packet: usize,
     /// Rate the endpoint PCM is converted to first (`None`: none needed).
     pub resample_to: Option<u32>,
@@ -572,7 +556,7 @@ mod tests {
         assert_eq!(p.fit_mtu(1005), Ok(None));
         assert_eq!(p.fit_mtu(672), Ok(None), "672-byte packets fit exactly");
         assert_eq!(p.fit_mtu(671), Ok(Some(Bitrate::K584)));
-        assert_eq!(p.bitrate, Bitrate::K442);
+        assert_eq!(p.bitrate, Bitrate::K291, "the next rate the buds decode");
         assert!(p.packet_bytes() <= 671);
         let mut p = plan(F48, 0x3E).unwrap();
         assert_eq!(p.fit_mtu(300), Ok(Some(Bitrate::K192)));
