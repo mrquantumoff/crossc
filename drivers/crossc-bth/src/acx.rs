@@ -14,8 +14,47 @@
 //!
 //! Modelled on microsoft/Windows-driver-samples `audio/Acx/Samples`
 //! (AudioCodec: `Device.cpp`, `RenderCircuit.cpp`, `StreamEngine.cpp`), minus
-//! the volume/mute elements (so Windows applies software volume) and the
-//! S0-idle policy (D0Exit closes every L2CAP channel).
+//! the S0-idle policy (D0Exit closes every L2CAP channel).
+//!
+//! # Unified volume (hardware volume through the inbox AVRCP stack)
+//! Unless `DisableAvrcpVolume` is set (below), the render circuit also
+//! provides the private contract the inbox AVRCP volume controller
+//! (`BthAvrcp.dll` in BthAvctpSvc) drives for `BthA2dp.sys`, so the buds'
+//! volume and the Windows slider become one control. Recovered from the
+//! disassembly in `target/avrcp-research` (`inbox-contract.md`, `PLAN.md`);
+//! nothing of it is documented:
+//! * interface category `{e630310c-1733-42bb-9847-7e45d1a27490}`
+//!   ([`KSCATEGORY_AVRCP_VOLUME`]): BthAvrcp and BthAvctpSvc find the
+//!   interface by this class on the A2DP devnode (instance id + class +
+//!   enabled; no reference string, no driver test). Assigned with
+//!   `AcxCircuitInitAssignCategories`, which *replaces* ACX's own list, so
+//!   [`RENDER_CATEGORIES`] repeats that list (required first entry
+//!   `{2c6bb644-...}`, `Acx01000!AfxCircuit::FinishCategoryInitializing`).
+//! * KS property `{401e566b-b47e-4e34-b0fc-94826e9e2a1a}` id 1 ([`AVRCP_VOLUME_SET`],
+//!   GET/SET, one LONG in 1/65536 dB, -63.5..0 dB): BthAvrcp reads the level
+//!   to send to the buds and writes the buds' level.
+//! * KS event, same set, id 1: generated when the Windows-side level or mute
+//!   changes; BthAvrcp then reads the property.
+//! * KS method `{0e62540f-bac4-4b85-b344-0d82ed5008ac}` id 6
+//!   ([`A2DP_SERVICE_METHOD_SET`], `MethodServiceReady`): sent by
+//!   BthAvctpSvc when it finds the interface. BthA2dp parks it; its sender
+//!   only traces the result (`lambda_9e75...::operator()` in BthAvctpSvc), so
+//!   it is completed at once with success here.
+//! * an `AcxVolume` and an `AcxMute` element with BthA2dp's range: Windows
+//!   stops scaling the PCM and hands the level to the driver.
+//!
+//! The state and its rules (taper, echo rule, connect sync, mute) are in
+//! `avrcp_vol.rs`; the service applies the level in software while nobody
+//! on the AVRCP side answers (`crossc_ioctl::audio` "Volume"). ACX
+//! marshals every one of these requests (caller-context capture, size
+//! checks); the handlers below see captured buffers at PASSIVE.
+//!
+//! Everything new is traced with an `avrcp:` prefix (DebugView, "Capture
+//! Kernel"): circuit build, method 6, event enable / disable, every property
+//! GET / SET with its value, every Windows volume / mute write. The process
+//! id in those lines is the context the callback runs in
+//! (`PsGetCurrentProcessId`); ACX runs the event enable in the caller's
+//! context, the property and method callbacks possibly not.
 //!
 //! # How ACX is called from Rust
 //! ACX is a KMDF class extension. Every DDI is an entry of the function table
@@ -43,11 +82,28 @@
 //! Neither can skip the class-extension *binding* done by the loader before
 //! `DriverEntry`, and neither undoes the INF changes.
 //!
+//! `DisableAvrcpVolume` (REG_DWORD, non-zero), in the same two keys, turns
+//! off only the unified volume: no category list, property, method, event,
+//! volume or mute element is registered, and the endpoint is exactly the
+//! v0.1.1 one (Windows applies software volume). The device key is read when
+//! the device is added, so a change needs a device restart (disable/enable,
+//! or reconnecting the buds is not enough).
+//!
 //! # Failure policy
 //! * `AcxDriverInitialize` fails -> ACX off for the driver, pipe unaffected.
 //! * `AcxDeviceInitInitialize` / `AcxDeviceInitialize` fail -> DeviceAdd fails
 //!   (the WDFDEVICE_INIT has already been modified by ACX).
 //! * Anything circuit-level fails -> logged, no endpoint, pipe unaffected.
+//! * The unified volume costs the endpoint nothing: with it on, any failure
+//!   building or adding the circuit (the circuit init, `AcxCircuitCreate`,
+//!   a missing volume element or AVRCP event, the pins, and
+//!   `AcxDeviceAddCircuit`, where ACX checks the category list and the
+//!   elements' default connections and registers the interfaces) deletes the
+//!   half-built circuit (`WdfObjectDelete` of a circuit that was never
+//!   added, as after `AcxDeviceDetachCircuit`) and builds the v0.1.1 circuit
+//!   once instead; the feature then stays off for the device until it is
+//!   added again. Only a missing mute element is tolerated (Windows mutes in
+//!   software).
 
 use core::mem::{offset_of, size_of, zeroed};
 use core::ptr::{addr_of_mut, null_mut};
@@ -62,6 +118,7 @@ use wdk_sys::ntddk::{
 use wdk_sys::*;
 
 use crate::audio_core::ring_bytes;
+use crate::avrcp_vol::{self, CHANNELS, LEVEL_MAX, LEVEL_MIN, LEVEL_STEP};
 use crate::rt_limits::{self, StreamSlots};
 use crate::{CtxInfo, DeviceContext, attributes, audio, nt_success, trace};
 use sys::*;
@@ -146,6 +203,94 @@ const KSDATAFORMAT_SPECIFIER_WAVEFORMATEX: GUID =
 /// Vendor component id of the render circuit {871EEB92-ABB3-43B1-9E2F-4C2206CC0CCF}.
 static RENDER_COMPONENT_ID: GUID = guid(0x871E_EB92, 0xABB3, 0x43B1, [0x9E, 0x2F, 0x4C, 0x22, 0x06, 0xCC, 0x0C, 0xCF]);
 
+// ---- unified volume (see the module docs) ---------------------------------
+// The private GUIDs were read from BthA2dp.sys 10.0.26100.9750 with its
+// public PDB (`db 140073eb0`, `db 140073f20`, `db 1400740a0`) and are the
+// ones BthAvrcp.dll / BthAvctpSvc.dll reference; ACX's category list from
+// Acx01000.sys (`db 14002e8e0 L60`).
+
+/// BthA2dp "VolumeLevelCache" property / "VolumeCacheWritten" event set
+/// {401E566B-B47E-4E34-B0FC-94826E9E2A1A}.
+static AVRCP_VOLUME_SET: GUID = guid(0x401E_566B, 0xB47E, 0x4E34, [0xB0, 0xFC, 0x94, 0x82, 0x6E, 0x9E, 0x2A, 0x1A]);
+/// The one property / event id in that set.
+const AVRCP_VOLUME_ID: ULONG = 1;
+/// BthA2dp controller method set {0E62540F-BAC4-4B85-B344-0D82ED5008AC}.
+static A2DP_SERVICE_METHOD_SET: GUID =
+    guid(0x0E62_540F, 0xBAC4, 0x4B85, [0xB3, 0x44, 0x0D, 0x82, 0xED, 0x50, 0x08, 0xAC]);
+/// `AVFilter::MethodServiceReady`, the only id BthAvctpSvc sends to a sink
+/// node (ids 0-5 and 7 are used by the PC-as-sink path only).
+const A2DP_METHOD_SERVICE_READY: ULONG = 6;
+/// Interface class of BthA2dp's controller filter {E630310C-1733-42BB-9847-7E45D1A27490}.
+const KSCATEGORY_AVRCP_VOLUME: GUID = guid(0xE630_310C, 0x1733, 0x42BB, [0x98, 0x47, 0x7E, 0x45, 0xD1, 0xA2, 0x74, 0x90]);
+/// First entry ACX requires in a category list {2C6BB644-E1AE-47F8-9A2B-1D1FA750F2FA}.
+const ACX_CIRCUIT_CATEGORY: GUID = guid(0x2C6B_B644, 0xE1AE, 0x47F8, [0x9A, 0x2B, 0x1D, 0x1F, 0xA7, 0x50, 0xF2, 0xFA]);
+/// ks.h `KSCATEGORY_RENDER` {65E8773E-8F56-11D0-A3B9-00A0C9223196}
+const KSCATEGORY_RENDER: GUID = guid(0x65E8_773E, 0x8F56, 0x11D0, [0xA3, 0xB9, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96]);
+/// ks.h `KSCATEGORY_CAPTURE` {65E8773D-8F56-11D0-A3B9-00A0C9223196}
+const KSCATEGORY_CAPTURE: GUID = guid(0x65E8_773D, 0x8F56, 0x11D0, [0xA3, 0xB9, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96]);
+/// ksmedia.h `KSCATEGORY_REALTIME` {EB115FFC-10C8-4964-831D-6DCB02E6F23F}
+const KSCATEGORY_REALTIME: GUID = guid(0xEB11_5FFC, 0x10C8, 0x4964, [0x83, 0x1D, 0x6D, 0xCB, 0x02, 0xE6, 0xF2, 0x3F]);
+/// ksmedia.h `KSCATEGORY_TOPOLOGY` {DDA54A40-1E4C-11D1-A050-405705C10000}
+const KSCATEGORY_TOPOLOGY: GUID = guid(0xDDA5_4A40, 0x1E4C, 0x11D1, [0xA0, 0x50, 0x40, 0x57, 0x05, 0xC1, 0x00, 0x00]);
+/// ksmedia.h `KSAUDFNAME_VOLUME_CONTROL` {185FEDF7-9905-11D1-95A9-00C04FB925D3}
+static KSAUDFNAME_VOLUME_CONTROL: GUID =
+    guid(0x185F_EDF7, 0x9905, 0x11D1, [0x95, 0xA9, 0x00, 0xC0, 0x4F, 0xB9, 0x25, 0xD3]);
+/// ksmedia.h `KSAUDFNAME_WAVE_MUTE` {185FEDE6-9905-11D1-95A9-00C04FB925D3}
+static KSAUDFNAME_WAVE_MUTE: GUID = guid(0x185F_EDE6, 0x9905, 0x11D1, [0x95, 0xA9, 0x00, 0xC0, 0x4F, 0xB9, 0x25, 0xD3]);
+/// ACX's default list for a render circuit with a sink pin, in its order
+/// (`Acx01000!AfxCircuit::FinishCategoryInitializing`, `14002e8e0`), plus
+/// the AVRCP volume class. ACX copies the array.
+static RENDER_CATEGORIES: [GUID; 7] = [
+    ACX_CIRCUIT_CATEGORY,
+    guid(0x6994_AD04, 0x93EF, 0x11D0, [0xA3, 0xCC, 0x00, 0xA0, 0xC9, 0x22, 0x31, 0x96]), // KSCATEGORY_AUDIO
+    KSCATEGORY_RENDER,
+    KSCATEGORY_CAPTURE,
+    KSCATEGORY_REALTIME,
+    KSCATEGORY_TOPOLOGY,
+    KSCATEGORY_AVRCP_VOLUME,
+];
+/// acxrequest.h item flags (KSPROPERTY_TYPE_GET / _SET, KSMETHOD_TYPE_SEND).
+const PROPERTY_FLAG_GET: ULONG = 0x1;
+const PROPERTY_FLAG_SET: ULONG = 0x2;
+const METHOD_FLAG_SEND: ULONG = 0x1;
+/// VARENUM `VT_I4`: what ACX reports in a BASICSUPPORT answer.
+const VT_I4: ULONG = 3;
+/// acxelements.h `AcxElementIdDefault`.
+const ACX_ELEMENT_ID_DEFAULT: ULONG = u32::MAX;
+
+/// Item tables handed to ACX. Writable statics like the samples' (ACX gets
+/// non-const pointers), never written by this driver.
+#[repr(transparent)]
+struct AcxItems<T>(core::cell::UnsafeCell<T>);
+// SAFETY: written by nobody; ACX only reads them.
+unsafe impl<T> Sync for AcxItems<T> {}
+
+/// Property `{401e566b}` id 1: GET and SET of one LONG; the KSPROPERTY
+/// alone is the control (BthA2dp: MinProperty 0x18, MinData 4).
+static AVRCP_PROPERTIES: AcxItems<[ACX_PROPERTY_ITEM; 1]> = AcxItems(core::cell::UnsafeCell::new([ACX_PROPERTY_ITEM {
+    Set: &raw const AVRCP_VOLUME_SET,
+    Id: AVRCP_VOLUME_ID,
+    Flags: PROPERTY_FLAG_GET | PROPERTY_FLAG_SET,
+    EvtAcxObjectProcessRequest: Some(evt_avrcp_property),
+    Reserved: null_mut(),
+    ControlCb: 0,
+    ValueCb: size_of::<LONG>() as ULONG,
+    ValueType: VT_I4,
+}]));
+
+/// Method `{0e62540f}` id 6: no arguments, no result (BthA2dp: MinMethod
+/// 0x18, MinData 0; BthAvctpSvc sends KSMETHOD flags 1 = SEND).
+static AVRCP_METHODS: AcxItems<[ACX_METHOD_ITEM; 1]> = AcxItems(core::cell::UnsafeCell::new([ACX_METHOD_ITEM {
+    Set: &raw const A2DP_SERVICE_METHOD_SET,
+    Id: A2DP_METHOD_SERVICE_READY,
+    Flags: METHOD_FLAG_SEND,
+    EvtAcxObjectProcessRequest: Some(evt_avrcp_method),
+    Reserved: null_mut(),
+    ArgsCb: 0,
+    ResultCb: 0,
+    ResultType: 0,
+}]));
+
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 const SPEAKER_FRONT_LEFT: u32 = 0x1;
 const SPEAKER_FRONT_RIGHT: u32 = 0x2;
@@ -183,6 +328,7 @@ static CIRCUIT_NAME_US: StaticUnicode = StaticUnicode(UNICODE_STRING {
     Buffer: CIRCUIT_NAME.as_ptr().cast_mut(),
 });
 static DISABLE_ACX_VALUE: [u16; 10] = utf16("DisableAcx");
+static DISABLE_AVRCP_VOLUME_VALUE: [u16; 18] = utf16("DisableAvrcpVolume");
 
 fn unicode(s: &'static [u16]) -> UNICODE_STRING {
     UNICODE_STRING {
@@ -446,6 +592,101 @@ const _: () = {
     assert!(ACX_ID_DEFAULT == 0xFFFF_FFFF && ACX_INSTANCE_INDETERMINATE == 0xFFFF_FFFF);
     assert!(WAVE_FORMAT_EXTENSIBLE == 0xFFFE && KSAUDIO_SPEAKER_STEREO == 3);
     assert!(FORMATS[0].cb_size == 22 && FORMATS[0].format_size == 104);
+
+    // ---- unified volume (msvc-layout.txt, "unified volume" part) ----------
+    assert!(_ACXFUNCENUM::AcxCircuitInitAssignCategoriesTableIndex == 5);
+    assert!(_ACXFUNCENUM::AcxCircuitInitAssignPropertiesTableIndex == 7);
+    assert!(_ACXFUNCENUM::AcxCircuitInitAssignMethodsTableIndex == 8);
+    assert!(_ACXFUNCENUM::AcxCircuitAddEventsTableIndex == 15);
+    assert!(_ACXFUNCENUM::AcxCircuitAddElementsTableIndex == 16);
+    assert!(_ACXFUNCENUM::AcxMuteCreateTableIndex == 84);
+    assert!(_ACXFUNCENUM::AcxMuteChangeStateNotificationTableIndex == 85);
+    assert!(_ACXFUNCENUM::AcxVolumeCreateTableIndex == 86);
+    assert!(_ACXFUNCENUM::AcxVolumeChangeLevelNotificationTableIndex == 87);
+    assert!(_ACXFUNCENUM::AcxEventCreateTableIndex == 95);
+    assert!(_ACXFUNCENUM::AcxEventGenerateEventTableIndex == 97);
+    assert!(_ACXFUNCENUM::AcxRequestGetParametersTableIndex == 153);
+    assert!(size_of::<ACX_PROPERTY_ITEM>() == 48);
+    assert!(offset_of!(ACX_PROPERTY_ITEM, Id) == 8);
+    assert!(offset_of!(ACX_PROPERTY_ITEM, Flags) == 12);
+    assert!(offset_of!(ACX_PROPERTY_ITEM, EvtAcxObjectProcessRequest) == 16);
+    assert!(offset_of!(ACX_PROPERTY_ITEM, Reserved) == 24);
+    assert!(offset_of!(ACX_PROPERTY_ITEM, ControlCb) == 32);
+    assert!(offset_of!(ACX_PROPERTY_ITEM, ValueCb) == 36);
+    assert!(offset_of!(ACX_PROPERTY_ITEM, ValueType) == 40);
+    assert!(size_of::<ACX_METHOD_ITEM>() == 48);
+    assert!(offset_of!(ACX_METHOD_ITEM, Id) == 8);
+    assert!(offset_of!(ACX_METHOD_ITEM, Flags) == 12);
+    assert!(offset_of!(ACX_METHOD_ITEM, EvtAcxObjectProcessRequest) == 16);
+    assert!(offset_of!(ACX_METHOD_ITEM, Reserved) == 24);
+    assert!(offset_of!(ACX_METHOD_ITEM, ArgsCb) == 32);
+    assert!(offset_of!(ACX_METHOD_ITEM, ResultCb) == 36);
+    assert!(offset_of!(ACX_METHOD_ITEM, ResultType) == 40);
+    assert!(size_of::<ACX_EVENT_CALLBACKS>() == 32);
+    assert!(offset_of!(ACX_EVENT_CALLBACKS, EvtAcxEventEnable) == 8);
+    assert!(offset_of!(ACX_EVENT_CALLBACKS, EvtAcxEventDisable) == 16);
+    assert!(offset_of!(ACX_EVENT_CALLBACKS, EvtAcxEventProcessRequest) == 24);
+    assert!(size_of::<ACX_EVENT_CONFIG>() == 32);
+    assert!(offset_of!(ACX_EVENT_CONFIG, Flags) == 4);
+    assert!(offset_of!(ACX_EVENT_CONFIG, Set) == 8);
+    assert!(offset_of!(ACX_EVENT_CONFIG, Id) == 16);
+    assert!(offset_of!(ACX_EVENT_CONFIG, Type) == 20);
+    assert!(offset_of!(ACX_EVENT_CONFIG, Callbacks) == 24);
+    assert!(size_of::<ACX_VOLUME_CALLBACKS>() == 40);
+    assert!(offset_of!(ACX_VOLUME_CALLBACKS, EvtAcxVolumeAssignLevel) == 8);
+    assert!(offset_of!(ACX_VOLUME_CALLBACKS, EvtAcxRampedVolumeAssignLevel) == 16);
+    assert!(offset_of!(ACX_VOLUME_CALLBACKS, EvtAcxVolumeRetrieveLevel) == 24);
+    assert!(offset_of!(ACX_VOLUME_CALLBACKS, EvtAcxVolumeProcessRequest) == 32);
+    assert!(size_of::<ACX_VOLUME_CONFIG>() == 48);
+    assert!(offset_of!(ACX_VOLUME_CONFIG, Id) == 4);
+    assert!(offset_of!(ACX_VOLUME_CONFIG, Name) == 8);
+    assert!(offset_of!(ACX_VOLUME_CONFIG, Flags) == 16);
+    assert!(offset_of!(ACX_VOLUME_CONFIG, ChannelsCount) == 20);
+    assert!(offset_of!(ACX_VOLUME_CONFIG, Maximum) == 24);
+    assert!(offset_of!(ACX_VOLUME_CONFIG, Minimum) == 28);
+    assert!(offset_of!(ACX_VOLUME_CONFIG, SteppingDelta) == 32);
+    assert!(offset_of!(ACX_VOLUME_CONFIG, Callbacks) == 40);
+    assert!(size_of::<ACX_MUTE_CALLBACKS>() == 32);
+    assert!(offset_of!(ACX_MUTE_CALLBACKS, EvtAcxMuteAssignState) == 8);
+    assert!(offset_of!(ACX_MUTE_CALLBACKS, EvtAcxMuteRetrieveState) == 16);
+    assert!(offset_of!(ACX_MUTE_CALLBACKS, EvtAcxMuteProcessRequest) == 24);
+    assert!(size_of::<ACX_MUTE_CONFIG>() == 32);
+    assert!(offset_of!(ACX_MUTE_CONFIG, Id) == 4);
+    assert!(offset_of!(ACX_MUTE_CONFIG, Name) == 8);
+    assert!(offset_of!(ACX_MUTE_CONFIG, Flags) == 16);
+    assert!(offset_of!(ACX_MUTE_CONFIG, ChannelsCount) == 20);
+    assert!(offset_of!(ACX_MUTE_CONFIG, Callbacks) == 24);
+    assert!(size_of::<ACX_REQUEST_PARAMETERS>() == 72);
+    assert!(offset_of!(ACX_REQUEST_PARAMETERS, Type) == 4);
+    assert!(offset_of!(ACX_REQUEST_PARAMETERS, Parameters) == 8);
+    assert!(offset_of!(_ACX_REQUEST_PARAMETERS__bindgen_ty_1__bindgen_ty_1, Set) == 0);
+    assert!(offset_of!(_ACX_REQUEST_PARAMETERS__bindgen_ty_1__bindgen_ty_1, Id) == 16);
+    assert!(offset_of!(_ACX_REQUEST_PARAMETERS__bindgen_ty_1__bindgen_ty_1, Verb) == 20);
+    assert!(offset_of!(_ACX_REQUEST_PARAMETERS__bindgen_ty_1__bindgen_ty_1, Value) == 48);
+    assert!(offset_of!(_ACX_REQUEST_PARAMETERS__bindgen_ty_1__bindgen_ty_1, ValueCb) == 56);
+    assert!(offset_of!(_ACX_REQUEST_PARAMETERS__bindgen_ty_1__bindgen_ty_2, Id) == 16);
+    assert!(_ACX_REQUEST_TYPE::AcxRequestTypeProperty == 3);
+    assert!(_ACX_REQUEST_TYPE::AcxRequestTypeMethod == 4);
+    assert!(_ACX_PROPERTY_VERB::AcxPropertyVerbGet == 1);
+    assert!(_ACX_PROPERTY_VERB::AcxPropertyVerbSet == 2);
+    assert!(PROPERTY_FLAG_GET == ACX_PROPERTY_ITEM_FLAG_GET && PROPERTY_FLAG_GET == 0x1);
+    assert!(PROPERTY_FLAG_SET == ACX_PROPERTY_ITEM_FLAG_SET && PROPERTY_FLAG_SET == 0x2);
+    assert!(METHOD_FLAG_SEND == ACX_METHOD_ITEM_FLAG_SEND && METHOD_FLAG_SEND == 0x1);
+    assert!(ACX_ELEMENT_ID_DEFAULT == 0xFFFF_FFFF);
+    assert!(STATUS_INVALID_DEVICE_STATE as u32 == 0xC000_0184);
+    assert!(STATUS_INVALID_DEVICE_REQUEST as u32 == 0xC000_0010);
+    assert!(STATUS_INVALID_PARAMETER as u32 == 0xC000_000D);
+    // GUIDs: ksmedia.h / ks.h ones as printed by acxcheck; the private ones
+    // as dumped from BthA2dp.sys (module docs).
+    assert!(KSCATEGORY_CAPTURE.Data1 == 0x65E8_773D && KSCATEGORY_CAPTURE.Data4[7] == 0x96);
+    assert!(KSCATEGORY_TOPOLOGY.Data1 == 0xDDA5_4A40 && KSCATEGORY_TOPOLOGY.Data4[7] == 0x00);
+    assert!(KSCATEGORY_RENDER.Data1 == 0x65E8_773E && KSCATEGORY_REALTIME.Data1 == 0xEB11_5FFC);
+    assert!(KSAUDFNAME_VOLUME_CONTROL.Data1 == 0x185F_EDF7 && KSAUDFNAME_WAVE_MUTE.Data1 == 0x185F_EDE6);
+    assert!(RENDER_CATEGORIES[0].Data1 == 0x2C6B_B644 && RENDER_CATEGORIES[6].Data1 == 0xE630_310C);
+    assert!(RENDER_CATEGORIES[1].Data1 == KSCATEGORY_AUDIO.Data1);
+    assert!(AVRCP_VOLUME_SET.Data1 == 0x401E_566B && A2DP_SERVICE_METHOD_SET.Data1 == 0x0E62_540F);
+    // The volume element's range is the one avrcp_vol.rs maps.
+    assert!(LEVEL_MIN as u32 == 0xFFC0_8000 && LEVEL_MAX == 0 && LEVEL_STEP == 0x8000 && CHANNELS == 2);
 };
 
 // ---------------------------------------------------------------------------
@@ -489,8 +730,35 @@ struct AcxDeviceCtx {
     /// [`rt_limits::MAX_STREAMS`]). All zero, as WDF hands the context out,
     /// is the empty count.
     streams: StreamSlots,
+    /// The unified volume is on for this device (neither key has
+    /// `DisableAvrcpVolume`). Written once in [`device_created`].
+    avrcp_volume: bool,
+    /// The circuit's ACXVOLUME / ACXMUTE / ACXEVENT while it is added, else
+    /// 0. Read by [`evt_vol_work`]; cleared (and the work item flushed) in
+    /// [`evt_release_hardware`] before the circuit is deleted.
+    volume: AtomicUsize,
+    mute: AtomicUsize,
+    event: AtomicUsize,
+    /// Runs [`evt_vol_work`] at PASSIVE. Created once in [`device_created`].
+    vol_work: WDFWORKITEM,
+    /// `VOL_WORK_*` bits the work item has to do.
+    vol_pending: AtomicU32,
 }
 acx_context_type!(ACX_DEVICE_CTX_INFO, AcxDeviceCtx, c"CrossCAcxDeviceContext", acx_device_ctx);
+
+/// [`evt_vol_work`] jobs.
+const VOL_WORK_LEVEL: u32 = 1;
+const VOL_WORK_MUTE: u32 = 2;
+const VOL_WORK_EVENT: u32 = 4;
+
+/// Context of the circuit and of its volume, mute and event objects: the
+/// way from an ACX callback to the device.
+#[repr(C)]
+struct LinkCtx {
+    dev: *mut DeviceContext,
+    adev: *mut AcxDeviceCtx,
+}
+acx_context_type!(LINK_CTX_INFO, LinkCtx, c"CrossCAcxLinkContext", link_ctx);
 
 /// Context of the ACXJACK: the way from the presence callback to the device.
 #[repr(C)]
@@ -563,16 +831,27 @@ acx_context_type!(STREAM_CTX_INFO, StreamCtx, c"CrossCAcxStreamContext", stream_
 // Kill switch
 // ---------------------------------------------------------------------------
 
-/// Reads `DisableAcx` from an open key and closes the key.
-unsafe fn disable_acx_value(key: WDFKEY) -> bool {
+/// A REG_DWORD flag in an open key is present and non-zero.
+unsafe fn flag_value(key: WDFKEY, name: &'static [u16]) -> bool {
     unsafe {
-        let name = unicode(&DISABLE_ACX_VALUE);
+        let name = unicode(name);
         let mut value: ULONG = 0;
         let status = call_unsafe_wdf_function_binding!(WdfRegistryQueryULong, key, &raw const name, &raw mut value);
-        call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
         nt_success(status) && value != 0
     }
 }
+
+/// Reads `DisableAcx` from an open key and closes the key.
+unsafe fn disable_acx_value(key: WDFKEY) -> bool {
+    unsafe {
+        let off = flag_value(key, &DISABLE_ACX_VALUE);
+        call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
+        off
+    }
+}
+
+/// `DisableAvrcpVolume` in the service Parameters key (read in `driver_init`).
+static AVRCP_VOLUME_OFF: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Driver / device hooks (called from lib.rs)
@@ -600,9 +879,15 @@ pub unsafe fn driver_init(driver: WDFDRIVER) {
             WDF_NO_OBJECT_ATTRIBUTES,
             &raw mut key
         );
-        if nt_success(status) && disable_acx_value(key) {
-            trace!("acx: DisableAcx set in the service Parameters key - ACX off");
-            return;
+        if nt_success(status) {
+            if flag_value(key, &DISABLE_AVRCP_VOLUME_VALUE) {
+                AVRCP_VOLUME_OFF.store(true, Ordering::SeqCst);
+                trace!("avrcp: DisableAvrcpVolume set in the service Parameters key - unified volume off");
+            }
+            if disable_acx_value(key) {
+                trace!("acx: DisableAcx set in the service Parameters key - ACX off");
+                return;
+            }
         }
         if !table_bound() {
             let globals = (&raw const AcxDriverGlobals).read();
@@ -697,7 +982,48 @@ pub unsafe fn device_created(device: WDFDEVICE) -> NTSTATUS {
             (*ctx).jack_work = null_mut();
             return status;
         }
-        trace!("acx: device initialized");
+
+        // Unified volume: both kill switches, then its work item. Neither
+        // can fail the device; without the work item the feature is off.
+        let mut device_off = false;
+        let mut key: WDFKEY = null_mut();
+        let st = call_unsafe_wdf_function_binding!(
+            WdfDeviceOpenRegistryKey,
+            device,
+            PLUGPLAY_REGKEY_DEVICE,
+            KEY_READ,
+            WDF_NO_OBJECT_ATTRIBUTES,
+            &raw mut key
+        );
+        if nt_success(st) {
+            device_off = flag_value(key, &DISABLE_AVRCP_VOLUME_VALUE);
+            call_unsafe_wdf_function_binding!(WdfRegistryClose, key);
+        }
+        if device_off {
+            trace!("avrcp: DisableAvrcpVolume set in the device key - unified volume off for this device");
+        }
+        (*ctx).avrcp_volume = !device_off && !AVRCP_VOLUME_OFF.load(Ordering::SeqCst);
+        if (*ctx).avrcp_volume {
+            let mut wcfg = WDF_WORKITEM_CONFIG {
+                Size: size_of::<WDF_WORKITEM_CONFIG>() as ULONG,
+                EvtWorkItemFunc: Some(evt_vol_work),
+                AutomaticSerialization: 0,
+            };
+            let mut attr = attributes();
+            attr.ParentObject = device.cast();
+            let st = call_unsafe_wdf_function_binding!(
+                WdfWorkItemCreate,
+                &raw mut wcfg,
+                &raw mut attr,
+                addr_of_mut!((*ctx).vol_work)
+            );
+            if !nt_success(st) {
+                trace!("avrcp: WdfWorkItemCreate failed {:#x} - unified volume off", st);
+                (*ctx).vol_work = null_mut();
+                (*ctx).avrcp_volume = false;
+            }
+        }
+        trace!("acx: device initialized (unified volume {})", if (*ctx).avrcp_volume { "on" } else { "off" });
         STATUS_SUCCESS
     }
 }
@@ -712,25 +1038,41 @@ pub unsafe extern "C" fn evt_prepare_hardware(device: WDFDEVICE, _raw: WDFCMRESL
         if ctx.is_null() || !(*ctx).render.is_null() || (*ctx).failed {
             return STATUS_SUCCESS;
         }
-        let (circuit, jack) = match create_render_circuit(device) {
-            Ok(c) => c,
+        let mut built = add_render_circuit(device, (*ctx).avrcp_volume);
+        if let Err(status) = built
+            && (*ctx).avrcp_volume
+        {
+            // The half-built circuit is gone: the plain v0.1.1 circuit
+            // instead, and no new attempt with the feature on this device
+            // (a rebalance would only fail the same way).
+            trace!("avrcp: circuit with the volume contract failed {:#x} - unified volume off, building it without", status);
+            (*ctx).avrcp_volume = false;
+            built = add_render_circuit(device, false);
+        }
+        let Built { circuit, jack, vol } = match built {
+            Ok(b) => b,
             Err(status) => {
-                trace!("acx: render circuit creation failed {:#x} - no endpoint", status);
+                trace!("acx: render circuit failed {:#x} - no endpoint", status);
                 (*ctx).failed = true;
                 return STATUS_SUCCESS;
             }
         };
-        let status = acx!(AcxDeviceAddCircuitTableIndex, PFN_ACXDEVICEADDCIRCUIT, device, circuit);
-        if !nt_success(status) {
-            trace!("acx: AcxDeviceAddCircuit failed {:#x} - no endpoint", status);
-            (*ctx).failed = true;
-            return STATUS_SUCCESS;
-        }
         (*ctx).render = circuit;
         (*ctx).jack.store(jack as usize, Ordering::SeqCst);
+        let dev = crate::device_ctx(device.cast());
+        (*ctx).volume.store(vol.volume as usize, Ordering::SeqCst);
+        (*ctx).mute.store(vol.mute as usize, Ordering::SeqCst);
+        (*ctx).event.store(vol.event as usize, Ordering::SeqCst);
+        let element = !vol.volume.is_null();
+        audio::volume(dev, |v| v.set_element(element));
         // From here on the audio IOCTLs work (AUDIO_FLAG_ACX).
-        audio::set_endpoint(crate::device_ctx(device.cast()), true);
-        trace!("acx: render circuit added (jack: unplugged until a service sets the link)");
+        audio::set_endpoint(dev, true);
+        trace!(
+            "acx: render circuit added (jack: unplugged until a service sets the link; hardware volume {}, mute {}, AVRCP event {})",
+            element,
+            !vol.mute.is_null(),
+            !vol.event.is_null()
+        );
         STATUS_SUCCESS
     }
 }
@@ -750,7 +1092,16 @@ pub unsafe extern "C" fn evt_release_hardware(device: WDFDEVICE, _translated: WD
         if !(*ctx).jack_work.is_null() {
             call_unsafe_wdf_function_binding!(WdfWorkItemFlush, (*ctx).jack_work);
         }
-        audio::set_endpoint(crate::device_ctx(device.cast()), false);
+        // Same for the volume objects, which also go with the circuit.
+        (*ctx).volume.store(0, Ordering::SeqCst);
+        (*ctx).mute.store(0, Ordering::SeqCst);
+        (*ctx).event.store(0, Ordering::SeqCst);
+        if !(*ctx).vol_work.is_null() {
+            call_unsafe_wdf_function_binding!(WdfWorkItemFlush, (*ctx).vol_work);
+        }
+        let dev = crate::device_ctx(device.cast());
+        audio::volume(dev, |v| v.set_element(false));
+        audio::set_endpoint(dev, false);
         let status = acx!(AcxDeviceRemoveCircuitTableIndex, PFN_ACXDEVICEREMOVECIRCUIT, device, (*ctx).render);
         (*ctx).render = null_mut();
         trace!("acx: render circuit removed ({:#x})", status);
@@ -771,13 +1122,235 @@ fn check(status: NTSTATUS, what: &str) -> Result<(), NTSTATUS> {
     }
 }
 
-unsafe fn create_render_circuit(device: WDFDEVICE) -> Result<(ACXCIRCUIT, ACXJACK), NTSTATUS> {
+/// The circuit's unified-volume objects; null where not created.
+#[derive(Clone, Copy)]
+struct VolObjects {
+    volume: ACXVOLUME,
+    mute: ACXMUTE,
+    event: ACXEVENT,
+}
+
+const NO_VOL: VolObjects = VolObjects { volume: null_mut(), mute: null_mut(), event: null_mut() };
+
+/// A render circuit, ready for AcxDeviceAddCircuit.
+struct Built {
+    circuit: ACXCIRCUIT,
+    jack: ACXJACK,
+    vol: VolObjects,
+}
+
+/// Unified volume, before AcxCircuitCreate: the category list (ACX's own
+/// plus the AVRCP volume class), the property and the method.
+unsafe fn assign_avrcp_init(init: PACXCIRCUIT_INIT) -> NTSTATUS {
+    unsafe {
+        let st = acx!(
+            AcxCircuitInitAssignCategoriesTableIndex,
+            PFN_ACXCIRCUITINITASSIGNCATEGORIES,
+            init,
+            RENDER_CATEGORIES.as_ptr(),
+            RENDER_CATEGORIES.len() as ULONG
+        );
+        if !nt_success(st) {
+            trace!("avrcp: AcxCircuitInitAssignCategories failed {:#x}", st);
+            return st;
+        }
+        let st = acx!(
+            AcxCircuitInitAssignPropertiesTableIndex,
+            PFN_ACXCIRCUITINITASSIGNPROPERTIES,
+            init,
+            AVRCP_PROPERTIES.0.get().cast(),
+            1
+        );
+        if !nt_success(st) {
+            trace!("avrcp: AcxCircuitInitAssignProperties failed {:#x}", st);
+            return st;
+        }
+        let st =
+            acx!(AcxCircuitInitAssignMethodsTableIndex, PFN_ACXCIRCUITINITASSIGNMETHODS, init, AVRCP_METHODS.0.get().cast(), 1);
+        if !nt_success(st) {
+            trace!("avrcp: AcxCircuitInitAssignMethods failed {:#x}", st);
+        }
+        st
+    }
+}
+
+/// Unified volume, after AcxCircuitCreate and before the pins: the volume
+/// and mute elements (ACX connects host pin -> volume -> mute -> bridge pin
+/// in the order they are added) and the AVRCP event. Without the volume
+/// element nothing else is made and without the event the result lacks it;
+/// either way [`add_render_circuit`] then discards the whole circuit and
+/// builds the v0.1.1 one, because the category, property and method
+/// assigned before `AcxCircuitCreate` cannot be taken back. Without the
+/// mute element the circuit is kept and Windows mutes by itself.
+unsafe fn add_volume_objects(device: WDFDEVICE, circuit: ACXCIRCUIT) -> VolObjects {
+    unsafe {
+        let mut out = NO_VOL;
+        let link = |obj: WDFOBJECT| {
+            let c = link_ctx(obj);
+            if !c.is_null() {
+                (*c).dev = crate::device_ctx(device.cast());
+                (*c).adev = acx_device_ctx(device.cast());
+            }
+            !c.is_null()
+        };
+
+        // ---- volume: BthA2dp's range, two channels, no ramp callback ----
+        // (ACX prefers the ramped callback when present; the buds cannot ramp.)
+        let mut vcb = ACX_VOLUME_CALLBACKS {
+            Size: size_of::<ACX_VOLUME_CALLBACKS>() as ULONG,
+            EvtAcxVolumeAssignLevel: Some(evt_volume_assign),
+            EvtAcxRampedVolumeAssignLevel: None,
+            EvtAcxVolumeRetrieveLevel: Some(evt_volume_retrieve),
+            EvtAcxVolumeProcessRequest: None,
+        };
+        let mut vcfg = ACX_VOLUME_CONFIG {
+            Size: size_of::<ACX_VOLUME_CONFIG>() as ULONG,
+            Id: ACX_ELEMENT_ID_DEFAULT,
+            Name: &raw const KSAUDFNAME_VOLUME_CONTROL,
+            Flags: 0,
+            ChannelsCount: CHANNELS as ULONG,
+            Maximum: LEVEL_MAX,
+            Minimum: LEVEL_MIN,
+            SteppingDelta: LEVEL_STEP as ULONG,
+            Callbacks: &raw mut vcb,
+        };
+        let mut attr = attributes();
+        attr.ParentObject = circuit.cast();
+        attr.ContextTypeInfo = &raw const LINK_CTX_INFO.0;
+        let mut volume: ACXVOLUME = null_mut();
+        let st = acx!(AcxVolumeCreateTableIndex, PFN_ACXVOLUMECREATE, circuit.cast(), &raw mut attr, &raw mut vcfg, &raw mut volume);
+        if !nt_success(st) || !link(volume.cast()) {
+            trace!("avrcp: AcxVolumeCreate failed {:#x} - no hardware volume", st);
+            return NO_VOL;
+        }
+
+        // ---- mute -----------------------------------------------------------
+        let mut mcb = ACX_MUTE_CALLBACKS {
+            Size: size_of::<ACX_MUTE_CALLBACKS>() as ULONG,
+            EvtAcxMuteAssignState: Some(evt_mute_assign),
+            EvtAcxMuteRetrieveState: Some(evt_mute_retrieve),
+            EvtAcxMuteProcessRequest: None,
+        };
+        let mut mcfg = ACX_MUTE_CONFIG {
+            Size: size_of::<ACX_MUTE_CONFIG>() as ULONG,
+            Id: ACX_ELEMENT_ID_DEFAULT,
+            Name: &raw const KSAUDFNAME_WAVE_MUTE,
+            Flags: 0,
+            ChannelsCount: CHANNELS as ULONG,
+            Callbacks: &raw mut mcb,
+        };
+        let mut attr = attributes();
+        attr.ParentObject = circuit.cast();
+        attr.ContextTypeInfo = &raw const LINK_CTX_INFO.0;
+        let mut mute: ACXMUTE = null_mut();
+        let st = acx!(AcxMuteCreateTableIndex, PFN_ACXMUTECREATE, circuit.cast(), &raw mut attr, &raw mut mcfg, &raw mut mute);
+        if !nt_success(st) || !link(mute.cast()) {
+            trace!("avrcp: AcxMuteCreate failed {:#x} - no hardware mute", st);
+            mute = null_mut();
+        }
+
+        let mut elements: [ACXELEMENT; 2] = [volume.cast(), mute.cast()];
+        let count = if mute.is_null() { 1 } else { 2 };
+        let st = acx!(AcxCircuitAddElementsTableIndex, PFN_ACXCIRCUITADDELEMENTS, circuit, elements.as_mut_ptr(), count);
+        if !nt_success(st) {
+            trace!("avrcp: AcxCircuitAddElements failed {:#x} - no hardware volume", st);
+            return NO_VOL;
+        }
+        out.volume = volume;
+        out.mute = mute;
+
+        // ---- the AVRCP event ------------------------------------------------
+        let mut ecb = ACX_EVENT_CALLBACKS {
+            Size: size_of::<ACX_EVENT_CALLBACKS>() as ULONG,
+            EvtAcxEventEnable: Some(evt_avrcp_event_enable),
+            EvtAcxEventDisable: Some(evt_avrcp_event_disable),
+            EvtAcxEventProcessRequest: None,
+        };
+        let mut ecfg = ACX_EVENT_CONFIG {
+            Size: size_of::<ACX_EVENT_CONFIG>() as ULONG,
+            Flags: 0,
+            Set: &raw const AVRCP_VOLUME_SET,
+            Id: AVRCP_VOLUME_ID,
+            Type: 0,
+            Callbacks: &raw mut ecb,
+        };
+        let mut attr = attributes();
+        attr.ParentObject = circuit.cast();
+        attr.ContextTypeInfo = &raw const LINK_CTX_INFO.0;
+        let mut event: ACXEVENT = null_mut();
+        let st = acx!(AcxEventCreateTableIndex, PFN_ACXEVENTCREATE, circuit.cast(), &raw mut attr, &raw mut ecfg, &raw mut event);
+        if !nt_success(st) || !link(event.cast()) {
+            trace!("avrcp: AcxEventCreate failed {:#x} - no AVRCP event", st);
+            return out;
+        }
+        let st = acx!(AcxCircuitAddEventsTableIndex, PFN_ACXCIRCUITADDEVENTS, circuit, &raw mut event, 1);
+        if !nt_success(st) {
+            trace!("avrcp: AcxCircuitAddEvents failed {:#x} - no AVRCP event", st);
+            return out;
+        }
+        out.event = event;
+        out
+    }
+}
+
+/// Build the render circuit and add it to the device.
+///
+/// With `avrcp` every failure deletes the circuit if one was created, so the
+/// caller can build the plain one in its place: a missing volume element or
+/// AVRCP event counts as a failure (a circuit that advertises the AVRCP
+/// interface, property and method without both would be neither the unified
+/// endpoint nor the v0.1.1 one), and so does `AcxDeviceAddCircuit`, which is
+/// where ACX checks what the feature adds (`AfxDevice::AddCircuit` ->
+/// `AfxCircuit::FinishInitializing`: connections through the elements,
+/// `FinishCategoryInitializing`; then `AfxCircuit::Register`: one interface
+/// per category). A circuit that failed `AcxDeviceAddCircuit` is not in the
+/// device's list (AddCircuit unlinks it and drops its reference), and ACX's
+/// own cleanup of a circuit (`AfxCircuit::Deinitialize`, run by the delete)
+/// unregisters whatever was registered and releases the create-time
+/// reference; this is the documented `AcxDeviceDetachCircuit` +
+/// `WdfObjectDelete` path.
+///
+/// Without `avrcp` the behaviour is v0.1.1's: a failed circuit stays
+/// parented to the device and goes away with it.
+unsafe fn add_render_circuit(device: WDFDEVICE, avrcp: bool) -> Result<Built, NTSTATUS> {
+    unsafe {
+        let discard = |circuit: ACXCIRCUIT| {
+            if avrcp && !circuit.is_null() {
+                call_unsafe_wdf_function_binding!(WdfObjectDelete, circuit.cast());
+            }
+        };
+        let built = match create_render_circuit(device, avrcp) {
+            Ok(b) => b,
+            Err((status, circuit)) => {
+                discard(circuit);
+                return Err(status);
+            }
+        };
+        if avrcp && (built.vol.volume.is_null() || built.vol.event.is_null()) {
+            trace!("avrcp: volume element or AVRCP event missing - discarding the circuit");
+            discard(built.circuit);
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+        let status = acx!(AcxDeviceAddCircuitTableIndex, PFN_ACXDEVICEADDCIRCUIT, device, built.circuit);
+        if !nt_success(status) {
+            trace!("acx: AcxDeviceAddCircuit failed {:#x}", status);
+            discard(built.circuit);
+            return Err(status);
+        }
+        Ok(built)
+    }
+}
+
+/// `Err((status, circuit))`: `circuit` is the created circuit (never
+/// added), or null when the failure came before `AcxCircuitCreate`
+/// succeeded.
+unsafe fn create_render_circuit(device: WDFDEVICE, avrcp: bool) -> Result<Built, (NTSTATUS, ACXCIRCUIT)> {
     unsafe {
         // ---- circuit -------------------------------------------------------
         let mut init = acx!(AcxCircuitInitAllocateTableIndex, PFN_ACXCIRCUITINITALLOCATE, device);
         if init.is_null() {
             trace!("acx: AcxCircuitInitAllocate failed");
-            return Err(STATUS_INSUFFICIENT_RESOURCES);
+            return Err((STATUS_INSUFFICIENT_RESOURCES, null_mut()));
         }
         acx!(AcxCircuitInitSetComponentIdTableIndex, PFN_ACXCIRCUITINITSETCOMPONENTID, init, &raw const RENDER_COMPONENT_ID);
         let status =
@@ -787,7 +1360,7 @@ unsafe fn create_render_circuit(device: WDFDEVICE) -> Result<(ACXCIRCUIT, ACXJAC
             // interfaces cannot match, so treat it as fatal for the circuit.
             trace!("acx: AcxCircuitInitAssignName failed {:#x}", status);
             acx!(AcxCircuitInitFreeTableIndex, PFN_ACXCIRCUITINITFREE, init);
-            return Err(status);
+            return Err((status, null_mut()));
         }
         acx!(
             AcxCircuitInitSetCircuitTypeTableIndex,
@@ -818,9 +1391,21 @@ unsafe fn create_render_circuit(device: WDFDEVICE) -> Result<(ACXCIRCUIT, ACXJAC
         if !nt_success(status) {
             trace!("acx: AcxCircuitInitAssignAcxCreateStreamCallback failed {:#x}", status);
             acx!(AcxCircuitInitFreeTableIndex, PFN_ACXCIRCUITINITFREE, init);
-            return Err(status);
+            return Err((status, null_mut()));
+        }
+        if avrcp {
+            let status = assign_avrcp_init(init);
+            if !nt_success(status) {
+                acx!(AcxCircuitInitFreeTableIndex, PFN_ACXCIRCUITINITFREE, init);
+                return Err((status, null_mut()));
+            }
         }
         let mut attr = attributes();
+        if avrcp {
+            // Only with the feature, so the circuit without it is created
+            // exactly as in v0.1.1.
+            attr.ContextTypeInfo = &raw const LINK_CTX_INFO.0;
+        }
         let mut circuit: ACXCIRCUIT = null_mut();
         let status =
             acx!(AcxCircuitCreateTableIndex, PFN_ACXCIRCUITCREATE, device, &raw mut attr, &raw mut init, &raw mut circuit);
@@ -831,10 +1416,31 @@ unsafe fn create_render_circuit(device: WDFDEVICE) -> Result<(ACXCIRCUIT, ACXJAC
             if !init.is_null() {
                 acx!(AcxCircuitInitFreeTableIndex, PFN_ACXCIRCUITINITFREE, init);
             }
-            return Err(status);
+            return Err((status, null_mut()));
         }
-        // From here on a failure leaves `circuit` parented to the device; it
-        // is never added and goes away with the device.
+        // From here on a failure returns `circuit` (never added): without the
+        // feature it stays parented to the device and goes away with it,
+        // with it add_render_circuit deletes it.
+        let check = |status: NTSTATUS, what: &str| check(status, what).map_err(|s| (s, circuit));
+        let vol = if avrcp {
+            // The property and method callbacks find the device through it.
+            let lc = link_ctx(circuit.cast());
+            if !lc.is_null() {
+                (*lc).dev = crate::device_ctx(device.cast());
+                (*lc).adev = acx_device_ctx(device.cast());
+            }
+            add_volume_objects(device, circuit)
+        } else {
+            NO_VOL
+        };
+        if avrcp {
+            trace!(
+                "avrcp: circuit has the volume contract (category {{e630310c}}, property/event {{401e566b}}/1, method {{0e62540f}}/6), volume element {}, mute {}, event {}",
+                !vol.volume.is_null(),
+                !vol.mute.is_null(),
+                !vol.event.is_null()
+            );
+        }
 
         // ---- pins: [0] host (sink, streaming), [1] bridge (source) ---------
         let mut pins: [ACXPIN; 2] = [null_mut(); 2];
@@ -922,7 +1528,7 @@ unsafe fn create_render_circuit(device: WDFDEVICE) -> Result<(ACXCIRCUIT, ACXJAC
         let jc = jack_ctx(jack.cast());
         if jc.is_null() {
             trace!("acx: jack has no context");
-            return Err(STATUS_UNSUCCESSFUL);
+            return Err((STATUS_UNSUCCESSFUL, circuit));
         }
         (*jc).dev = crate::device_ctx(device.cast());
         check(acx!(AcxPinAddJacksTableIndex, PFN_ACXPINADDJACKS, pins[1], &raw mut jack, 1), "AcxPinAddJacks")?;
@@ -931,7 +1537,7 @@ unsafe fn create_render_circuit(device: WDFDEVICE) -> Result<(ACXCIRCUIT, ACXJAC
         let list = acx!(AcxPinGetRawDataFormatListTableIndex, PFN_ACXPINGETRAWDATAFORMATLIST, pins[0]);
         if list.is_null() {
             trace!("acx: AcxPinGetRawDataFormatList returned null");
-            return Err(STATUS_INSUFFICIENT_RESOURCES);
+            return Err((STATUS_INSUFFICIENT_RESOURCES, circuit));
         }
         for (i, ks) in FORMATS.iter().enumerate() {
             // ACX_DATAFORMAT_CONFIG_INIT_KS; ACX copies the KS format.
@@ -964,9 +1570,281 @@ unsafe fn create_render_circuit(device: WDFDEVICE) -> Result<(ACXCIRCUIT, ACXJAC
             }
         }
 
-        // No elements: ACX connects host pin -> bridge pin by default.
+        // ACX connects host pin -> (volume -> mute ->) bridge pin by default.
         check(acx!(AcxCircuitAddPinsTableIndex, PFN_ACXCIRCUITADDPINS, circuit, pins.as_mut_ptr(), 2), "AcxCircuitAddPins")?;
-        Ok((circuit, jack))
+        Ok(Built { circuit, jack, vol })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified volume: ACX callbacks (all PASSIVE), see avrcp_vol.rs for the rules
+// ---------------------------------------------------------------------------
+
+/// Milliseconds on a monotonic clock (for the AVRCP staleness check).
+fn now_ms() -> u64 {
+    unsafe {
+        let mut freq: LARGE_INTEGER = zeroed();
+        let t = KeQueryPerformanceCounter(&raw mut freq).QuadPart as u64;
+        let f = (freq.QuadPart as u64).max(1);
+        (t / f) * 1000 + (t % f) * 1000 / f
+    }
+}
+
+fn pid() -> usize {
+    unsafe { wdk_sys::ntddk::PsGetCurrentProcessId() as usize }
+}
+
+/// 1/65536 dB as "-12.34 dB" without floating point.
+struct Db(i32);
+
+impl core::fmt::Display for Db {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let v = i64::from(self.0);
+        let sign = if v < 0 { "-" } else { "" };
+        let a = v.unsigned_abs();
+        let cents = (a * 100 + 32768) / 65536;
+        write!(f, "{sign}{}.{:02} dB", cents / 100, cents % 100)
+    }
+}
+
+/// Queue `jobs` (`VOL_WORK_*`) for [`evt_vol_work`].
+unsafe fn vol_work(adev: *mut AcxDeviceCtx, fx: avrcp_vol::Effects) {
+    unsafe {
+        let mut jobs = 0;
+        if fx.notify_volume {
+            jobs |= VOL_WORK_LEVEL;
+        }
+        if fx.notify_mute {
+            jobs |= VOL_WORK_MUTE;
+        }
+        if fx.avrcp_event {
+            jobs |= VOL_WORK_EVENT;
+        }
+        if jobs == 0 || adev.is_null() || (*adev).vol_work.is_null() {
+            return;
+        }
+        (*adev).vol_pending.fetch_or(jobs, Ordering::SeqCst);
+        call_unsafe_wdf_function_binding!(WdfWorkItemEnqueue, (*adev).vol_work);
+    }
+}
+
+/// Work item (PASSIVE): tell Windows / AVRCP what changed. Never called
+/// from inside an ACX callback, so none of these DDIs runs while ACX is
+/// dispatching a request of the same circuit. `evt_release_hardware`
+/// clears the handles and flushes this before the circuit is deleted.
+unsafe extern "C" fn evt_vol_work(item: WDFWORKITEM) {
+    unsafe {
+        let device = call_unsafe_wdf_function_binding!(WdfWorkItemGetParentObject, item);
+        let ctx = acx_device_ctx(device);
+        if ctx.is_null() {
+            return;
+        }
+        let jobs = (*ctx).vol_pending.swap(0, Ordering::SeqCst);
+        if jobs & VOL_WORK_LEVEL != 0 {
+            let volume = (*ctx).volume.load(Ordering::SeqCst) as ACXVOLUME;
+            if !volume.is_null() {
+                acx!(AcxVolumeChangeLevelNotificationTableIndex, PFN_ACXVOLUMECHANGELEVELNOTIFICATION, volume);
+            }
+        }
+        if jobs & VOL_WORK_MUTE != 0 {
+            let mute = (*ctx).mute.load(Ordering::SeqCst) as ACXMUTE;
+            if !mute.is_null() {
+                acx!(AcxMuteChangeStateNotificationTableIndex, PFN_ACXMUTECHANGESTATENOTIFICATION, mute);
+            }
+        }
+        if jobs & VOL_WORK_EVENT != 0 {
+            let event = (*ctx).event.load(Ordering::SeqCst) as ACXEVENT;
+            if !event.is_null() {
+                acx!(AcxEventGenerateEventTableIndex, PFN_ACXEVENTGENERATEEVENT, event);
+                audio::volume(crate::device_ctx(device), |v| v.event_generated());
+                trace!("avrcp: volume event generated");
+            }
+        }
+    }
+}
+
+/// The device behind an object carrying a [`LinkCtx`].
+unsafe fn linked(obj: WDFOBJECT) -> Option<(*mut DeviceContext, *mut AcxDeviceCtx)> {
+    unsafe {
+        let c = link_ctx(obj);
+        if c.is_null() || (*c).dev.is_null() {
+            None
+        } else {
+            Some(((*c).dev, (*c).adev))
+        }
+    }
+}
+
+/// Property `{401e566b}` id 1 on the circuit (BthAvrcp's VolumeController).
+/// ACX has matched set, id and verb against the item and checked the value
+/// size (>= 4) before calling. Completes the request on every path.
+unsafe extern "C" fn evt_avrcp_property(object: ACXOBJECT, request: WDFREQUEST) {
+    unsafe {
+        let mut p: ACX_REQUEST_PARAMETERS = zeroed();
+        p.Size = size_of::<ACX_REQUEST_PARAMETERS>() as USHORT;
+        acx!(AcxRequestGetParametersTableIndex, PFN_ACXREQUESTGETPARAMETERS, request, &raw mut p);
+        let Some((dev, adev)) = linked(object) else {
+            return crate::complete(request, STATUS_INVALID_DEVICE_STATE, 0);
+        };
+        if p.Type != _ACX_REQUEST_TYPE::AcxRequestTypeProperty {
+            return crate::complete(request, STATUS_INVALID_DEVICE_REQUEST, 0);
+        }
+        let prop = p.Parameters.Property.as_ref();
+        if prop.Value.is_null() || (prop.ValueCb as usize) < size_of::<LONG>() {
+            return crate::complete(request, STATUS_BUFFER_TOO_SMALL, 0);
+        }
+        let value = prop.Value.cast::<LONG>();
+        match prop.Verb {
+            _ACX_PROPERTY_VERB::AcxPropertyVerbGet => {
+                let level = audio::volume(dev, |v| v.remote_get());
+                value.write_unaligned(level);
+                trace!(
+                    "avrcp: property GET -> {} (AVRCP {}) [pid {}]",
+                    Db(level),
+                    avrcp_vol::level_to_avrcp(level),
+                    pid()
+                );
+                crate::complete(request, STATUS_SUCCESS, size_of::<LONG>());
+            }
+            _ACX_PROPERTY_VERB::AcxPropertyVerbSet => {
+                let raw = value.read_unaligned();
+                let now = now_ms();
+                let (fx, muted, window) =
+                    audio::volume(dev, |v| (v.remote_set(raw, now), v.muted(), v.connect_window_open()));
+                trace!(
+                    "avrcp: property SET {} ({:#x}, AVRCP {}) from the buds: slider {}, mute {}, event {}, connect window {}{} [pid {}]",
+                    Db(avrcp_vol::clamp_level(raw)),
+                    raw as u32,
+                    avrcp_vol::level_to_avrcp(raw),
+                    if fx.notify_volume { "moved" } else { "kept" },
+                    if fx.notify_mute { "cleared" } else if muted { "on" } else { "off" },
+                    fx.avrcp_event,
+                    if window { "open" } else { "closed" },
+                    if raw != avrcp_vol::clamp_level(raw) { " (clamped)" } else { "" },
+                    pid()
+                );
+                vol_work(adev, fx);
+                crate::complete(request, STATUS_SUCCESS, 0);
+            }
+            verb => {
+                trace!("avrcp: property verb {} refused", verb);
+                crate::complete(request, STATUS_INVALID_DEVICE_REQUEST, 0);
+            }
+        }
+    }
+}
+
+/// Method `{0e62540f}` id 6 (`MethodServiceReady`, from BthAvctpSvc).
+/// BthA2dp parks it for the life of the service; the sender only traces
+/// the result, so it is answered at once.
+unsafe extern "C" fn evt_avrcp_method(_object: ACXOBJECT, request: WDFREQUEST) {
+    unsafe {
+        let mut p: ACX_REQUEST_PARAMETERS = zeroed();
+        p.Size = size_of::<ACX_REQUEST_PARAMETERS>() as USHORT;
+        acx!(AcxRequestGetParametersTableIndex, PFN_ACXREQUESTGETPARAMETERS, request, &raw mut p);
+        let id = if p.Type == _ACX_REQUEST_TYPE::AcxRequestTypeMethod { p.Parameters.Method.as_ref().Id } else { u32::MAX };
+        trace!("avrcp: method {{0e62540f}}/{} (MethodServiceReady) - answered with success [pid {}]", id, pid());
+        crate::complete(request, STATUS_SUCCESS, 0);
+    }
+}
+
+/// First subscriber of the AVRCP event (BthAvrcp's IOCTL_KS_ENABLE_EVENT
+/// with an event handle; ACX keeps the list and calls this for the first
+/// one only).
+unsafe extern "C" fn evt_avrcp_event_enable(event: ACXEVENT) -> NTSTATUS {
+    unsafe {
+        if let Some((dev, _)) = linked(event.cast()) {
+            audio::volume(dev, |v| v.subscribe(true));
+        }
+        trace!("avrcp: volume event enabled (AVRCP subscribed) [pid {}]", pid());
+    }
+    STATUS_SUCCESS
+}
+
+/// Last subscriber gone (its handle closed, or the circuit is going).
+unsafe extern "C" fn evt_avrcp_event_disable(event: ACXEVENT) {
+    unsafe {
+        if let Some((dev, _)) = linked(event.cast()) {
+            audio::volume(dev, |v| v.subscribe(false));
+        }
+        trace!("avrcp: volume event disabled (no AVRCP subscriber) [pid {}]", pid());
+    }
+}
+
+unsafe extern "C" fn evt_volume_assign(volume: ACXVOLUME, channel: ULONG, level: LONG) -> NTSTATUS {
+    unsafe {
+        let Some((dev, adev)) = linked(volume.cast()) else {
+            return STATUS_INVALID_DEVICE_STATE;
+        };
+        let now = now_ms();
+        match audio::volume(dev, |v| v.windows_level(channel, level, now)) {
+            Ok(fx) => {
+                trace!(
+                    "avrcp: Windows volume ch {} = {} (AVRCP {}){}",
+                    channel as i32,
+                    Db(avrcp_vol::clamp_level(level)),
+                    avrcp_vol::level_to_avrcp(level),
+                    if fx.avrcp_event { ", event" } else { "" }
+                );
+                vol_work(adev, fx);
+                STATUS_SUCCESS
+            }
+            Err(_) => STATUS_INVALID_PARAMETER,
+        }
+    }
+}
+
+unsafe extern "C" fn evt_volume_retrieve(volume: ACXVOLUME, channel: ULONG, level: *mut LONG) -> NTSTATUS {
+    unsafe {
+        let Some((dev, _)) = linked(volume.cast()) else {
+            return STATUS_INVALID_DEVICE_STATE;
+        };
+        match audio::volume(dev, |v| v.retrieve_level(channel)) {
+            Ok(l) if !level.is_null() => {
+                *level = l;
+                STATUS_SUCCESS
+            }
+            Ok(_) => STATUS_INVALID_PARAMETER,
+            Err(_) => STATUS_INVALID_PARAMETER,
+        }
+    }
+}
+
+unsafe extern "C" fn evt_mute_assign(mute: ACXMUTE, channel: ULONG, state: ULONG) -> NTSTATUS {
+    unsafe {
+        let Some((dev, adev)) = linked(mute.cast()) else {
+            return STATUS_INVALID_DEVICE_STATE;
+        };
+        let now = now_ms();
+        match audio::volume(dev, |v| v.windows_mute(channel, state != 0, now)) {
+            Ok(fx) => {
+                trace!(
+                    "avrcp: Windows mute ch {} = {}{}",
+                    channel as i32,
+                    state != 0,
+                    if fx.avrcp_event { ", event" } else { "" }
+                );
+                vol_work(adev, fx);
+                STATUS_SUCCESS
+            }
+            Err(_) => STATUS_INVALID_PARAMETER,
+        }
+    }
+}
+
+unsafe extern "C" fn evt_mute_retrieve(mute: ACXMUTE, channel: ULONG, state: *mut ULONG) -> NTSTATUS {
+    unsafe {
+        let Some((dev, _)) = linked(mute.cast()) else {
+            return STATUS_INVALID_DEVICE_STATE;
+        };
+        match audio::volume(dev, |v| v.retrieve_mute(channel)) {
+            Ok(m) if !state.is_null() => {
+                *state = ULONG::from(m);
+                STATUS_SUCCESS
+            }
+            Ok(_) => STATUS_INVALID_PARAMETER,
+            Err(_) => STATUS_INVALID_PARAMETER,
+        }
     }
 }
 

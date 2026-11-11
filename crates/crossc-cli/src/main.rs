@@ -216,6 +216,36 @@ fn fmt_info(i: &ioc::InfoReply) -> String {
     )
 }
 
+/// The audio endpoint and its volume, as two `info` lines.
+fn fmt_audio_volume(s: &crossc_ioctl::audio::AudioState) -> String {
+    use crossc_ioctl::audio::StreamState;
+    let stream = match s.stream {
+        StreamState::None => "no stream".to_string(),
+        st => format!(
+            "{} {} Hz/{}-bit",
+            if st == StreamState::Running {
+                "running"
+            } else {
+                "paused"
+            },
+            s.format.sample_rate,
+            s.format.valid_bits
+        ),
+    };
+    format!(
+        "audio      endpoint {}, service {}, link {}, {stream}
+volume     {}",
+        if s.acx() { "on" } else { "off" },
+        if s.attached() {
+            "attached"
+        } else {
+            "not attached"
+        },
+        if s.link() { "up" } else { "down" },
+        crossc_core::volume::describe(s)
+    )
+}
+
 const USAGE: &str = "usage: crossc-cli [--device N | --path PATH] [-v] [--secure] [--in-mtu N] [--out-mtu-max N] [--seid N (media only)] <info|list|probe|media|raw [CMD]...|play [OPTS]>
 play OPTS: [--mode hifi|uhq|ssc48|ssc44] [--config 0xNN] [--bitrate KBPS] [--frames-per-packet N]
            [--ts packets|samples] [--seconds S] [--tone HZ [--level DBFS] | --sweep | --wav PATH]
@@ -380,7 +410,18 @@ fn run(g: &Global, cmd: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("device: {}", dev.path);
     }
     match cmd {
-        Cmd::Info => println!("{}", fmt_info(&dev.info()?)),
+        Cmd::Info => {
+            let info = dev.info()?;
+            println!("{}", fmt_info(&info));
+            if info.protocol_version >= 2 {
+                match dev.audio_state() {
+                    Ok(s) => println!("{}", fmt_audio_volume(&s)),
+                    Err(e) => println!(
+                        "audio      AUDIO_GET_STATE failed: {e} (needs an elevated prompt)"
+                    ),
+                }
+            }
+        }
         Cmd::Play(a) => play_cmd(g, &dev, &a)?,
         Cmd::Probe | Cmd::Media => {
             let info = dev.info()?;
@@ -645,6 +686,18 @@ mod tests {
     #[test]
     fn args() {
         assert_eq!(parse_args(&s(&["info"])).unwrap().1, Cmd::Info);
+        let st = crossc_ioctl::audio::AudioState {
+            flags: crossc_ioctl::audio::AUDIO_FLAG_ACX | crossc_ioctl::audio::AUDIO_FLAG_HW_VOLUME,
+            ..Default::default()
+        };
+        let text = fmt_audio_volume(&st);
+        assert!(
+            text.starts_with(
+                "audio      endpoint on, service not attached, link down, no stream
+volume     hardware, software gain"
+            ),
+            "{text}"
+        );
         let (g, c) = parse_args(&s(&["--device", "1", "-v", "probe", "--secure"])).unwrap();
         assert_eq!(c, Cmd::Probe);
         assert_eq!(g.device_index, 1);

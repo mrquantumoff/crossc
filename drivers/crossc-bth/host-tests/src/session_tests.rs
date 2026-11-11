@@ -921,3 +921,55 @@ fn tap_matches_a_model_under_random_load() {
         }
     }
 }
+
+#[test]
+fn volume_report_bumps_seq_but_counters_do_not() {
+    use crossc_ioctl::audio::{AUDIO_FLAG_AVRCP, AUDIO_FLAG_HW_VOLUME, VolumeState};
+    let mut s = Session::new();
+    s.set_endpoint(true);
+    let seq = s.state().seq;
+    let v = VolumeState { level: -100, left: -100, right: -200, avrcp: 120, gets: 1, sets: 0, events: 1 };
+    assert!(s.set_volume(AUDIO_FLAG_HW_VOLUME | AUDIO_FLAG_AVRCP, v));
+    let st = s.state();
+    assert_ne!(st.seq, seq);
+    assert_eq!(st.flags, AUDIO_FLAG_ACX | AUDIO_FLAG_HW_VOLUME | AUDIO_FLAG_AVRCP);
+    assert_eq!(st.volume, v);
+    // Counters only: stored, no bump.
+    assert!(!s.set_volume(AUDIO_FLAG_HW_VOLUME | AUDIO_FLAG_AVRCP, VolumeState { gets: 9, ..v }));
+    assert_eq!((s.state().seq, s.state().volume.gets), (st.seq, 9));
+    // Non-volume bits cannot be smuggled in.
+    assert!(s.set_volume(AUDIO_FLAG_LINK | AUDIO_FLAG_HW_VOLUME, v));
+    assert_eq!(s.state().flags, AUDIO_FLAG_ACX | AUDIO_FLAG_HW_VOLUME);
+    assert!(!s.state().link());
+    // The encoded reply keeps the v2 bytes a v2 caller reads.
+    let e = s.state().encode();
+    assert_eq!(AudioState::decode(&e[..AudioState::SIZE_V2]).unwrap().seq, s.state().seq);
+}
+
+#[test]
+fn state_replies_fit_v2_and_v3_buffers() {
+    use crate::audio_core::write_state;
+    use crossc_ioctl::audio::{AUDIO_FLAG_HW_VOLUME, VolumeState};
+    let mut s = Session::new();
+    s.set_endpoint(true);
+    s.set_volume(AUDIO_FLAG_HW_VOLUME, VolumeState { level: -5, left: -5, right: -6, avrcp: 126, ..Default::default() });
+    let st = s.state();
+    let full = st.encode();
+    // A v2 caller: 40 bytes, exactly the v2 reply.
+    let mut b40 = [0xAA; 40];
+    assert_eq!(write_state(&mut b40, &st), Some(40));
+    assert_eq!(b40[..], full[..40]);
+    let v2 = AudioState::decode(&b40).unwrap();
+    assert_eq!((v2.seq, v2.flags, v2.volume), (st.seq, st.flags, VolumeState::default()));
+    // Something in between: what fits.
+    let mut b50 = [0xAA; 50];
+    assert_eq!(write_state(&mut b50, &st), Some(50));
+    assert_eq!(AudioState::decode(&b50).unwrap().volume.level, -5);
+    // A v3 caller, and a bigger buffer: the full 64 bytes, nothing more.
+    let mut b80 = [0xAA; 80];
+    assert_eq!(write_state(&mut b80, &st), Some(AudioState::SIZE));
+    assert_eq!(AudioState::decode(&b80[..64]), Ok(st));
+    assert_eq!(b80[64], 0xAA);
+    // Shorter than v2: refused (STATUS_BUFFER_TOO_SMALL).
+    assert_eq!(write_state(&mut [0; 39], &st), None);
+}

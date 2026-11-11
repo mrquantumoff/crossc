@@ -62,6 +62,7 @@ use crate::signaling::{self, Signaling};
 use crate::ssc::{SscSep, choose_ssc, local_caps};
 use crate::stop::StopSignal;
 use crate::stream::{PipeError, Pipeline};
+use crate::volume::{self, Decision, VolumeMode};
 
 /// How often the driver is retried while it cannot be attached.
 pub const DRIVER_RETRY: Duration = Duration::from_secs(10);
@@ -255,6 +256,10 @@ pub struct Session<D: Driver, P: LinkProbe, K: Clock> {
     /// Last delay the sink reported, 1/10 ms.
     last_delay: Option<u16>,
     stats_every: Duration,
+    /// Who applies the volume and the software gain, from the last state.
+    volume: Decision,
+    /// Mode and mute last logged.
+    volume_logged: Option<(VolumeMode, bool)>,
 }
 
 impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
@@ -289,6 +294,8 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             link: None,
             last_delay: None,
             stats_every: STATS_EVERY,
+            volume: volume::decide(&AudioState::default()),
+            volume_logged: None,
         }
     }
 
@@ -309,6 +316,16 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
     /// Last delay the sink reported, in 1/10 ms.
     pub fn sink_delay(&self) -> Option<u16> {
         self.last_delay
+    }
+
+    /// Who applies the volume, and the software gain, as of the last state.
+    pub fn volume(&self) -> Decision {
+        self.volume
+    }
+
+    /// The gain the current link's pipeline is ramping to (or holds).
+    pub fn pipeline_gain(&self) -> Option<[f64; 2]> {
+        self.link.as_ref().map(|l| l.pipe.gain().target())
     }
 
     /// Run until the stop request has been honoured.
@@ -471,6 +488,50 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
         if s.format.is_valid() {
             self.last_format = Some(s.format);
         }
+        self.note_volume(s);
+    }
+
+    /// Who applies the volume now; log transitions (info) and level
+    /// changes (debug). The pipeline follows in [`Self::on_state`].
+    fn note_volume(&mut self, s: AudioState) {
+        let d = volume::decide(&s);
+        let v = s.volume;
+        let dbs = |l: i32| f64::from(l) / 65536.0;
+        let now = (d.mode, s.muted());
+        if self.volume_logged != Some(now) {
+            let detail = match d.mode {
+                VolumeMode::Windows => String::new(),
+                _ => format!(
+                    "; level {:.1} dB (AVRCP {}){}",
+                    dbs(v.level),
+                    v.avrcp,
+                    if s.muted() { ", muted" } else { "" }
+                ),
+            };
+            self.info(&format!("volume: {}{detail}", d.mode.describe()));
+            self.volume_logged = Some(now);
+        } else if d != self.volume {
+            self.say(
+                Level::Debug,
+                &format!(
+                    "volume: level {:.1} dB (AVRCP {}), left {:.1} / right {:.1} dB, gain {:.4} / {:.4}",
+                    dbs(v.level),
+                    v.avrcp,
+                    dbs(v.left),
+                    dbs(v.right),
+                    d.gain[0],
+                    d.gain[1]
+                ),
+            );
+        }
+        self.volume = d;
+    }
+
+    /// A new pipeline starts at the current gain (no ramp from unity).
+    fn new_pipeline(&self, fmt: PcmFormat, plan: &Plan) -> Result<Pipeline, String> {
+        let mut p = Pipeline::new(fmt, plan)?;
+        p.set_gain(self.volume.gain, true);
+        Ok(p)
     }
 
     /// The driver ended the session (or its audio requests fail): drop
@@ -620,7 +681,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             unsupported: true,
         })?;
         let (media, plan, mtu_limit) = self.open_stream(&mut sig, &sep, fmt, plan)?;
-        let pipe = match Pipeline::new(fmt, &plan) {
+        let pipe = match self.new_pipeline(fmt, &plan) {
             Ok(p) => p,
             Err(e) => {
                 self.release(&mut sig, sep.seid);
@@ -1000,6 +1061,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
 
     fn on_state(&mut self, link: &mut Link<D>, s: AudioState) -> Flow {
         self.note_state(s);
+        link.pipe.set_gain(self.volume.gain, false);
         if s.format.is_valid() && s.format != link.fmt {
             return self.on_format(link, s.format);
         }
@@ -1054,7 +1116,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
         let sep = link.sep.clone();
         match self.open_stream(&mut link.sig, &sep, fmt, plan) {
             Ok((media, plan, limit)) => {
-                let pipe = match Pipeline::new(fmt, &plan) {
+                let pipe = match self.new_pipeline(fmt, &plan) {
                     Ok(p) => p,
                     Err(e) => return down(e, true),
                 };

@@ -18,8 +18,8 @@ use std::time::Duration;
 use avdtp::signal::Message;
 use crossc_ioctl as ioc;
 use crossc_ioctl::audio::{
-    AUDIO_FLAG_ACX, AUDIO_FLAG_ATTACHED, AUDIO_FLAG_LINK, AudioState, PCM_FLAG_DISCONTINUITY,
-    PcmFormat, PcmHeader, StreamState,
+    AUDIO_FLAG_ACX, AUDIO_FLAG_ATTACHED, AUDIO_FLAG_LINK, AUDIO_FLAGS_VOLUME, AudioState,
+    PCM_FLAG_DISCONTINUITY, PcmFormat, PcmHeader, StreamState, VolumeState,
 };
 
 use super::FakeSink;
@@ -223,6 +223,14 @@ impl FakeState {
         } else {
             self.state.flags &= !AUDIO_FLAG_ACX;
         }
+        self.bump();
+    }
+
+    /// The volume state changes (protocol 3): `flags` are the
+    /// `AUDIO_FLAG_*` volume bits, the rest of the flags stay.
+    pub fn set_volume(&mut self, flags: u32, volume: VolumeState) {
+        self.state.flags = (self.state.flags & !AUDIO_FLAGS_VOLUME) | (flags & AUDIO_FLAGS_VOLUME);
+        self.state.volume = volume;
         self.bump();
     }
 

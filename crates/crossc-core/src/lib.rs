@@ -16,6 +16,8 @@
 //!   packets pipeline, and the state machine that turns the endpoint's audio
 //!   into an SSC stream. [`real`] (Windows) is the seam's implementation on
 //!   the device, with the Bluetooth connection probe.
+//! * [`volume`]: who applies the endpoint volume (Windows, the buds over
+//!   AVRCP, or a software gain here) and the gain stage.
 //! * [`log`], [`stop`]: logging and shutdown seams.
 //! * [`fake`] (tests, or the `testing` feature): a fake AVDTP sink and a
 //!   fake driver.
@@ -43,3 +45,4 @@ pub mod signaling;
 pub mod ssc;
 pub mod stop;
 pub mod stream;
+pub mod volume;

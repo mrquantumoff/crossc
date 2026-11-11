@@ -73,7 +73,8 @@ use crossc_ioctl::audio as wire;
 use wdk_sys::ntddk::KeGetCurrentIrql;
 use wdk_sys::*;
 
-use crate::audio_core::{Id, ReadDone, Refuse, Session, Ticket, WaitDone};
+use crate::audio_core::{Id, ReadDone, Refuse, Session, Ticket, WaitDone, write_state};
+use crate::avrcp_vol::Volume;
 use crate::audio_park::{self, Parking, Verdict};
 use crate::{
     CLOSE_TIMEOUT_PASSES, DeviceContext, RawInput, RequestContext, attributes, close_all, complete, device_ctx,
@@ -87,9 +88,12 @@ const MAX_SWEEP: u32 = 16;
 /// Audio state of one device, part of the pipe's [`DeviceContext`].
 #[repr(C)]
 pub struct AudioDev {
-    /// Guards `session`, `ring`, `ring_len`.
+    /// Guards `session`, `vol`, `ring`, `ring_len`.
     lock: WDFSPINLOCK,
     session: Session,
+    /// Hardware volume / AVRCP volume state (`avrcp_vol.rs`); its report is
+    /// copied into `session` after every change ([`volume`]).
+    vol: Volume,
     /// Ring storage of the stream that feeds the tap (nonpaged pool owned by
     /// that stream, see `acx.rs`), or null. `ring_len` is the session's ring
     /// capacity.
@@ -235,6 +239,7 @@ pub unsafe fn init(dev: *mut DeviceContext, device: WDFDEVICE, acx_on: bool) -> 
         // The device context is zero-filled; give the session its real
         // initial value before anything can look at it.
         addr_of_mut!((*a).session).write(Session::new());
+        addr_of_mut!((*a).vol).write(Volume::new());
         (*a).ring = null_mut();
         (*a).ring_len = 0;
         let mut lattr = attributes();
@@ -301,12 +306,8 @@ pub unsafe fn ioctl(dev: *mut DeviceContext, req: WDFREQUEST, rc: *mut RequestCo
 /// Copy a state reply into the request's output buffer and complete it.
 unsafe fn complete_with_state(req: WDFREQUEST, rc: *mut RequestContext, state: &wire::AudioState) {
     unsafe {
-        let e = state.encode();
-        match out_buffer(rc).get_mut(..e.len()) {
-            Some(dst) => {
-                dst.copy_from_slice(&e);
-                complete(req, STATUS_SUCCESS, e.len());
-            }
+        match write_state(out_buffer(rc), state) {
+            Some(n) => complete(req, STATUS_SUCCESS, n),
             None => complete(req, STATUS_BUFFER_TOO_SMALL, 0),
         }
     }
@@ -316,7 +317,7 @@ unsafe fn complete_with_state(req: WDFREQUEST, rc: *mut RequestContext, state: &
 /// flags then lack AUDIO_FLAG_ACX).
 unsafe fn ioctl_get_state(dev: *mut DeviceContext, req: WDFREQUEST, rc: *mut RequestContext) {
     unsafe {
-        if (*rc).out_len < wire::AudioState::SIZE {
+        if (*rc).out_len < wire::AudioState::SIZE_V2 {
             return complete(req, STATUS_BUFFER_TOO_SMALL, 0);
         }
         let a = audio(dev);
@@ -390,7 +391,7 @@ unsafe fn ioctl_wait_event(dev: *mut DeviceContext, req: WDFREQUEST, rc: *mut Re
         let Ok(r) = with_input(input, wire::WaitEventRequest::decode) else {
             return complete(req, STATUS_BUFFER_TOO_SMALL, 0);
         };
-        if (*rc).out_len < wire::AudioState::SIZE {
+        if (*rc).out_len < wire::AudioState::SIZE_V2 {
             return complete(req, STATUS_BUFFER_TOO_SMALL, 0);
         }
         let a = audio(dev);
@@ -501,17 +502,11 @@ unsafe fn settle(a: *mut AudioDev, rc: *mut RequestContext, ticket: Ticket, kind
                 match done {
                     WaitDone::Stale => Verdict::Complete((STATUS_CANCELLED, 0)),
                     WaitDone::NotReady => Verdict::Keep,
-                    WaitDone::Done(state) => {
-                        let e = state.encode();
-                        // The size was checked before the request was parked.
-                        match out.get_mut(..e.len()) {
-                            Some(dst) => {
-                                dst.copy_from_slice(&e);
-                                Verdict::Complete((STATUS_SUCCESS, e.len()))
-                            }
-                            None => Verdict::Complete((STATUS_BUFFER_TOO_SMALL, 0)),
-                        }
-                    }
+                    // The size was checked before the request was parked.
+                    WaitDone::Done(state) => match write_state(out, &state) {
+                        Some(n) => Verdict::Complete((STATUS_SUCCESS, n)),
+                        None => Verdict::Complete((STATUS_BUFFER_TOO_SMALL, 0)),
+                    },
                 }
             }
             Parked::Read => {
@@ -728,6 +723,27 @@ pub unsafe fn set_endpoint(dev: *mut DeviceContext, present: bool) {
         if changed {
             kick_wait(dev);
         }
+    }
+}
+
+/// Run `f` on the device's volume state under the audio lock, then copy its
+/// report into the session and complete a waiting WAIT_EVENT if that
+/// changed the state. `f` must be pure bookkeeping (it runs under a
+/// spinlock). Any IRQL <= DISPATCH.
+pub unsafe fn volume<R>(dev: *mut DeviceContext, f: impl FnOnce(&mut Volume) -> R) -> R {
+    unsafe {
+        let a = audio(dev);
+        lock(a);
+        // SAFETY: under the lock, released before the reference is used again.
+        let v = &mut *addr_of_mut!((*a).vol);
+        let r = f(v);
+        let (flags, st) = v.wire();
+        let changed = session(a).set_volume(flags, st);
+        unlock(a);
+        if changed {
+            kick_wait(dev);
+        }
+        r
     }
 }
 

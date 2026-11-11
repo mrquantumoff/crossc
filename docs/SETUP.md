@@ -1246,3 +1246,275 @@ tests: `cd drivers\crossc-bth\host-tests; cargo test`.
   the device object is deleted, until bthport ends that OPEN (the same wait
   as for an abandoned close), which is bounded by bthport's timers and has
   no Verifier break.
+
+## 14. Unified volume live test
+
+**What this build adds.** The Windows volume slider and the buds' own volume
+become one control, as with Windows' inbox A2DP driver. The driver's render
+circuit now also carries the private interface the inbox AVRCP stack
+(`BthAvctpSvc` with `BthAvrcp.dll`) uses to do absolute volume for
+`BthA2dp.sys`: interface class `{e630310c-1733-42bb-9847-7e45d1a27490}`, KS
+property and event `{401e566b-b47e-4e34-b0fc-94826e9e2a1a}` id 1, KS method
+`{0e62540f-bac4-4b85-b344-0d82ed5008ac}` id 6, plus a hardware volume and mute
+element with BthA2dp's range (-63.5..0 dB). AVRCP itself (play / pause / next)
+stays on the inbox nodes and is not touched. The service speaks protocol v3:
+while the buds apply the volume it streams unscaled, and while nobody does
+(no AVRCP subscriber, kill switch, a Windows update that changed the private
+interface) it applies the slider and mute in software, so the slider always
+works. Design: `docs/DESIGN.md`, "Volume".
+
+**Not tested live.** Nothing of it has been loaded. It builds, is signed,
+passes InfVerif, clippy, the image check and the layout check against cl.exe,
+and the volume logic passes its host tests (a closed-loop simulation of
+Windows + BthAvrcp + buds included). Whether the inbox AVRCP stack accepts a
+non-Microsoft driver as its volume partner is what this test finds out. Keep
+`C:\crossc-known-good` and read 10f first.
+
+**Install both halves together.** A v0.1.1 service with this driver leaves
+the slider and mute without effect whenever AVRCP is not active: the
+endpoint claims hardware volume and mute, so Windows stops scaling and
+muting the stream itself, and the old service applies neither.
+
+**Hearing first.** Before installing, set the Windows volume of the buds low
+(20 % or less) and keep the buds out of your ears until 14c is done. From
+this build on the Windows level is sent to the buds as their own volume. The
+buds' level is expected to win when they connect, but if Windows restores its
+stored level after AVRCP has connected, that level goes to the buds instead,
+and with the old two-control setup it may well be 100 %.
+
+### 14a. Install (admin)
+
+```powershell
+cd C:\src\crossc
+.\tools\install-driver.ps1                  # driver (debug build), one UAC prompt
+cargo build --release -p crossc-service -p crossc-cli
+$svc = "C:\src\crossc\target\release\crossc-service.exe"
+$cli = "C:\src\crossc\target\release\crossc-cli.exe"
+& $svc uninstall; & $svc install --start    # service, protocol v3
+```
+
+DebugView (section 6) running, filter `crossc:`. New lines at node start:
+
+```
+crossc: acx: device initialized (unified volume on)
+crossc: avrcp: circuit has the volume contract (category {e630310c}, property/event {401e566b}/1, method {0e62540f}/6), volume element true, mute true, event true
+crossc: acx: render circuit added (jack: unplugged until a service sets the link; hardware volume true, mute true, AVRCP event true)
+```
+
+Something else instead:
+
+* `avrcp: circuit with the volume contract failed 0x... - unified volume
+  off, building it without`, after a line saying what failed (for example
+  `AcxDeviceAddCircuit failed 0x...`, `volume element or AVRCP event
+  missing - discarding the circuit`, or an `AcxCircuitInitAssign...`
+  failure): ACX refused something the feature adds. The half-built circuit
+  is deleted and the endpoint is built as in 0.1.1 (Windows scales the
+  volume); the next `render circuit added` line says `hardware volume
+  false`. The feature stays off for the device until it is removed and added
+  again. Send the lines.
+* `mute false` with `volume element true`: only the mute element could not
+  be created; Windows mutes in software, the rest works.
+
+If Windows still scales the volume after the install (the Levels tab of 14e
+shows no dB range), remove the device in Device Manager and reconnect the
+buds once so that the endpoint is rebuilt.
+
+### 14b. The interface exists (user)
+
+```powershell
+pnputil /enum-interfaces /class "{e630310c-1733-42bb-9847-7e45d1a27490}"
+```
+
+Expected: an entry on the buds' node (`...{0000110b-...}...AABBCCDDEEFF...`)
+whose path ends in `\Headphones0`, **Enabled**. The old `\CONTROL` entry from
+when BthA2dp drove the node may still be listed as Disabled; that is fine.
+
+### 14c. The inbox stack finds it: reconnect the buds (the deciding step)
+
+Put both buds in the case, close it, wait 10 s, take them out. Expected, in
+this order (values and process ids vary; here the buds were at AVRCP 38):
+
+```
+crossc: avrcp: method {0e62540f}/6 (MethodServiceReady) - answered with success [pid N]
+crossc: avrcp: volume event enabled (AVRCP subscribed) [pid N]
+crossc: avrcp: property SET -17.80 dB (0xffee... , AVRCP 38) from the buds: slider moved, mute off, event false, connect window closed [pid N]
+crossc: avrcp: Windows volume ch 0 = -18.00 dB (AVRCP 37)
+crossc: avrcp: Windows volume ch 1 = -18.00 dB (AVRCP 37)
+```
+
+or, if BthAvrcp turned on its response processing before the buds' INTERIM
+answer arrived, two SETs within about a second: first its built-in default,
+then the buds' level:
+
+```
+crossc: avrcp: property SET -10.19 dB (0xfff5... , AVRCP 64) from the buds: slider moved, mute off, event false, connect window open [pid N]
+crossc: avrcp: Windows volume ch 0 = -10.00 dB (AVRCP 65)
+crossc: avrcp: Windows volume ch 1 = -10.00 dB (AVRCP 65)
+crossc: avrcp: property SET -17.80 dB (0xffee... , AVRCP 38) from the buds: slider moved, mute off, event false, connect window closed [pid N]
+crossc: avrcp: Windows volume ch 0 = -18.00 dB (AVRCP 37)
+crossc: avrcp: Windows volume ch 1 = -18.00 dB (AVRCP 37)
+```
+
+* The method line comes from BthAvctpSvc, the event and SET lines from
+  BthAvrcp inside the same service. `tasklist /svc /fi "PID eq N"` should
+  show the `svchost.exe` that hosts `BthAvctpSvc`. The pid is the process the
+  callback ran in: ACX runs the event enable in the caller's process, the
+  property and method callbacks may show 4 (System).
+* The (last) SET carries the buds' current level: the buds' level wins at
+  connect, and the Windows slider jumps to it. In the second sequence the
+  slider shows about 50 % for a moment first. Note which sequence you got.
+  If the buds were at 50 % (AVRCP 64) there is only the first SET in either
+  case.
+* The `Windows volume` lines after a SET are audiosrv writing the level back
+  on its 0.5 dB grid, which is why their AVRCP value can differ from the
+  SET's by one or two. They must **not** end in `, event` (echo rule).
+* If Windows was muted at connect, each connect SET says `mute on, event
+  true` and a `property GET -> -63.50 dB (AVRCP 0)` follows; Windows stays
+  muted and the buds go to 0.
+
+`& $cli info` (elevated) now has a volume line:
+
+```
+volume     hardware, the buds apply it (AVRCP absolute volume active); level -17.8 dB = AVRCP 38; left -18.0 / right -18.0 dB; AVRCP subscriber: yes; AVRCP requests: 0 get, 1 set, 0 events
+```
+
+and `C:\ProgramData\crossc\service.log` has
+`volume: the buds apply the volume (AVRCP absolute volume active); level ...`.
+
+(`level` is the buds' exact level, `left` / `right` what audiosrv wrote
+back on its grid; the request counts say 2 sets after the second sequence.)
+
+**Go / no-go.** Go: the method line, `volume event enabled` and the connect
+`property SET` appear. No-go, none of them: the inbox stack does not use the
+interface (send the `pnputil` output of 14b and the log). The endpoint keeps
+working with software volume (the service log says `software gain`).
+
+### 14d. Buds -> Windows
+
+Change the volume on the buds (gesture) a few steps up and down. Expected per
+step: at most one `property SET ... from the buds: slider moved`, the
+Windows slider follows, then the `Windows volume` write-back lines
+**without** `, event`. No `volume event generated` or `property GET` follows
+a buds gesture. The loudness changes once per step, not twice. A step can
+have no SET at all: BthAvrcp ignores a new buds level whose whole percent
+(`level * 100 / 127`, rounded down) equals the previous one's, e.g. 0 -> 1,
+4 -> 5, 63 -> 64 (inbox behaviour, not a crossc fault); the slider then
+catches up on the next step.
+
+### 14e. Windows -> buds
+
+Move the slider (Settings > Sound, or the volume flyout). Expected per change:
+
+```
+crossc: avrcp: Windows volume ch 0 = -18.00 dB (AVRCP 37), event
+crossc: avrcp: volume event generated
+crossc: avrcp: property GET -> -18.00 dB (AVRCP 37) [pid N]
+```
+
+The buds get louder or quieter. Slider 50 % should be about AVRCP 64
+(-10.2 dB; 63 or 65 if audiosrv writes on the 0.5 dB grid, which the
+values above assume), 100 % AVRCP 127 (0 dB), 0 % AVRCP 0. In general
+slider p reaches the buds as `round(127 p)`, or one or two away from it.
+When you stop moving the slider the lines stop within a second: no
+ping-pong between the slider and the buds, and the slider stays where you
+left it.
+
+Control Panel > Sound > Headphones > Properties > Levels shows the hardware
+range: right-click the value to switch it to dB; the slider runs from
+-63.5 dB to 0 dB.
+
+### 14f. Mute
+
+Mute in the volume flyout. Expected: `Windows mute ch ... = true, event`, then
+`property GET -> -63.50 dB (AVRCP 0)`. No sound (the service silences the
+stream as well). Unmute: `= false, event`, a `property GET` with the old
+level, sound at the old level. Mute again, then press volume up on the buds:
+it unmutes (`mute cleared` in the SET line) and the flyout shows unmuted.
+
+### 14g. AVRCP still works
+
+Play / pause / next track from the buds still work, and
+
+```powershell
+sc query BthAvctpSvc        # STATE: RUNNING
+```
+
+### 14h. Software fallback (optional, admin)
+
+Turn absolute volume off in Windows' own AVRCP stack and reconnect the buds:
+
+```powershell
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Bluetooth\Audio\AVRCP\CT" /v DisableAbsoluteVolume /t REG_DWORD /d 1 /f
+```
+
+Expected after the reconnect: no `volume event enabled`; the service logs
+`volume: software gain (hardware volume without an AVRCP subscriber); level
+...`; the slider changes the loudness (smoothly, no clicks) and the buds' own
+volume is separate again. Put the value back afterwards (it was 0 on this
+machine):
+
+```powershell
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\Bluetooth\Audio\AVRCP\CT" /v DisableAbsoluteVolume /t REG_DWORD /d 0 /f
+```
+
+### 14i. Reconnect, sleep, phone, second buds
+
+* **Buds into the case, out of range, or taken by the phone:**
+  `avrcp: volume event disabled (no AVRCP subscriber)` when BthAvrcp lets go
+  (the service then logs `software gain`, harmless while the link is down).
+  On the next connect 14c repeats (method 6, enable, SET).
+* **Connect while muted:** mute Windows, buds into the case and out again.
+  Windows must stay muted and the buds silent (each connect SET line says
+  `mute on, event true`, followed by a GET of AVRCP 0). Unmute: the buds play
+  at the level they had before. Exception: if the buds' INTERIM answer was
+  taken after they had already applied the mute (it reads 0), or their level
+  was 0 or 1 and the INTERIM arrives after the mute went out, BthAvrcp drops
+  it (same whole percent as the 0 it just sent) and the level after unmute
+  is its default, about 50 % (AVRCP 64). Note which one you got.
+* **Sleep and resume:** after resume and reconnect, the same sequence as 14c.
+  Level and mute survive (they belong to the device, not to the circuit).
+* **A second pair of buds** with crossc on its node: each node has its own
+  circuit, interface and state; the lines of both appear, each after its
+  own reconnect.
+* A subscriber that stops answering (an event without a GET for 2 s when the
+  next change comes) is treated as gone: `crossc-cli info` then shows
+  `AVRCP subscriber: yes` together with `software gain`, and the service
+  applies the slider until the subscriber reads again.
+
+### 14j. Kill switch: `DisableAvrcpVolume` (admin)
+
+Same two keys as `DisableAcx` (10d). Per device:
+
+```powershell
+reg add "HKLM\SYSTEM\CurrentControlSet\Enum\$node\Device Parameters" /v DisableAvrcpVolume /t REG_DWORD /d 1 /f
+pnputil /restart-device "$node"
+```
+
+Whole driver:
+
+```powershell
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\crossc_bth\Parameters" /v DisableAvrcpVolume /t REG_DWORD /d 1 /f
+pnputil /restart-device "$node"
+```
+
+Expected: `avrcp: DisableAvrcpVolume set in the device key - unified volume
+off for this device` (or `... in the service Parameters key ...`),
+`acx: device initialized (unified volume off)`, no `avrcp: circuit has the
+volume contract` line, the `\Headphones0` entry of 14b gone or Disabled,
+`crossc-cli info` showing `volume     no hardware volume (Windows scales the
+PCM)`, and the service logging `volume: Windows applies the volume`.
+Everything else is exactly 0.1.1. Delete the value
+(`reg delete "<key>" /v DisableAvrcpVolume /f`) and restart the node to turn
+it back on.
+
+### 14k. Rollback
+
+1. The kill switch (14j): the endpoint and the stream stay.
+2. If the driver misbehaves with the switch set too:
+   `.\tools\install-driver.ps1 -Uninstall` (back to BthA2dp), or the
+   known-good package and the recovery of 10f.
+
+### 14l. What to send
+
+The DebugView log from node start through 14c-14g, `service.log`, the output
+of `& $cli info`, and the `pnputil` output of 14b.

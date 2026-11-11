@@ -215,5 +215,60 @@ int main(void) {
     printf("value sizeof(WAVEFORMATEXTENSIBLE)-sizeof(WAVEFORMATEX) = %u\n",
            (unsigned)(sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)));
     printf("alignof KSDATAFORMAT_WAVEFORMATEXTENSIBLE = %u\n", (unsigned)__alignof(KSDATAFORMAT_WAVEFORMATEXTENSIBLE));
+
+    /* ---- unified volume (AVRCP volume contract, volume / mute elements) ---- */
+    I(AcxCircuitInitAssignCategories); I(AcxCircuitInitAssignProperties); I(AcxCircuitInitAssignMethods);
+    I(AcxCircuitAddEvents); I(AcxCircuitAddElements); I(AcxMuteCreate); I(AcxMuteChangeStateNotification);
+    I(AcxVolumeCreate); I(AcxVolumeChangeLevelNotification); I(AcxEventCreate); I(AcxEventGenerateEvent);
+    I(AcxRequestGetParameters);
+    S(ACX_PROPERTY_ITEM); O(ACX_PROPERTY_ITEM, Id); O(ACX_PROPERTY_ITEM, Flags);
+    O(ACX_PROPERTY_ITEM, EvtAcxObjectProcessRequest); O(ACX_PROPERTY_ITEM, Reserved); O(ACX_PROPERTY_ITEM, ControlCb);
+    O(ACX_PROPERTY_ITEM, ValueCb); O(ACX_PROPERTY_ITEM, ValueType);
+    S(ACX_METHOD_ITEM); O(ACX_METHOD_ITEM, Id); O(ACX_METHOD_ITEM, Flags); O(ACX_METHOD_ITEM, EvtAcxObjectProcessRequest);
+    O(ACX_METHOD_ITEM, Reserved); O(ACX_METHOD_ITEM, ArgsCb); O(ACX_METHOD_ITEM, ResultCb); O(ACX_METHOD_ITEM, ResultType);
+    S(ACX_EVENT_CALLBACKS); O(ACX_EVENT_CALLBACKS, EvtAcxEventEnable); O(ACX_EVENT_CALLBACKS, EvtAcxEventDisable);
+    O(ACX_EVENT_CALLBACKS, EvtAcxEventProcessRequest);
+    S(ACX_EVENT_CONFIG); O(ACX_EVENT_CONFIG, Flags); O(ACX_EVENT_CONFIG, Set); O(ACX_EVENT_CONFIG, Id);
+    O(ACX_EVENT_CONFIG, Type); O(ACX_EVENT_CONFIG, Callbacks);
+    S(ACX_VOLUME_CALLBACKS); O(ACX_VOLUME_CALLBACKS, EvtAcxVolumeAssignLevel);
+    O(ACX_VOLUME_CALLBACKS, EvtAcxRampedVolumeAssignLevel); O(ACX_VOLUME_CALLBACKS, EvtAcxVolumeRetrieveLevel);
+    O(ACX_VOLUME_CALLBACKS, EvtAcxVolumeProcessRequest);
+    S(ACX_VOLUME_CONFIG); O(ACX_VOLUME_CONFIG, Id); O(ACX_VOLUME_CONFIG, Name); O(ACX_VOLUME_CONFIG, Flags);
+    O(ACX_VOLUME_CONFIG, ChannelsCount); O(ACX_VOLUME_CONFIG, Maximum); O(ACX_VOLUME_CONFIG, Minimum);
+    O(ACX_VOLUME_CONFIG, SteppingDelta); O(ACX_VOLUME_CONFIG, Callbacks);
+    S(ACX_MUTE_CALLBACKS); O(ACX_MUTE_CALLBACKS, EvtAcxMuteAssignState); O(ACX_MUTE_CALLBACKS, EvtAcxMuteRetrieveState);
+    O(ACX_MUTE_CALLBACKS, EvtAcxMuteProcessRequest);
+    S(ACX_MUTE_CONFIG); O(ACX_MUTE_CONFIG, Id); O(ACX_MUTE_CONFIG, Name); O(ACX_MUTE_CONFIG, Flags);
+    O(ACX_MUTE_CONFIG, ChannelsCount); O(ACX_MUTE_CONFIG, Callbacks);
+    S(ACX_REQUEST_PARAMETERS); O(ACX_REQUEST_PARAMETERS, Type); O(ACX_REQUEST_PARAMETERS, Parameters);
+    O(ACX_REQUEST_PARAMETERS, Parameters.Property.Set); O(ACX_REQUEST_PARAMETERS, Parameters.Property.Id);
+    O(ACX_REQUEST_PARAMETERS, Parameters.Property.Verb); O(ACX_REQUEST_PARAMETERS, Parameters.Property.Value);
+    O(ACX_REQUEST_PARAMETERS, Parameters.Property.ValueCb); O(ACX_REQUEST_PARAMETERS, Parameters.Method.Id);
+    E(AcxRequestTypeProperty); E(AcxRequestTypeMethod); E(AcxPropertyVerbGet); E(AcxPropertyVerbSet);
+    V(ACX_PROPERTY_ITEM_FLAG_GET); V(ACX_PROPERTY_ITEM_FLAG_SET); V(ACX_METHOD_ITEM_FLAG_SEND); V(AcxElementIdDefault);
+    V(STATUS_INVALID_DEVICE_STATE); V(STATUS_INVALID_DEVICE_REQUEST); V(STATUS_INVALID_PARAMETER);
+    {
+        ACX_VOLUME_CONFIG c; ACX_VOLUME_CONFIG_INIT(&c);
+        printf("init ACX_VOLUME_CONFIG: Size=%u Id=0x%X Flags=%u\n", c.Size, c.Id, c.Flags);
+    }
+    {
+        ACX_MUTE_CONFIG c; ACX_MUTE_CONFIG_INIT(&c);
+        printf("init ACX_MUTE_CONFIG: Size=%u Id=0x%X Flags=%u\n", c.Size, c.Id, c.Flags);
+    }
+    {
+        ACX_EVENT_CONFIG c; ACX_EVENT_CONFIG_INIT(&c);
+        printf("init ACX_EVENT_CONFIG: Size=%u Flags=%u Type=%u\n", c.Size, c.Flags, c.Type);
+    }
+    {
+        ACX_VOLUME_CALLBACKS v; ACX_MUTE_CALLBACKS m; ACX_EVENT_CALLBACKS e;
+        ACX_VOLUME_CALLBACKS_INIT(&v); ACX_MUTE_CALLBACKS_INIT(&m); ACX_EVENT_CALLBACKS_INIT(&e);
+        printf("init ACX_VOLUME_CALLBACKS / ACX_MUTE_CALLBACKS / ACX_EVENT_CALLBACKS: Size=%u / %u / %u\n", v.Size, m.Size,
+               e.Size);
+    }
+    {
+        ACX_REQUEST_PARAMETERS r; ACX_REQUEST_PARAMETERS_INIT(&r);
+        printf("init ACX_REQUEST_PARAMETERS: Size=%u\n", (unsigned)r.Size);
+    }
+    G(KSCATEGORY_CAPTURE); G(KSCATEGORY_TOPOLOGY); G(KSAUDFNAME_VOLUME_CONTROL); G(KSAUDFNAME_WAVE_MUTE);
     return 0;
 }

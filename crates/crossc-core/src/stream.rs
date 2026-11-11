@@ -12,6 +12,7 @@ use crate::pcm::{self, Dither, FrameBuf};
 use crate::plan::Plan;
 use crate::resample::StreamResampler;
 use crate::rtp::{Packetizer, TsMode};
+use crate::volume::Gain;
 
 /// Interleaved stereo samples per SSC frame (mono input is duplicated).
 const FRAME_LEN: usize = FRAME_SAMPLES * 2;
@@ -52,6 +53,9 @@ pub struct Pipeline {
     pkt: Vec<u8>,
     frames: u64,
     packets: u64,
+    /// Software volume (unity, and then bypassed, unless the session sets one).
+    gain: Gain,
+    gained: Vec<u8>,
 }
 
 fn resampler_for(fmt: PcmFormat, plan: &Plan) -> Option<StreamResampler> {
@@ -81,7 +85,19 @@ impl Pipeline {
             pkt: Vec::new(),
             frames: 0,
             packets: 0,
+            gain: Gain::unity(),
+            gained: Vec::new(),
         })
+    }
+
+    /// Per-channel linear gain from now on, ramped (see [`crate::volume`])
+    /// or `immediate`. Unity with no ramp running leaves the PCM untouched.
+    pub fn set_gain(&mut self, gain: [f64; 2], immediate: bool) {
+        self.gain.set(gain, self.fmt.sample_rate, immediate);
+    }
+
+    pub fn gain(&self) -> &Gain {
+        &self.gain
     }
 
     /// The endpoint format changed but the stream configuration did not
@@ -131,15 +147,23 @@ impl Pipeline {
         data: &[u8],
         send: &mut dyn FnMut(&[u8]) -> Result<(), ChanError>,
     ) -> Result<usize, PipeError> {
+        // Software volume first, at 32-bit precision; skipped entirely at
+        // unity so that path stays bit-exact.
+        let (data, fmt) = if self.gain.is_unity() {
+            (data, self.fmt)
+        } else {
+            let f = self.gain.apply(data, self.fmt, &mut self.gained);
+            (&self.gained[..], f)
+        };
         match &mut self.resampler {
             Some(r) => {
                 self.rs_in.clear();
-                pcm::append_chunk_f64(data, self.fmt, &mut self.rs_in);
+                pcm::append_chunk_f64(data, fmt, &mut self.rs_in);
                 self.rs_out.clear();
                 r.process(&self.rs_in, &mut self.rs_out);
                 pcm::append_f64(&self.rs_out, &mut self.dither, &mut self.acc);
             }
-            None => pcm::append_chunk(data, self.fmt, &mut self.dither, &mut self.acc),
+            None => pcm::append_chunk(data, fmt, &mut self.dither, &mut self.acc),
         }
         let mut sent = 0;
         while let Some(frame) = self.acc.head(FRAME_LEN) {

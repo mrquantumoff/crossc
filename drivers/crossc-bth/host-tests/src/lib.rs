@@ -23,6 +23,9 @@ pub mod cb_refs;
 #[path = "../../src/rt_limits.rs"]
 pub mod rt_limits;
 
+#[path = "../../src/avrcp_vol.rs"]
+pub mod avrcp_vol;
+
 #[cfg(test)]
 extern crate std;
 
@@ -40,3 +43,5 @@ mod open_tests;
 mod cb_tests;
 #[cfg(test)]
 mod rt_tests;
+#[cfg(test)]
+mod volume_tests;

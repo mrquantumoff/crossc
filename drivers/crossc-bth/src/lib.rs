@@ -91,6 +91,7 @@ mod cb_refs;
 mod open_park;
 mod pcm_ring;
 mod rt_limits;
+mod avrcp_vol;
 mod trace;
 
 use core::mem::{offset_of, size_of, zeroed};

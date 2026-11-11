@@ -54,8 +54,10 @@ pub struct Guid {
 }
 
 /// Version of this contract, reported by GET_INFO. Bump on any wire change.
-/// 1 = L2CAP pipe; 2 adds the [`audio`] IOCTLs (the pipe is unchanged).
-pub const PROTOCOL_VERSION: u32 = 2;
+/// 1 = L2CAP pipe; 2 adds the [`audio`] IOCTLs (the pipe is unchanged); 3
+/// adds the volume state to [`audio::AudioState`] (additive: the reply grows
+/// behind the v2 bytes, every v2 field and code is unchanged).
+pub const PROTOCOL_VERSION: u32 = 3;
 
 pub mod audio;
 

@@ -27,8 +27,11 @@ What works: the buds show up as *Headphones (your buds' name)*; pick 48 kHz or
 96 kHz, 24-bit, in the device's sound settings and any app plays through them.
 The device shows as unplugged while the buds are away.
 
-What does not exist yet: hardware volume on the buds (Windows scales the audio
-instead), SBC/AAC fallback through this driver, production code signing.
+The Windows volume slider and the buds' own volume are one control (AVRCP
+absolute volume through Windows' own AVRCP stack; not yet tested on hardware).
+
+What does not exist yet: SBC/AAC fallback through this driver, production code
+signing.
 Hands-free (call) audio and the microphone stay on Windows' own driver and are
 unaffected.
 

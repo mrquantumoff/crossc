@@ -35,8 +35,8 @@
 //!   chunk never mixes formats.
 
 use crossc_ioctl::audio::{
-    AUDIO_FLAG_ACX, AUDIO_FLAG_ATTACHED, AUDIO_FLAG_LINK, AudioState, PCM_FLAG_DISCONTINUITY, PcmFormat, PcmHeader,
-    StreamState,
+    AUDIO_FLAG_ACX, AUDIO_FLAG_ATTACHED, AUDIO_FLAG_LINK, AUDIO_FLAGS_VOLUME, AudioState, PCM_FLAG_DISCONTINUITY,
+    PcmFormat, PcmHeader, StreamState, VolumeState,
 };
 
 use crate::pcm_ring::Ring;
@@ -55,6 +55,20 @@ pub fn ring_bytes(format: &PcmFormat) -> usize {
     }
     let frames = (u64::from(format.sample_rate) * u64::from(RING_MS) / 1000).max(1);
     usize::try_from(frames).map_or(0, |f| f.saturating_mul(format.frame_bytes()))
+}
+
+/// Write a GET_STATE / WAIT_EVENT reply into `out`: as much of the
+/// protocol 3 reply as fits, and at least the protocol 2 part (a v2 caller
+/// passes a 40-byte buffer and gets exactly what protocol 2 sent). Returns
+/// the reply length; `None` if `out` is shorter than the v2 reply.
+pub fn write_state(out: &mut [u8], state: &AudioState) -> Option<usize> {
+    let e = state.encode();
+    if out.len() < AudioState::SIZE_V2 {
+        return None;
+    }
+    let n = out.len().min(e.len());
+    out.get_mut(..n)?.copy_from_slice(e.get(..n)?);
+    Some(n)
 }
 
 /// The sequence number after `seq`: the next one, skipping 0 ("none" in
@@ -142,6 +156,10 @@ pub struct Session {
     wait_seq: u32,
     /// The parked READ_PCM (0 = none).
     read_ticket: Ticket,
+    /// Protocol 3 volume report (`avrcp_vol::Volume::wire`): its
+    /// `AUDIO_FLAG_*` bits and fields.
+    volume_flags: u32,
+    volume: VolumeState,
 }
 
 impl Default for Session {
@@ -169,6 +187,8 @@ impl Session {
             wait_ticket: 0,
             wait_seq: 0,
             read_ticket: 0,
+            volume_flags: 0,
+            volume: VolumeState { level: 0, left: 0, right: 0, avrcp: 0, gets: 0, sets: 0, events: 0 },
         }
     }
 
@@ -199,12 +219,28 @@ impl Session {
         }
         AudioState {
             seq: self.seq,
-            flags,
+            flags: flags | self.volume_flags,
             stream: self.stream_state,
             format: self.format,
             frames_rendered: self.rendered,
             frames_dropped: self.dropped,
+            volume: self.volume,
         }
+    }
+
+    /// New volume report. Returns true (and bumps the sequence number) if
+    /// the flags or a level changed; the AVRCP counters alone do not count,
+    /// like the frame counters. Bits outside `AUDIO_FLAGS_VOLUME` are ignored.
+    pub fn set_volume(&mut self, flags: u32, volume: VolumeState) -> bool {
+        let flags = flags & AUDIO_FLAGS_VOLUME;
+        let levels = |v: &VolumeState| (v.level, v.left, v.right, v.avrcp);
+        let changed = flags != self.volume_flags || levels(&volume) != levels(&self.volume);
+        self.volume_flags = flags;
+        self.volume = volume;
+        if changed {
+            self.bump();
+        }
+        changed
     }
 
     /// The render circuit exists: the audio IOCTLs are supported.

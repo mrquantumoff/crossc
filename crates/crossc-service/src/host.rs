@@ -152,12 +152,13 @@ pub fn fmt_audio(s: &AudioState) -> String {
         ),
     };
     format!(
-        "endpoint {}, service attached: {}, link: {}, stream: {stream}, frames rendered {} / dropped {}",
+        "endpoint {}, service attached: {}, link: {}, stream: {stream}, frames rendered {} / dropped {}; volume: {}",
         if s.acx() { "on" } else { "off (ACX disabled)" },
         yes_no(s.attached()),
         if s.link() { "up" } else { "down" },
         s.frames_rendered,
-        s.frames_dropped
+        s.frames_dropped,
+        crossc_core::volume::describe(s)
     )
 }
 
@@ -250,10 +251,11 @@ mod tests {
             },
             frames_rendered: 1000,
             frames_dropped: 7,
+            volume: Default::default(),
         };
         assert_eq!(
             fmt_audio(&s),
-            "endpoint on, service attached: yes, link: up, stream: running (96000 Hz, 2 ch, 24-bit in 32), frames rendered 1000 / dropped 7"
+            "endpoint on, service attached: yes, link: up, stream: running (96000 Hz, 2 ch, 24-bit in 32), frames rendered 1000 / dropped 7; volume: no hardware volume (Windows scales the PCM)"
         );
         let idle = fmt_audio(&AudioState::default());
         assert!(

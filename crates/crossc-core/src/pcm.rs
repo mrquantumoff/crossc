@@ -193,7 +193,7 @@ pub fn f64_to_i24(x: f64) -> i32 {
 
 /// Iterate the samples of a chunk as 32-bit full-scale integers (a 16-bit
 /// sample is shifted up), each frame as (left, right); mono is duplicated.
-fn frames_i32(data: &[u8], fmt: PcmFormat) -> impl Iterator<Item = (i32, i32)> + '_ {
+pub(crate) fn frames_i32(data: &[u8], fmt: PcmFormat) -> impl Iterator<Item = (i32, i32)> + '_ {
     let bytes = usize::from(fmt.container_bits / 8).max(1);
     let ch = usize::from(fmt.channels).max(1);
     let sample = move |b: &[u8]| -> i32 {

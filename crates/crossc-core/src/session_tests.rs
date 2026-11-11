@@ -248,7 +248,7 @@ fn happy_path_48k_hifi() {
         stats[0].1
     );
     assert!(r.logged("link up: HiFi 48 kHz/24: config 0x0c, 192 kbps") == 1);
-    assert!(r.logged("attached: driver 0.1.0 (protocol v2), buds AA:BB:CC:DD:EE:FF") == 1);
+    assert!(r.logged("attached: driver 0.1.0 (protocol v3), buds AA:BB:CC:DD:EE:FF") == 1);
 }
 
 #[test]
@@ -1561,5 +1561,182 @@ fn random_event_storms_never_panic_and_always_stop_clean() {
             .filter(|l| l.1 == Level::Error)
             .count();
         assert!(errors < 60, "seed {seed}: {errors} error lines");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Volume (protocol 3)
+// ---------------------------------------------------------------------------
+
+mod volume {
+    use super::*;
+    use crate::volume::VolumeMode;
+    use crossc_ioctl::audio::{
+        AUDIO_FLAG_AVRCP, AUDIO_FLAG_HW_VOLUME, AUDIO_FLAG_MUTED, VolumeState,
+    };
+
+    const HW: u32 = AUDIO_FLAG_HW_VOLUME;
+    const BUDS: u32 = AUDIO_FLAG_HW_VOLUME | AUDIO_FLAG_AVRCP;
+
+    fn db(x: f64) -> i32 {
+        (x * 65536.0).round() as i32
+    }
+
+    fn vol(level: f64) -> VolumeState {
+        VolumeState {
+            level: db(level),
+            left: db(level),
+            right: db(level),
+            avrcp: 64,
+            ..VolumeState::default()
+        }
+    }
+
+    /// 2 s of 48 kHz/24 audio from t = 1 s, after `setup`; returns the rig.
+    fn run(setup: impl FnOnce(&Rig)) -> Rig {
+        let mut r = rig();
+        setup(&r);
+        r.stream(1.0, Running, FMT_48K_24)
+            .stream(3.0, Paused, FMT_48K_24);
+        r.run_to(7.0);
+        assert_eq!(r.packets().len(), 111, "{}", r.log.text());
+        r
+    }
+
+    fn baseline() -> Vec<Vec<u8>> {
+        run(|_| {}).packets()
+    }
+
+    #[test]
+    fn buds_mode_streams_bit_exact() {
+        let base = baseline();
+        // AVRCP active at -20 dB: the buds apply it, the PCM is untouched.
+        let r = run(|r| {
+            r.fake.with(|s| s.set_volume(BUDS, vol(-20.0)));
+        });
+        assert_eq!(r.packets(), base);
+        assert_eq!(r.s.volume().mode, VolumeMode::Buds);
+        assert_eq!(r.s.volume().gain, [1.0, 1.0]);
+        assert_eq!(
+            r.logged("volume: the buds apply the volume"),
+            1,
+            "{}",
+            r.log.text()
+        );
+        // Right after a buds report: exact buds level, channels on the
+        // 0.5 dB grid. Still untouched.
+        let r = run(|r| {
+            r.fake.with(|s| {
+                s.set_volume(
+                    BUDS,
+                    VolumeState {
+                        level: -667_751,
+                        left: db(-10.5),
+                        right: db(-10.5),
+                        ..VolumeState::default()
+                    },
+                )
+            });
+        });
+        assert_eq!(r.packets(), base);
+        // No hardware volume (v2 driver, kill switch): bit-exact as well,
+        // whatever the volume bytes hold.
+        let r = run(|r| {
+            r.fake.with(|s| s.set_volume(0, vol(-20.0)));
+        });
+        assert_eq!(r.packets(), base);
+        assert_eq!(r.s.volume().mode, VolumeMode::Windows);
+    }
+
+    #[test]
+    fn software_gain_without_a_subscriber() {
+        let base = baseline();
+        let r = run(|r| {
+            r.fake.with(|s| s.set_volume(HW, vol(-20.0)));
+        });
+        assert_eq!(r.s.volume().mode, VolumeMode::Software);
+        let g = r.s.volume().gain;
+        assert!(
+            (g[0] - 0.1).abs() < 1e-9 && (g[1] - 0.1).abs() < 1e-9,
+            "{g:?}"
+        );
+        let p = r.packets();
+        assert_eq!(p.len(), base.len());
+        assert!(
+            p.iter().zip(&base).all(|(a, b)| a != b),
+            "every packet is scaled"
+        );
+        assert_eq!(r.logged("volume: software gain"), 1, "{}", r.log.text());
+        // A slider move while streaming: logged at debug level, applied.
+        let r = run(|r| {
+            r.fake.with(|s| s.set_volume(HW, vol(-20.0)));
+            r.at(2.0, |s| s.set_volume(HW, vol(-6.0)));
+        });
+        assert!((r.s.volume().gain[0] - crate::volume::level_to_gain(db(-6.0))).abs() < 1e-12);
+        assert_eq!(r.logged("volume: software gain"), 1);
+    }
+
+    #[test]
+    fn switching_modes_mid_stream() {
+        let base = baseline();
+        let r = run(|r| {
+            r.fake.with(|s| s.set_volume(BUDS, vol(-20.0)));
+            // The subscriber goes (AVRCP lost), then comes back.
+            r.at(2.0, |s| s.set_volume(HW, vol(-20.0)));
+            r.at(2.5, |s| s.set_volume(BUDS, vol(-20.0)));
+        });
+        let p = r.packets();
+        // Until the switch the stream is the unscaled one (packet 55 holds
+        // frames from both sides of t = 2 s).
+        assert_eq!(p[..54], base[..54]);
+        // Scaled from shortly after (the 20 ms ramp) until the switch back.
+        for k in 57..80 {
+            assert_ne!(p[k], base[k], "packet {k}");
+        }
+        assert_eq!(r.s.volume().mode, VolumeMode::Buds);
+        let modes: Vec<String> = r
+            .log
+            .find("volume: ")
+            .into_iter()
+            .map(|(t, m)| format!("{t} {}", m.split("volume: ").nth(1).unwrap_or("")))
+            .collect();
+        assert_eq!(modes.len(), 3, "{modes:?}");
+        assert!(modes[0].starts_with("0 the buds apply"), "{modes:?}");
+        assert!(modes[1].starts_with("2000 software gain"), "{modes:?}");
+        assert!(modes[2].starts_with("2500 the buds apply"), "{modes:?}");
+    }
+
+    #[test]
+    fn mute_silences_in_both_hardware_modes() {
+        for flags in [HW, BUDS] {
+            let r = run(|r| {
+                r.fake
+                    .with(move |s| s.set_volume(flags | AUDIO_FLAG_MUTED, vol(-3.0)));
+            });
+            assert_eq!(r.s.volume().gain, [0.0, 0.0]);
+            assert!(r.logged(", muted") >= 1, "{}", r.log.text());
+        }
+        // A muted stream's packets are all the same encoded silence after
+        // the pipeline starts muted (no ramp from unity at creation).
+        let r = run(|r| {
+            r.fake
+                .with(|s| s.set_volume(BUDS | AUDIO_FLAG_MUTED, vol(0.0)));
+        });
+        let p = r.packets();
+        let silent = run(|r| {
+            r.fake.with(|s| {
+                s.set_volume(
+                    HW,
+                    VolumeState {
+                        level: crossc_ioctl::audio::VOLUME_LEVEL_MIN,
+                        left: crossc_ioctl::audio::VOLUME_LEVEL_MIN,
+                        right: crossc_ioctl::audio::VOLUME_LEVEL_MIN,
+                        ..VolumeState::default()
+                    },
+                )
+            });
+        })
+        .packets();
+        assert_eq!(p, silent, "mute == slider at the bottom == silence");
     }
 }

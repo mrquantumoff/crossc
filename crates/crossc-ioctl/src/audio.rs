@@ -28,6 +28,24 @@
 //!   does not fit the buffer gives `STATUS_BUFFER_TOO_SMALL` at that point.
 //! * The counters are per device object: they restart when the device does.
 //!
+//! # Volume (protocol 3)
+//! The endpoint can carry a hardware volume (an ACX volume and mute element)
+//! whose level the inbox AVRCP stack sends to the buds as absolute volume
+//! (see `docs/DESIGN.md`, "Volume"). [`AudioState`] then reports it:
+//! [`AUDIO_FLAG_HW_VOLUME`] (Windows no longer scales the PCM itself),
+//! [`AUDIO_FLAG_AVRCP`] (the buds apply that volume: stream unscaled),
+//! [`AUDIO_FLAG_MUTED`] and the levels in [`VolumeState`]. With `HW_VOLUME`
+//! set and `AVRCP` clear nobody applies the volume, so the service must
+//! (software gain); with `HW_VOLUME` clear Windows already has. A change of
+//! the volume flags or levels bumps [`AudioState::seq`]; the AVRCP request
+//! counters do not.
+//!
+//! The reply grew from [`AudioState::SIZE_V2`] to [`AudioState::SIZE`] bytes
+//! behind the v2 fields. A v3 driver accepts an output buffer of at least
+//! `SIZE_V2` bytes and fills as much of `SIZE` as fits, so a v2 caller still
+//! works; [`AudioState::decode`] accepts a `SIZE_V2` reply (a v2 driver) and
+//! reads the volume fields as zero, which means "no hardware volume".
+//!
 //! # Rules the driver keeps
 //! * The audio engine never waits for the service. With nobody attached, or a
 //!   reader that falls behind, rendered PCM is dropped and counted in
@@ -174,6 +192,54 @@ pub const AUDIO_FLAG_ACX: u32 = 1;
 pub const AUDIO_FLAG_ATTACHED: u32 = 2;
 /// The link flag set by SET_LINK.
 pub const AUDIO_FLAG_LINK: u32 = 4;
+/// Protocol 3: the endpoint has a hardware volume (and mute) element, so
+/// Windows does not scale the PCM. Clear: no such element (v2 driver, the
+/// `DisableAvrcpVolume` kill switch, or the element could not be created);
+/// Windows has applied the volume before the PCM reaches the tap.
+pub const AUDIO_FLAG_HW_VOLUME: u32 = 8;
+/// Protocol 3: hardware volume is active: the inbox AVRCP stack holds the
+/// volume event and answers it, so the buds apply [`VolumeState::level`].
+/// Stream the PCM unscaled. Clear while `HW_VOLUME` is set: apply the level
+/// (and mute) in software.
+pub const AUDIO_FLAG_AVRCP: u32 = 16;
+/// Protocol 3: the endpoint is muted (mute element). The buds are sent the
+/// minimum level; the PCM should be silenced as well.
+pub const AUDIO_FLAG_MUTED: u32 = 32;
+/// Protocol 3, diagnostics: the AVRCP volume event is enabled (a subscriber
+/// exists), whether or not it answers ([`AUDIO_FLAG_AVRCP`] decides).
+pub const AUDIO_FLAG_AVRCP_SUBSCRIBED: u32 = 64;
+/// Every flag the volume state owns.
+pub const AUDIO_FLAGS_VOLUME: u32 =
+    AUDIO_FLAG_HW_VOLUME | AUDIO_FLAG_AVRCP | AUDIO_FLAG_MUTED | AUDIO_FLAG_AVRCP_SUBSCRIBED;
+
+/// Lowest hardware volume level, 1/65536 dB: -63.5 dB (`0xFFC08000`), the
+/// range the inbox A2DP driver exposes.
+pub const VOLUME_LEVEL_MIN: i32 = -4_161_536;
+/// Highest hardware volume level: 0 dB.
+pub const VOLUME_LEVEL_MAX: i32 = 0;
+
+/// Protocol 3 part of [`AudioState`]. All zero when there is no hardware
+/// volume. Levels are in 1/65536 dB within
+/// [`VOLUME_LEVEL_MIN`]..=[`VOLUME_LEVEL_MAX`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VolumeState {
+    /// The level for the buds (the unmuted value while muted). Normally the
+    /// louder channel; right after the buds reported a level it is that
+    /// level exactly, while the channels hold Windows' write-back of it
+    /// rounded to the 0.5 dB grid.
+    pub level: i32,
+    /// Per-channel levels as Windows set them (balance).
+    pub left: i32,
+    pub right: i32,
+    /// The AVRCP absolute volume (0..=127) the buds are sent for the
+    /// current state (0 while muted).
+    pub avrcp: u8,
+    /// Diagnostics, wrapping: AVRCP-side property GETs, property SETs (the
+    /// buds' level), and volume events the driver generated.
+    pub gets: u16,
+    pub sets: u16,
+    pub events: u16,
+}
 
 /// GET_STATE / WAIT_EVENT reply.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -190,10 +256,16 @@ pub struct AudioState {
     pub frames_rendered: u64,
     /// Of those, frames that were never handed to a reader.
     pub frames_dropped: u64,
+    /// Protocol 3 (zero from a v2 driver).
+    pub volume: VolumeState,
 }
 
 impl AudioState {
-    pub const SIZE: usize = 40;
+    /// Size of the reply in protocol 2, and the smallest output buffer a v3
+    /// driver accepts.
+    pub const SIZE_V2: usize = 40;
+    /// Size of the full protocol 3 reply.
+    pub const SIZE: usize = 64;
     pub fn encode(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
         b[0..4].copy_from_slice(&self.seq.to_le_bytes());
@@ -206,12 +278,33 @@ impl AudioState {
         // 19..24 reserved
         b[24..32].copy_from_slice(&self.frames_rendered.to_le_bytes());
         b[32..40].copy_from_slice(&self.frames_dropped.to_le_bytes());
+        // protocol 3
+        let v = &self.volume;
+        b[40..44].copy_from_slice(&v.level.to_le_bytes());
+        b[44..48].copy_from_slice(&v.left.to_le_bytes());
+        b[48..52].copy_from_slice(&v.right.to_le_bytes());
+        b[52] = v.avrcp;
+        // 53..56 reserved
+        b[56..58].copy_from_slice(&v.gets.to_le_bytes());
+        b[58..60].copy_from_slice(&v.sets.to_le_bytes());
+        b[60..62].copy_from_slice(&v.events.to_le_bytes());
+        // 62..64 reserved
         b
     }
+    /// Accepts a v2 reply ([`Self::SIZE_V2`] bytes: volume all zero) as well
+    /// as a longer one (bytes past [`Self::SIZE`] are ignored).
     pub fn decode(b: &[u8]) -> Result<Self, WireError> {
-        if b.len() < Self::SIZE {
+        if b.len() < Self::SIZE_V2 {
             return Err(WireError::TooShort);
         }
+        let i32_at = |o: usize| {
+            b.get(o..o + 4)
+                .map_or(0, |x| i32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+        };
+        let u16_at = |o: usize| {
+            b.get(o..o + 2)
+                .map_or(0, |x| u16::from_le_bytes([x[0], x[1]]))
+        };
         Ok(Self {
             seq: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
             flags: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
@@ -228,6 +321,15 @@ impl AudioState {
             frames_dropped: u64::from_le_bytes([
                 b[32], b[33], b[34], b[35], b[36], b[37], b[38], b[39],
             ]),
+            volume: VolumeState {
+                level: i32_at(40),
+                left: i32_at(44),
+                right: i32_at(48),
+                avrcp: b.get(52).copied().unwrap_or(0),
+                gets: u16_at(56),
+                sets: u16_at(58),
+                events: u16_at(60),
+            },
         })
     }
     pub fn attached(&self) -> bool {
@@ -238,6 +340,20 @@ impl AudioState {
     }
     pub fn acx(&self) -> bool {
         self.flags & AUDIO_FLAG_ACX != 0
+    }
+    /// The endpoint has a hardware volume element (protocol 3).
+    pub fn hw_volume(&self) -> bool {
+        self.flags & AUDIO_FLAG_HW_VOLUME != 0
+    }
+    /// The buds apply the volume (protocol 3).
+    pub fn avrcp_volume(&self) -> bool {
+        self.flags & AUDIO_FLAG_AVRCP != 0
+    }
+    pub fn muted(&self) -> bool {
+        self.flags & AUDIO_FLAG_MUTED != 0
+    }
+    pub fn avrcp_subscribed(&self) -> bool {
+        self.flags & AUDIO_FLAG_AVRCP_SUBSCRIBED != 0
     }
 }
 
@@ -347,13 +463,71 @@ mod tests {
             format: FMT,
             frames_rendered: 0x0102_0304_0506_0708,
             frames_dropped: 9,
+            volume: VolumeState::default(),
         };
         let b = s.encode();
         assert_eq!(AudioState::decode(&b), Ok(s));
         assert!(s.attached() && s.link() && s.acx());
+        assert!(!s.hw_volume() && !s.avrcp_volume() && !s.muted());
         assert_eq!(AudioState::decode(&b[..39]), Err(WireError::TooShort));
         assert_eq!(AudioState::decode(&[0; 40]).unwrap(), AudioState::default());
         assert_eq!(StreamState::from_wire(99), StreamState::None);
+    }
+
+    #[test]
+    fn v3_state_roundtrip_and_v2_compatibility() {
+        let s = AudioState {
+            seq: 3,
+            flags: AUDIO_FLAG_ACX | AUDIO_FLAG_HW_VOLUME | AUDIO_FLAG_AVRCP | AUDIO_FLAG_MUTED,
+            stream: StreamState::Paused,
+            format: FMT,
+            frames_rendered: 5,
+            frames_dropped: 1,
+            volume: VolumeState {
+                level: -667_751,
+                left: -700_000,
+                right: -667_751,
+                avrcp: 64,
+                gets: 0xFFFE,
+                sets: 2,
+                events: 0x1234,
+            },
+        };
+        let b = s.encode();
+        assert_eq!(b.len(), AudioState::SIZE);
+        assert_eq!(AudioState::decode(&b), Ok(s));
+        assert!(s.hw_volume() && s.avrcp_volume() && s.muted() && !s.avrcp_subscribed());
+        assert_eq!(VOLUME_LEVEL_MIN as u32, 0xFFC0_8000);
+        // The v2 bytes are exactly what protocol 2 sent: a v2 caller that
+        // gets only the first 40 bytes sees the v2 part of the same state.
+        let v2 = AudioState::decode(&b[..AudioState::SIZE_V2]).unwrap();
+        assert_eq!(
+            v2,
+            AudioState {
+                volume: VolumeState::default(),
+                ..s
+            }
+        );
+        // A v2 driver's 40-byte reply: no hardware volume.
+        let old = AudioState {
+            volume: VolumeState::default(),
+            flags: AUDIO_FLAG_ACX,
+            ..s
+        };
+        let d = AudioState::decode(&old.encode()[..40]).unwrap();
+        assert!(!d.hw_volume() && d.volume == VolumeState::default());
+        // A reply cut inside the volume part reads what is there, the rest 0.
+        let part = AudioState::decode(&b[..46]).unwrap();
+        assert_eq!((part.volume.level, part.volume.left), (-667_751, 0));
+        // Longer replies (a later version) are accepted.
+        let mut long = [0u8; 80];
+        long[..64].copy_from_slice(&b);
+        assert_eq!(AudioState::decode(&long), Ok(s));
+        // The volume flags are disjoint from the v2 ones.
+        assert_eq!(
+            AUDIO_FLAGS_VOLUME & (AUDIO_FLAG_ACX | AUDIO_FLAG_ATTACHED | AUDIO_FLAG_LINK),
+            0
+        );
     }
 
     #[test]
