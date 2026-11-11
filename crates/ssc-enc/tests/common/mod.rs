@@ -127,7 +127,7 @@ pub fn encode_rust(cfg: &Config, raw: &[u8]) -> (Vec<u8>, Vec<FrameInfo>) {
         return encode_rust_s32raw(cfg, raw);
     }
     let ch = if cfg.mono { 1 } else { 2 };
-    let samples: Vec<i16> = raw.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    let samples: Vec<i16> = raw.as_chunks::<2>().0.iter().map(|&b| i16::from_le_bytes(b)).collect();
     let per_frame = FRAME_SAMPLES * ch;
     let nframes = samples.len() / per_frame;
     let mut enc = Box::new(Encoder::new(cfg.mode, ch).unwrap());
@@ -166,12 +166,12 @@ pub fn encode_rust(cfg: &Config, raw: &[u8]) -> (Vec<u8>, Vec<FrameInfo>) {
 }
 
 fn encode_rust_f32raw(cfg: &Config, raw: &[u8]) -> (Vec<u8>, Vec<FrameInfo>) {
-    let samples: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let samples: Vec<f32> = raw.as_chunks::<4>().0.iter().map(|&b| f32::from_le_bytes(b)).collect();
     let mut enc = Box::new(Encoder::new(cfg.mode, 2).unwrap());
     enc.set_flags(cfg.flags);
     let (mut stream, mut infos) = (Vec::new(), Vec::new());
     let mut out = [0u8; MAX_FRAME_BYTES];
-    for (k, p) in samples.chunks_exact(2 * FRAME_SAMPLES).enumerate() {
+    for (k, p) in samples.as_chunks::<{ 2 * FRAME_SAMPLES }>().0.iter().enumerate() {
         let rate = cfg.rates[k % cfg.rates.len()];
         let n = enc.encode_frame(PcmFrame::F32(p), rate, &mut out).unwrap();
         stream.extend_from_slice(&(n as u16).to_le_bytes());
@@ -183,7 +183,7 @@ fn encode_rust_f32raw(cfg: &Config, raw: &[u8]) -> (Vec<u8>, Vec<FrameInfo>) {
 
 fn encode_rust_s32raw(cfg: &Config, raw: &[u8]) -> (Vec<u8>, Vec<FrameInfo>) {
     let ch = if cfg.mono { 1 } else { 2 };
-    let samples: Vec<i32> = raw.chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let samples: Vec<i32> = raw.as_chunks::<4>().0.iter().map(|&b| i32::from_le_bytes(b)).collect();
     let mut enc = Box::new(Encoder::new(cfg.mode, ch).unwrap());
     enc.set_flags(cfg.flags);
     let (mut stream, mut infos) = (Vec::new(), Vec::new());
@@ -209,7 +209,7 @@ fn encode_rust_s32raw(cfg: &Config, raw: &[u8]) -> (Vec<u8>, Vec<FrameInfo>) {
 pub fn widen_s16(raw: &[u8], bits: u32) -> Vec<u8> {
     let mut lcg: u32 = 0x2545_f491;
     let mut out = Vec::with_capacity(raw.len() * 2);
-    for b in raw.chunks_exact(2) {
+    for b in raw.as_chunks::<2>().0 {
         let s = i16::from_le_bytes([b[0], b[1]]) as i64;
         lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         let shift = bits - 16;

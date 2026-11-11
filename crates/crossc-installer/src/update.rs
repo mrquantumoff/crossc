@@ -704,7 +704,8 @@ pub fn download_release(
 /// or colon, no device name, ...); symbolic links are refused; files are only ever created, never overwritten
 /// (so two entries cannot name the same file); at most `max_entries` entries; at most `max_bytes` in all,
 /// counted as the data is unpacked rather than taken from the sizes the zip claims. Only stored and deflated
-/// entries can be read at all (the `zip` crate is built without anything else, and without decryption).
+/// entries are accepted, and no encrypted ones (the `zip` crate is built without anything else, and without
+/// decryption).
 /// Returns how many files and bytes were written.
 pub fn extract_bundle<R: Read + Seek>(
     zip: R,
@@ -727,10 +728,31 @@ pub fn extract_bundle<R: Read + Seek>(
         let mut entry = archive
             .by_index(index)
             .map_err(|e| format!("zip entry {index} cannot be read: {e}"))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|e| format!("zip entry {index} has a name that cannot be read: {e}"))?
+            .into_owned();
         if entry.is_symlink() {
             return Err(format!(
                 "zip entry \"{}\" is a symbolic link",
+                name.escape_default()
+            ));
+        }
+        // Checked here, before anything is created: the `zip` crate only notices an unsupported method once the
+        // data is read.
+        if entry.encrypted() {
+            return Err(format!(
+                "zip entry \"{}\" is encrypted",
+                name.escape_default()
+            ));
+        }
+        let method = entry.compression();
+        if !matches!(
+            method,
+            zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated
+        ) {
+            return Err(format!(
+                "zip entry \"{}\" is compressed with {method:?}, not stored or deflated",
                 name.escape_default()
             ));
         }
@@ -1555,6 +1577,54 @@ pub mod tests {
                 .contains("has no files")
         );
         assert!(files_in(&t.0).is_empty());
+    }
+
+    /// One stored entry whose local and central headers are patched with `patch(header, method_at, flags_at)`.
+    fn patched_zip(patch: impl Fn(&mut [u8], usize, usize)) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("crossc-0.2.0-x64/a.txt", options)
+            .unwrap();
+        writer.write_all(b"plain").unwrap();
+        let mut zip = writer.finish().unwrap().into_inner();
+        // Local file header: flags at 6, method at 8. Central directory header: flags at 8, method at 10.
+        let local = zip.windows(4).position(|w| w == b"PK\x03\x04").unwrap();
+        let central = zip.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+        patch(&mut zip[local..], 8, 6);
+        patch(&mut zip[central..], 10, 8);
+        zip
+    }
+
+    #[test]
+    fn other_compression_methods_and_encrypted_entries_are_refused() {
+        // Deflate64 (9), bzip2 (12), LZMA (14), zstd (93), and 77, which is no method at all. The zip crate is
+        // built without the named ones, so today it prints them as `Unsupported(n)`; only the refusal is checked,
+        // not that name, which a zip release with those methods built in would change.
+        for method in [9u16, 12, 14, 93, 77] {
+            let t = TempDir::new("zip-method");
+            let zip = patched_zip(|h, at, _| h[at..at + 2].copy_from_slice(&method.to_le_bytes()));
+            let err = unpack(&zip, &t.0).unwrap_err();
+            assert!(
+                err.contains("is compressed with ") && err.ends_with(", not stored or deflated"),
+                "{err}"
+            );
+            assert!(files_in(&t.0).is_empty(), "{method}");
+        }
+        // The encrypted flag (bit 0): there is no decryption to read it with. The zip crate itself refuses to open
+        // such an entry (`extract_bundle` checks it again, should that ever change).
+        let t = TempDir::new("zip-encrypted");
+        let zip = patched_zip(|h, _, at| h[at] |= 1);
+        let err = unpack(&zip, &t.0).unwrap_err();
+        assert!(
+            err.ends_with("a.txt\" is encrypted") || err.contains("Password required"),
+            "{err}"
+        );
+        assert!(files_in(&t.0).is_empty());
+        // The unpatched zip is fine, so it is the patch that is refused.
+        let t = TempDir::new("zip-unpatched");
+        assert_eq!(unpack(&patched_zip(|_, _, _| {}), &t.0).unwrap(), (1, 5));
     }
 
     #[test]
