@@ -1255,6 +1255,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossc-status"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "crossc-tray"
+version = "0.2.0"
+dependencies = [
+ "async-channel 2.5.0",
+ "crossc-status",
+ "gpui",
+ "raw-window-handle",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

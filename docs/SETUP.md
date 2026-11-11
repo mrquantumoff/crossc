@@ -1762,9 +1762,16 @@ Bluetooth adapter is built in or a USB dongle. For 15e the console output.
 `crossc-tray.exe` is an icon in the notification area that shows what the
 service is sending to the buds, with a details window. It runs as the
 logged-on user, not elevated, and only reads: everything it shows comes from
-the service over the named pipe `\.\pipe\crossc-status` (the driver's IOCTLs
+the service over the named pipe `\\.\pipe\crossc-status` (the driver's IOCTLs
 are admin-only, so the tray never talks to the driver). It changes nothing
 about the stream.
+
+The tray believes that pipe only if it is the service's: owned by SYSTEM or
+by Administrators, which is what a pipe created by the service (or by
+`crossc-service run` in an elevated console) is, and what no program of a
+plain user can create. While the service is not running any program could
+create a pipe of that name; the tray then shows "Status not trusted" instead
+of what that program says.
 
 > The service publishes its status from the version that includes the status
 > pipe (see `crates/crossc-status/INTEGRATION.md`). With an older service the
@@ -1784,7 +1791,11 @@ cargo build --release -p crossc-tray
 reconnecting, two pairs of buds, version mismatch) so the icon and the window
 can be looked at without buds. `--demo-state <name>` holds one of `off`,
 `waiting`, `hifi`, `uhq`, `adaptive`, `reconnect`, `two`, `mismatch`,
-`nobuds`.
+`nobuds`, `untrusted`.
+
+`--pipe \\.\pipe\<name>` reads another pipe than the service's (for trying the
+tray against `cargo run -p crossc-status --example serve`); such a pipe may be
+your own.
 
 ### 16b. The icon
 
@@ -1794,13 +1805,14 @@ Three ascending bars, a quality meter. New icons start in the overflow area
 | Icon | Meaning |
 |---|---|
 | bars dim, red cross | the service is not running (or has no status pipe) |
-| bars dim, amber dot | a problem that waiting does not fix: the service speaks another status protocol version, access denied, unreadable status |
+| bars dim, amber dot | a problem that waiting does not fix: service and tray are of different releases, access denied, unreadable status, a status pipe that is not the service's |
 | bars dim | the service runs, no stream is open: buds not connected, driver not ready, reconnecting |
 | 1 / 2 / 3 bars lit in the taskbar's text colour | a stream is open and idle: plain SSC / Seamless HiFi / UHQ |
 | 1 / 2 / 3 bars lit green | audio is streaming in that mode |
 
 With two pairs of buds the one that plays gives the icon. The tooltip has one
-line per pair, for example `Buds4 Pro — UHQ 96 kHz/24 · 584 kbps`, or says
+line per pair with mode, sample rate and depth, bitrate and media MTU limit,
+for example `Buds4 Pro — UHQ 96 kHz/24 · 584 kbps · MTU 1005`, or says
 what is wrong (`crossc — service not running`). The icon follows the taskbar's
 light or dark mode and its DPI, and comes back by itself after Explorer
 restarts.
@@ -1814,31 +1826,38 @@ the icon again. It has no taskbar button.
 
 | Field | Meaning |
 |---|---|
-| Title, badge | the buds' Bluetooth name (their address-based id if the name is unknown) and the link state |
-| Mode | UHQ (96 kHz / 24-bit), Seamless HiFi (48 kHz / 24-bit) or SSC (16-bit), with the SSC configuration octet sent to the buds |
+| Title, badge | the buds' Bluetooth name (their address-based id if the name is unknown) and the link state: waiting for the driver / buds not connected / ready / streaming / reconnecting |
+| Line under the title | with a stream: the mode by its full name and the bit depth, e.g. `UHQ (Ultra High Quality) · 24-bit`. Without one: what is being waited for |
+| The four boxes | the stream at a glance: **Mode** (UHQ, HiFi = Seamless HiFi, SSC = plain 16-bit), **Sample rate** of the audio as sent, **Bitrate** in use now (amber while stepped down), **Media MTU** in bytes: the largest media packet this link takes. Only while a stream is open |
 | Windows format | the format of the Windows endpoint: what you chose under Sound > Properties > Format. "nothing played yet" until the first stream |
 | Sent to the buds | rate and depth of the audio as sent. Underneath, if they differ from the Windows format: "resampled from ...", "16-bit input widened", "24-bit input dithered down" |
 | Bitrate | the bitrate in use now. Underneath: `fixed` (`AdaptiveBitrate=0`), `adaptive · ladder 584 / 291 / 152` (at the top; these are the steps), or in amber `stepped down · step 2 of 3 · top 584` while the link carries less |
 | Delay | the playback delay the buds reported (AVDTP delay report); "not reported" if they have not |
-| Volume | the level in percent, who applies the Windows slider, and "muted". `Buds (AVRCP)`: the buds themselves (hardware volume). `Software gain`: the service scales the audio because the buds do not answer. `Windows`: Windows scales the audio (`DisableAvrcpVolume`, or an older driver) |
-| State | waiting for the driver / buds not connected / ready / streaming / reconnecting, with the reason underneath (what the driver lacks, why the link went down, when the next attempt is) |
-| Packet | size of a media packet in bytes and the SSC frames in it; underneath the media MTU limit in use ("Copy details" also has how the limit was derived) |
-| Buds offer | the SSC capability octet of the buds (`0x3e` on Buds4 Pro) |
-| Driver | version of `crossc_bth` and the IOCTL protocol it speaks |
-| Packets sent, PCM frames | media packets sent, and PCM frames taken from the endpoint, since the service started this device's session |
+| Volume | the level in percent, who applies the Windows slider, and "muted". `set on the buds`: the buds themselves (hardware volume over AVRCP). `applied by the service`: the service scales the audio because the buds did not take the volume. `applied by Windows`: Windows scales the audio (`DisableAvrcpVolume`, or an older driver) |
+| State | only when there is a reason to give: the state again, with the reason underneath (what the driver lacks, why the link went down, when the next attempt is) |
+| Packet | size of a media packet in bytes and the SSC frames in it |
+| Media MTU | the media MTU limit in use, in bytes ("Copy details" also has how the limit was derived) |
+| Codec options | two octets in hex, `0x0a of 0x3e`: the SSC configuration octet sent to the buds, and the SSC capability octet the buds offered (`0x3e` on Buds4 Pro) |
+| Driver | version of `crossc_bth`; underneath the version of the IOCTL interface it speaks |
+| Activity | shown once the device has had a stream (or a counter is not zero) |
+| Packets sent, Frames read | media packets sent, and PCM frames taken from the endpoint, since the service started this device's session |
 | Dropped frames | PCM frames the driver dropped because the service did not read them in time. Should stay 0 |
-| Discontinuities | gaps in the PCM the driver reported (a stream that stopped and started) |
+| Stream gaps | discontinuities in the PCM the driver reported (a stream that stopped and started) |
 | Write errors | media writes that failed (each one takes the link down) |
 | Late packets | packets sent later than their schedule allows (40 ms or more behind the endpoint) |
-| Write latency | average and longest time a media write took in the current stream. Normally well under a millisecond; tens of milliseconds mean the link is congested |
+| Write latency | average and longest time a media write took in the current stream; shown while audio streams. Normally well under a millisecond; tens of milliseconds mean the link is congested |
 | Streaming for | how long the current stream has been running |
 | Reconnects | how often the link was set up again after a failure |
-| Amber / red line | the last warning or error of this device from the service's log, and how long ago |
-| Footer | the service's version, how long it has been running, the status protocol version |
+| Amber / red line | the last warning or error of this device from the service's log, and how long ago. Left out when it only repeats the reason under State ("Copy details" always has it) |
+| Footer | the service's version and how long it has been running |
 
-When there is no card the window says why: service not running, version
-mismatch (install the `crossc-tray.exe` that came with the service), access
-denied, or no buds with the crossc driver present.
+With two pairs of buds the cards stand side by side, equally high.
+
+When there is no card the window says why: service not running (open the
+crossc installer and choose Install), version mismatch (use the
+`crossc-tray.exe` that came with the service), access denied, status not
+trusted (another program holds the pipe's name; the service itself is probably
+not running), or no buds with the crossc driver present.
 
 ### 16d. The menu
 
@@ -1846,7 +1865,8 @@ Right click:
 
 * **Open details**: the window of 16c.
 * **Copy details**: everything of 16c as text on the clipboard (plus the
-  bitrate ladder and how the MTU limit was derived). Paste it into a report.
+  bitrate ladder, how the MTU limit was derived, the two SSC octets by name and
+  the status protocol version). Paste it into a report.
 * **Open service log folder**: `%ProgramData%\crossc` in Explorer (the folder
   the service names; only a plain local folder is ever opened).
 * **Start with Windows**: toggles the value `crossc-tray` under
@@ -1871,6 +1891,10 @@ Right click:
   the service it looks for the pipe every 5 s.
 * The details window is a second process of the same exe (`--flyout`) that
   exists only while the window is open (about 65 MB working set).
+* The service serves at most 8 status readers at once, 4 per Windows session
+  (the tray is one, its open details window a second). One more is turned
+  away and tries again; the window then says "Service busy" or
+  "Reconnecting" for a moment.
 * Stop the service (`sc stop crossc`, admin): within a second the icon gets
   the red cross and the tooltip says `crossc — service not running`. Start it
   again: the icon follows within 5 s, without restarting the tray.
