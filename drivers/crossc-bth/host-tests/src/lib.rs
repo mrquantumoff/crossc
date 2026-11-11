@@ -14,6 +14,15 @@ pub mod audio_park;
 #[path = "../../src/bt_name.rs"]
 pub mod bt_name;
 
+#[path = "../../src/open_park.rs"]
+pub mod open_park;
+
+#[path = "../../src/cb_refs.rs"]
+pub mod cb_refs;
+
+#[path = "../../src/rt_limits.rs"]
+pub mod rt_limits;
+
 #[cfg(test)]
 extern crate std;
 
@@ -25,3 +34,9 @@ mod session_tests;
 mod park_tests;
 #[cfg(test)]
 mod name_tests;
+#[cfg(test)]
+mod open_tests;
+#[cfg(test)]
+mod cb_tests;
+#[cfg(test)]
+mod rt_tests;

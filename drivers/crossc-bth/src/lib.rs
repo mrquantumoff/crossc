@@ -19,7 +19,8 @@
 //! IOCTL_INTERNAL_BTHENUM_GET_DEVINFO in SelfManagedIoInit, BRBs carried in the
 //! request context and submitted by formatting the *incoming* request with
 //! IOCTL_INTERNAL_BTH_SUBMIT_BRB, async CLOSE_CHANNEL from the DISPATCH-level
-//! disconnect indication, EvtIoStop cancelling sent requests.
+//! disconnect indication, EvtIoStop cancelling sent requests. One departure:
+//! an OPEN_CHANNEL BRB is not sent on the incoming request (see below).
 //!
 //! # Concurrency model
 //! * One `WDFSPINLOCK` per device guards every [`Channel`]. It is never held
@@ -38,7 +39,26 @@
 //!   right after WdfRequestSend returns. No cancel can fall into the gap
 //!   between linking a request and sending it.
 //! * A slot returns to `Free` only after the close BRB completed AND no
-//!   forwarded request still references it.
+//!   forwarded request still references it. A CLOSE that could not be handed
+//!   to bthport is not a completed close: the slot stays `Closing`
+//!   (`close_unsent`) until a later close attempt gets through or bthport
+//!   reports the disconnect and is told to close the channel itself.
+//! * bthport's indication callback is never called with memory of the
+//!   WDFDEVICE. Its context is a slot of a separately allocated, reference
+//!   counted block ([`CbBlock`]) that lives until the device AND every
+//!   registration bthport made have let go of it; the way from there to the
+//!   device is closed, and waited out, in the device's cleanup callback.
+//! * `EvtIoStop` cancels the READs and WRITEs that were forwarded; bthport
+//!   has cancel routines for both, so the queue's power stop does not sit
+//!   on them.
+//! * An OPEN_CHANNEL never gates the power-managed queue. bthport does not
+//!   cancel an OPEN it is working on (it ends with the peer's answer or
+//!   bthport's own L2CAP timers), and the framework waits, without a
+//!   timeout, for every request of a power-managed queue that the driver
+//!   still owns. So the caller's request is parked in a manual queue that
+//!   is not power-managed (one per channel slot) and the BRB travels on a
+//!   request the driver creates itself; see [`ioctl_open`] and
+//!   `open_park.rs`.
 //! * Synchronous closes (CLOSE ioctl, file cleanup, D0Exit, flush) wait with
 //!   an upper bound ([`CLOSE_TIMEOUT_PASSES`]). On timeout the slot is
 //!   abandoned: it stays `Closing` (so the close request is never reused in
@@ -67,7 +87,10 @@ mod audio_core;
 mod audio_park;
 mod bt_name;
 mod bth;
+mod cb_refs;
+mod open_park;
 mod pcm_ring;
+mod rt_limits;
 mod trace;
 
 use core::mem::{offset_of, size_of, zeroed};
@@ -77,14 +100,15 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use bth::*;
 use crossc_ioctl as ioc;
 use wdk_sys::ntddk::{
-    IoGetRequestorProcess, KeClearEvent, KeGetCurrentIrql, KeInitializeEvent, KeSetEvent, KeWaitForSingleObject,
-    PsDereferencePrimaryToken, PsReferencePrimaryToken, SeTokenIsAdmin,
+    ExAcquireRundownProtection, ExAllocatePool2, ExFreePool, ExInitializeRundownProtection, ExReleaseRundownProtection,
+    ExWaitForRundownProtectionRelease, IoGetRequestorProcess, KeClearEvent, KeGetCurrentIrql, KeInitializeEvent,
+    KeSetEvent, KeWaitForSingleObject, PsDereferencePrimaryToken, PsReferencePrimaryToken, SeTokenIsAdmin,
 };
 use wdk_sys::*;
 
 /// Driver version reported by GET_INFO: `major << 24 | minor << 16 | patch`
 /// (keep in sync with Cargo.toml `version`).
-const DRIVER_VERSION: u32 = 1 << 16; // 0.1.0
+const DRIVER_VERSION: u32 = (1 << 16) | 1; // 0.1.1
 const INCOMING_QUEUE_DEPTH: u8 = 50;
 /// Max forwarded requests (open/read/write) in flight per channel.
 const MAX_PENDING_PER_CHANNEL: u32 = 32;
@@ -96,6 +120,8 @@ const CLOSE_PASS_100NS: i64 = -1_000_000;
 const CLOSE_TIMEOUT_PASSES: u32 = 80;
 /// Re-issue cancels for still-pending requests every this many passes (1 s).
 const RECANCEL_EVERY_PASSES: u32 = 10;
+/// Pool tag of the [`CbBlock`] ("bCcC" in a pool dump).
+const CB_POOL_TAG: ULONG = u32::from_le_bytes(*b"bCcC");
 
 // ---------------------------------------------------------------------------
 // WDF context plumbing
@@ -169,11 +195,20 @@ struct Channel {
     /// Largest SDU we receive: the MTU of our own configuration request as
     /// the peer accepted it (BRB `OutResults.Params.Mtu`).
     in_mtu: u16,
-    /// Close requested while Opening (handle closed / D0Exit / CLOSE ioctl).
+    /// Close requested while Opening (handle closed / D0Exit / removal /
+    /// remote disconnect). A cancel of the parked caller alone does not set
+    /// it (see `open_held`).
     close_requested: bool,
     /// Peer disconnected (IndicationRemoteDisconnect). After the close, go Zombie.
     remote_disconnected: bool,
     close_brb_done: bool,
+    /// The slot is `Closing` but its CLOSE_CHANNEL never reached bthport
+    /// (format or send failed), so bthport still has the channel and may
+    /// still indicate on it. Not a finished close: the slot is not reused
+    /// and nobody is told it closed. Cleared, under the lock, by whoever
+    /// sends the CLOSE again ([`begin_close`]) or by the disconnect
+    /// indication that hands the close to bthport ([`indication_cb`]).
+    close_unsent: bool,
     /// When the close finishes go straight to Free, never Zombie: nobody can
     /// release the id later (no OPEN reply was delivered, the owner is
     /// closing it, or a synchronous close gave up and abandoned the slot).
@@ -185,6 +220,20 @@ struct Channel {
     close_req: WDFREQUEST,
     close_mem: WDFMEMORY,
     close_brb: _BRB_L2CA_CLOSE_CHANNEL,
+    /// Where the caller's OPEN_CHANNEL request waits while the slot is
+    /// `Opening`: manual, not power-managed, at most one request (the slot
+    /// has one OPEN at a time). Whoever takes the request out of it
+    /// completes it: a retrieve ([`open_complete`], [`open_abort`]) or the
+    /// queue's cancel callback ([`evt_open_canceled`]), which may instead
+    /// hand it on to `open_held`.
+    open_queue: WDFQUEUE,
+    /// The caller's OPEN request after it was cancelled while parked, kept
+    /// until its OPEN ends so that it gets the OPEN's own result (see
+    /// `open_park::on_cancel`). Only while the slot is `Opening` and
+    /// `close_requested` is false; null otherwise. Whoever moves the slot
+    /// out of `Opening`, or sets `close_requested`, takes it in the same
+    /// lock hold and completes it.
+    open_held: WDFREQUEST,
     dev: *mut DeviceContext,
 }
 
@@ -199,11 +248,48 @@ struct DeviceContext {
     remote_addr: u64,
     addr_flags: u32,
     next_generation: u32,
+    /// What bthport's indication callback is called with. Allocated in
+    /// DeviceAdd, let go of (not necessarily freed) in device cleanup.
+    cb: *mut CbBlock,
     channels: [Channel; ioc::MAX_CHANNELS],
     /// Audio path (session, PCM tap, queues of pended audio requests).
     audio: audio::AudioDev,
 }
 context_type!(DEVICE_CTX_INFO, DeviceContext, c"CrossCDeviceContext", device_ctx);
+
+/// `CallbackContext` of one channel slot's OPEN_CHANNEL BRB: which block,
+/// which slot. Written once in DeviceAdd.
+#[repr(C)]
+struct CbSlot {
+    block: *mut CbBlock,
+    index: u32,
+}
+
+/// The memory bthport's indication callback works on. Nonpaged pool of its
+/// own, NOT part of the WDFDEVICE context, because bthport may call the
+/// callback for as long as it has a channel registration it has not
+/// released, and that can be longer than the WDFDEVICE lives: bthport's
+/// reference on `ReferenceObject` keeps the WDM device object and the driver
+/// image, not the framework object and its context.
+///
+/// Lifetime: [`cb_refs::CbRefs`]. The device holds one reference from
+/// DeviceAdd to its cleanup callback; bthport holds one per registration,
+/// from `IndicationAddReference` to `IndicationReleaseReference`. Whoever
+/// drops the last one frees the block. It is never freed on a timeout.
+///
+/// `gate` is the only way from the block to the device. [`indication_cb`]
+/// uses `dev` only between `ExAcquireRundownProtection` and
+/// `ExReleaseRundownProtection`; [`evt_device_cleanup`] calls
+/// `ExWaitForRundownProtectionRelease`, after which no acquire succeeds and
+/// no callback is inside any more. `dev` is never cleared: it is simply not
+/// read once the gate is closed.
+#[repr(C)]
+struct CbBlock {
+    refs: cb_refs::CbRefs,
+    gate: EX_RUNDOWN_REF,
+    dev: *mut DeviceContext,
+    slots: [CbSlot; ioc::MAX_CHANNELS],
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -215,8 +301,9 @@ enum ReqKind {
 }
 
 /// Context of every request the framework creates for this device
-/// (WdfDeviceInitSetRequestAttributes). Nonpaged; holds the BRB so no
-/// per-request allocation is needed (same as bthecho).
+/// (WdfDeviceInitSetRequestAttributes), and of the request the driver
+/// creates for each OPEN_CHANNEL BRB ([`ioctl_open`]). Nonpaged; holds the
+/// BRB so no further allocation is needed (same as bthecho).
 #[repr(C)]
 struct RequestContext {
     brb: _BRB,
@@ -245,8 +332,15 @@ struct RequestContext {
     /// forwarded to its queue, read only by whoever owns the request then
     /// (after a retrieve, or in EvtIoCanceledOnQueue).
     audio_ticket: u64,
+    /// Parked OPEN_CHANNEL request only: the incarnation of `chan` it waits
+    /// for. Written before the request is forwarded to the slot's
+    /// `open_queue`; the cancel callback may run after the slot was reused.
+    open_gen: u32,
 }
 context_type!(REQUEST_CTX_INFO, RequestContext, c"CrossCRequestContext", request_ctx);
+
+// `open_park` spells STATUS_CANCELLED out (it is compiled for the host too).
+const _: () = assert!(open_park::waiter_status(open_park::Outcome::CloseLate, 0) == STATUS_CANCELLED);
 
 /// Context type attached to every WDFFILEOBJECT when ACX is on. It carries no
 /// data: it exists so the file-object attributes have a context type of their
@@ -449,6 +543,24 @@ unsafe extern "C" fn evt_device_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INI
         (*dev).target = call_unsafe_wdf_function_binding!(WdfDeviceGetIoTarget, device);
         (*dev).next_generation = 1;
 
+        // The indication callback's block (see CbBlock). From here on the
+        // device's cleanup callback lets go of it, whatever DeviceAdd
+        // returns. ExAllocatePool2 zeroes the memory.
+        let cb = ExAllocatePool2(POOL_FLAG_NON_PAGED as POOL_FLAGS, size_of::<CbBlock>() as SIZE_T, CB_POOL_TAG)
+            .cast::<CbBlock>();
+        if cb.is_null() {
+            trace!("no memory for the indication callback block");
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        addr_of_mut!((*cb).refs).write(cb_refs::CbRefs::new());
+        ExInitializeRundownProtection(addr_of_mut!((*cb).gate));
+        (*cb).dev = dev;
+        for i in 0..ioc::MAX_CHANNELS {
+            (*cb).slots[i].block = cb;
+            (*cb).slots[i].index = i as u32;
+        }
+        (*dev).cb = cb;
+
         let mut lattr = attributes();
         lattr.ParentObject = device.cast();
         let status = call_unsafe_wdf_function_binding!(WdfSpinLockCreate, &raw mut lattr, addr_of_mut!((*dev).lock));
@@ -469,6 +581,19 @@ unsafe extern "C" fn evt_device_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INI
             (*c).state = ChanState::Free;
             list_init(addr_of_mut!((*c).pending));
             KeInitializeEvent(addr_of_mut!((*c).done), _EVENT_TYPE::NotificationEvent, 1);
+            // Park queue of the slot's OPEN (see `Channel::open_queue`).
+            // Its cancel callback only starts a close and completes the
+            // request, both usable at DISPATCH_LEVEL.
+            let status = audio::create_manual_queue(
+                device,
+                _WDF_EXECUTION_LEVEL::WdfExecutionLevelDispatch,
+                Some(evt_open_canceled),
+                addr_of_mut!((*c).open_queue),
+            );
+            if !nt_success(status) {
+                trace!("ch{} open queue creation failed {:#x}", i, status);
+                return status;
+            }
             let mut a = attributes();
             a.ParentObject = device.cast();
             let status = call_unsafe_wdf_function_binding!(WdfRequestCreate, &raw mut a, (*dev).target, addr_of_mut!((*c).close_req));
@@ -486,6 +611,31 @@ unsafe extern "C" fn evt_device_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INI
             );
             if !nt_success(status) {
                 return status;
+            }
+            // Format the close request once now. The first format of a
+            // request allocates its FxInternalIoctlOthersContext
+            // (FxIoTarget::FormatInternalIoctlOthersRequest); WdfRequestReuse
+            // keeps it (FxRequestBase::ClearFieldsForReuse only calls
+            // ContextReleaseAndRestore), so the format in send_close_brb,
+            // which can run at DISPATCH and has nobody to report a failure
+            // to, no longer allocates. The request is not sent here, and
+            // send_close_brb reuses and formats it again before every send.
+            // A failure is only logged: the close path copes with a CLOSE
+            // it cannot send (`close_unsent`).
+            let status = call_unsafe_wdf_function_binding!(
+                WdfIoTargetFormatRequestForInternalIoctlOthers,
+                (*dev).target,
+                (*c).close_req,
+                IOCTL_INTERNAL_BTH_SUBMIT_BRB,
+                (*c).close_mem,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut()
+            );
+            if !nt_success(status) {
+                trace!("ch{} close request could not be pre-formatted {:#x}", i, status);
             }
         }
 
@@ -522,8 +672,11 @@ unsafe extern "C" fn evt_device_add(_driver: WDFDRIVER, mut init: PWDFDEVICE_INI
 
         // Default queue: parallel, power-managed (like bthcli), PASSIVE
         // callbacks so CLOSE can wait for the close BRB. EvtIoStop cancels
-        // requests we forwarded so power-down / removal never hangs on a
-        // READ that is waiting for data.
+        // the READs and WRITEs we forwarded, so that power-down / removal
+        // does not sit on a READ that is waiting for data. The queue stop
+        // still waits for bthport to complete each of them. An OPEN is not
+        // among them: its request leaves this queue before the BRB is sent
+        // (see ioctl_open).
         let mut q = WDF_IO_QUEUE_CONFIG {
             Size: size_of::<WDF_IO_QUEUE_CONFIG>() as ULONG,
             DispatchType: _WDF_IO_QUEUE_DISPATCH_TYPE::WdfIoQueueDispatchParallel,
@@ -553,9 +706,37 @@ static DEVICE_INTERFACE_GUID: GUID = GUID {
     Data4: ioc::DEVICE_INTERFACE_GUID.data4,
 };
 
+/// The WDFDEVICE is being deleted. PASSIVE_LEVEL (Microsoft Learn,
+/// EVT_WDF_OBJECT_CONTEXT_CLEANUP: the framework calls the cleanup callback
+/// of a device object at PASSIVE_LEVEL), which
+/// `ExWaitForRundownProtectionRelease` needs (IRQL <= APC_LEVEL).
+///
+/// WDF calls this after the cleanup callbacks of the device's children and
+/// before it destroys them (`FxObject::DisposeChildrenWorker`, then
+/// `DeletedAndDisposedWorkerLocked` -> `DestroyChildren`), so the spinlock
+/// an indication callback may be holding inside the gate is still there
+/// while this waits for it.
 unsafe extern "C" fn evt_device_cleanup(obj: WDFOBJECT) {
     unsafe {
         let dev = device_ctx(obj);
+        let cb = (*dev).cb;
+        if !cb.is_null() {
+            (*dev).cb = null_mut();
+            // Close the way from bthport's callback to this device and wait
+            // for a callback that is on it (short: a spinlock and at most
+            // one asynchronous send). From here on a disconnect indication
+            // only tells bthport to close the channel itself.
+            ExWaitForRundownProtectionRelease(addr_of_mut!((*cb).gate));
+            let registrations = (*cb).refs.registrations();
+            match (*cb).refs.release_device() {
+                cb_refs::Released::Last => ExFreePool(cb.cast()),
+                cb_refs::Released::Kept => trace!(
+                    "device cleanup: bthport still holds {} channel registration(s); the callback block stays until it releases them",
+                    registrations
+                ),
+                cb_refs::Released::Underflow => trace!("device cleanup: callback block already released (bug)"),
+            }
+        }
         if (*dev).profile_acquired {
             if let Some(deref) = (*dev).profile.Interface.InterfaceDereference {
                 deref((*dev).profile.Interface.Context);
@@ -575,6 +756,10 @@ unsafe extern "C" fn evt_self_managed_io_init(device: WDFDEVICE) -> NTSTATUS {
         let dev = device_ctx(device.cast());
         // Remote BD_ADDR, exactly as bthcli does it: internal IOCTL with an
         // *output* memory descriptor (not the "Others" argument form).
+        // Synchronous and without a timeout: this relies on BthEnum
+        // answering GET_DEVINFO for its own child without waiting for the
+        // radio (crash review F10). If that ever has to be bounded, give it
+        // WDF_REQUEST_SEND_OPTIONS with a timeout rather than a wait here.
         let mut info: BTH_DEVICE_INFO = zeroed();
         let mut out = WDF_MEMORY_DESCRIPTOR {
             Type: _WDF_MEMORY_DESCRIPTOR_TYPE::WdfMemoryDescriptorTypeBuffer,
@@ -792,8 +977,9 @@ unsafe extern "C" fn evt_file_cleanup(file: WDFFILEOBJECT) {
 /// Differences from `evt_file_cleanup`:
 /// * It runs at IRP_MJ_CLOSE, i.e. after every request on the handle has
 ///   completed, not at IRP_MJ_CLEANUP. When a process dies the I/O manager
-///   cancels its pending requests (bthport must honour the cancel, as it must
-///   for WdfRequestCancelSentRequest), so the close follows. A handle closed
+///   cancels its pending requests (bthport honours that for READ and WRITE;
+///   a pending OPEN ends when bthport ends its BRB, as it did before the
+///   park queue, see `evt_open_canceled`), so the close follows. A handle closed
 ///   while one of its own READs is still pending in a live thread keeps its
 ///   channels until that READ ends.
 /// * It also runs for ACX's own (KS) file objects, which own no channel, and
@@ -865,6 +1051,7 @@ unsafe fn begin_close(c: *mut Channel, remote: bool, generation: u32, release: b
         let mut n = 0usize;
         let mut send_close = false;
         let mut signal = false;
+        let mut held: WDFREQUEST = null_mut();
 
         lock(dev);
         if (*c).state == ChanState::Free || (*c).generation != generation {
@@ -878,14 +1065,37 @@ unsafe fn begin_close(c: *mut Channel, remote: bool, generation: u32, release: b
             (*c).release_when_done = true;
         }
         match (*c).state {
-            ChanState::Free | ChanState::Closing => {}
+            ChanState::Free => {}
+            ChanState::Closing => {
+                // An earlier CLOSE never reached bthport: try again. The
+                // flag is taken under the lock, so one caller at a time
+                // owns the close request (it is idle: its send failed).
+                if (*c).close_unsent {
+                    (*c).close_unsent = false;
+                    send_close = true;
+                }
+            }
             ChanState::Zombie => {
                 if release {
                     release_slot_locked(c);
                     signal = true;
                 }
             }
-            ChanState::Opening => (*c).close_requested = true,
+            // Never a CLOSE while the OPEN is in flight: open_complete sends
+            // it. A CLOSE queued behind the OPEN in bthport would still be
+            // cancellable (only the current signal request of a connection
+            // is not), and the close path relies on a sent CLOSE always
+            // being processed by bthport.
+            //
+            // A caller that was cancelled and is being kept for the OPEN's
+            // result would only get STATUS_CANCELLED now (the channel is
+            // closed again when it opens): complete it right away, so that
+            // nothing is held once a close was asked for (D0Exit and
+            // removal come before the purge of the park queues).
+            ChanState::Opening => {
+                (*c).close_requested = true;
+                held = core::ptr::replace(addr_of_mut!((*c).open_held), null_mut());
+            }
             ChanState::Open => {
                 (*c).state = ChanState::Closing;
                 (*c).close_brb_done = false;
@@ -899,6 +1109,10 @@ unsafe fn begin_close(c: *mut Channel, remote: bool, generation: u32, release: b
 
         if signal {
             KeSetEvent(addr_of_mut!((*c).done), 0, 0);
+        }
+        if !held.is_null() {
+            trace!("ch{} close asked for while a cancelled OPEN was kept: completed now", (*c).index);
+            complete(held, STATUS_CANCELLED, 0);
         }
         cancel_referenced(&victims[..n]);
         if send_close {
@@ -1006,14 +1220,16 @@ unsafe fn send_close_brb(c: *mut Channel) {
         } else {
             trace!("ch{} close format failed {:#x}", (*c).index, status);
         }
-        // Could not send: the handle is as good as gone; finish locally.
+        // Could not send. bthport was not told anything, so it still has the
+        // channel, with our callback registered on it: this is NOT a
+        // finished close. The slot stays Closing and keeps its handle, so it
+        // is not reused and not reported closed. It ends when a later close
+        // attempt gets through (begin_close), or when bthport indicates the
+        // disconnect and indication_cb lets bthport close the channel.
         lock(dev);
-        (*c).close_brb_done = true;
-        let fin = maybe_finish_locked(c);
+        (*c).close_unsent = true;
         unlock(dev);
-        if fin {
-            KeSetEvent(addr_of_mut!((*c).done), 0, 0);
-        }
+        trace!("ch{} CLOSE NOT SENT: the slot stays reserved until bthport lets go of the channel", (*c).index);
     }
 }
 
@@ -1022,6 +1238,14 @@ unsafe extern "C" fn close_complete(_req: WDFREQUEST, _t: WDFIOTARGET, p: PWDF_R
         let c = ctx.cast::<Channel>();
         let dev = (*c).dev;
         trace!("ch{} close BRB done {:#x}", (*c).index, (*p).IoStatus.__bindgen_anon_1.Status);
+        // Whatever the status: a CLOSE that bthport completed counts as
+        // closed. That rests on bthport, not on this driver (bthport.sys
+        // 10.0.26100, crash review F2): a CLOSE it handles always ends in
+        // the connection being deleted, and the only failures are "handle
+        // unknown" (already deleted) and "a CLOSE is already in progress",
+        // which this driver cannot cause (one close request per slot, never
+        // reused in flight). If a failed CLOSE could ever leave the channel
+        // open in bthport, treat it like `close_unsent` instead.
         lock(dev);
         (*c).close_brb_done = true;
         let fin = maybe_finish_locked(c);
@@ -1057,6 +1281,7 @@ unsafe fn release_slot_locked(c: *mut Channel) {
         (*c).close_requested = false;
         (*c).remote_disconnected = false;
         (*c).close_brb_done = false;
+        (*c).close_unsent = false;
         (*c).release_when_done = false;
     }
 }
@@ -1069,7 +1294,10 @@ unsafe fn close_sync(c: *mut Channel, generation: u32, budget: u32) -> bool {
         if !begin_close(c, false, generation, true) {
             return true;
         }
-        wait_closed(c, generation, budget) < budget || finished(c, generation)
+        // "Finished" never becomes false again for one incarnation, so this
+        // is the same answer wait_closed had when it returned early.
+        let _ = wait_closed(c, generation, budget);
+        finished(c, generation)
     }
 }
 
@@ -1089,7 +1317,18 @@ unsafe fn finished(c: *mut Channel, generation: u32) -> bool {
 /// timeout the slot is abandoned: it stays Closing (its close request may
 /// still be in flight, so it must not be reused), loses its owner, and goes
 /// straight to Free when bthport finally drains it. Returns passes used
-/// (== `budget` on timeout).
+/// (== `budget` on timeout). A slot whose CLOSE could not be sent
+/// (`close_unsent`) is abandoned at once, without using up the budget:
+/// nothing the wait could see is going to happen.
+///
+/// An abandoned slot's close request may still be in bthport when the
+/// device is deleted. WDF then waits for it (FxIoTarget::Remove ->
+/// WaitForSentIoToComplete, at device dispose); that wait is bounded only
+/// by bthport, which times out its own signal requests (crash review F9).
+///
+/// `done` is set by the finishers after they dropped the lock, so a wait
+/// can see the event of the incarnation before (crash review F3). The only
+/// effect is a pass that ends early; `finished` decides, under the lock.
 unsafe fn wait_closed(c: *mut Channel, generation: u32, budget: u32) -> u32 {
     unsafe {
         let dev = (*c).dev;
@@ -1098,7 +1337,10 @@ unsafe fn wait_closed(c: *mut Channel, generation: u32, budget: u32) -> u32 {
             if finished(c, generation) {
                 return used;
             }
-            if used >= budget {
+            lock(dev);
+            let unsent = (*c).generation == generation && (*c).state == ChanState::Closing && (*c).close_unsent;
+            unlock(dev);
+            if used >= budget || unsent {
                 lock(dev);
                 let abandoned = (*c).generation == generation && !matches!((*c).state, ChanState::Free | ChanState::Zombie);
                 if abandoned {
@@ -1110,14 +1352,15 @@ unsafe fn wait_closed(c: *mut Channel, generation: u32, budget: u32) -> u32 {
                 unlock(dev);
                 if abandoned {
                     trace!(
-                        "ch{} close ABANDONED after {} ms: state={:?} pending={} (slot frees itself when bthport drains)",
+                        "ch{} close ABANDONED after {} ms: state={:?} pending={} unsent={} (slot frees itself when bthport drains)",
                         (*c).index,
                         used * 100,
                         state,
-                        pending
+                        pending,
+                        unsent
                     );
                 }
-                return budget;
+                return if unsent { used } else { budget };
             }
             // `done` is a notification event; the timed re-check covers the
             // case where the slot finished and was immediately reused (event
@@ -1139,12 +1382,67 @@ unsafe fn wait_closed(c: *mut Channel, generation: u32, budget: u32) -> u32 {
 }
 
 /// bthport indication callback (IRQL <= DISPATCH).
+///
+/// `context` is a [`CbSlot`] of the device's [`CbBlock`], never memory of
+/// the WDFDEVICE. bthport calls this for as long as it holds a registration
+/// of the callback: from `IndicationAddReference`, which it delivers while
+/// it processes the OPEN_CHANNEL BRB, to `IndicationReleaseReference`, which
+/// it delivers when it destroys the connection (Microsoft Learn,
+/// INDICATION_CODE; bthport.sys 10.0.26100 `L2CapCon_SetCallback` pairs them
+/// with its ObReferenceObject / ObDereferenceObject on `ReferenceObject`).
+/// Each registration holds one reference on the block, so the block is
+/// valid in every call bthport is entitled to make, including calls that
+/// come after the WDFDEVICE was deleted.
+///
+/// What runs at which point:
+/// * Add/Release only touch the block's atomic count (and free the block,
+///   nonpaged pool, on the last release). No lock, no device.
+/// * A disconnect first acquires the block's run-down protection
+///   (`ExAcquireRundownProtection`, usable at DISPATCH_LEVEL on a nonpaged
+///   block). While it holds it, device cleanup is waiting in
+///   `ExWaitForRundownProtectionRelease` and the device context, its
+///   spinlock and the profile interface are all still there. If the acquire
+///   fails the device is gone: nothing of it is touched.
+///
+/// `CloseNow` (INDICATION_PARAMETERS, Microsoft Learn: "Set this member to
+/// TRUE to notify the Bluetooth driver stack to close the connection") is
+/// set in exactly the cases where this driver will not send a CLOSE_CHANNEL
+/// for the indicated connection: the device is gone, the indication is for
+/// no channel the driver tracks, or its CLOSE could not be sent. bthport
+/// then deletes the connection itself instead of keeping it, with this
+/// callback registered, until a CLOSE that never comes. For a channel the
+/// driver does close, `CloseNow` stays FALSE and the CLOSE_CHANNEL BRB is
+/// sent from here, as before and as bthecho does.
 unsafe extern "C" fn indication_cb(context: PVOID, code: INDICATION_CODE, params: PINDICATION_PARAMETERS) {
     unsafe {
-        let c = context.cast::<Channel>();
+        let slot = context.cast::<CbSlot>();
+        let cb = (*slot).block;
+        let index = (*slot).index;
         match code {
+            _INDICATION_CODE::IndicationAddReference => (*cb).refs.add(),
+            _INDICATION_CODE::IndicationReleaseReference => match (*cb).refs.release() {
+                cb_refs::Released::Kept => {}
+                cb_refs::Released::Last => {
+                    // The device let go earlier and this was bthport's last
+                    // registration: nobody can call with this block again.
+                    ExFreePool(cb.cast());
+                    trace!("ch{} last bthport registration released after the device went away; callback block freed", index);
+                }
+                cb_refs::Released::Underflow => trace!("ch{} IndicationReleaseReference without a registration (ignored)", index),
+            },
             _INDICATION_CODE::IndicationRemoteDisconnect => {
-                let dev = (*c).dev;
+                if params.is_null() {
+                    return;
+                }
+                if ExAcquireRundownProtection(addr_of_mut!((*cb).gate)) == 0 {
+                    // The device was deleted while bthport still had this
+                    // channel. Nobody is left to send a CLOSE_CHANNEL.
+                    (*params).Parameters.Disconnect.as_mut().CloseNow = 1;
+                    trace!("ch{} remote disconnect after the device went away: left to bthport (CloseNow)", index);
+                    return;
+                }
+                let dev = (*cb).dev;
+                let c = addr_of_mut!((*dev).channels[index as usize]);
                 let p = &*params;
                 let reason = p.Parameters.Disconnect.as_ref().Reason;
                 lock(dev);
@@ -1156,14 +1454,33 @@ unsafe extern "C" fn indication_cb(context: PVOID, code: INDICATION_CODE, params
                 };
                 let generation = (*c).generation;
                 unlock(dev);
-                trace!("ch{} remote disconnect reason={} ours={}", (*c).index, reason, ours);
+                let mut close_now = !ours;
                 if ours {
                     // As bthecho: send CLOSE_CHANNEL from here (async).
                     let _ = begin_close(c, true, generation, false);
+                    // If that CLOSE (or an earlier one) could not be sent,
+                    // hand the close to bthport and finish the slot here.
+                    lock(dev);
+                    let unsent = (*c).generation == generation && (*c).state == ChanState::Closing && (*c).close_unsent;
+                    let mut fin = false;
+                    if unsent {
+                        (*c).close_unsent = false;
+                        (*c).close_brb_done = true;
+                        fin = maybe_finish_locked(c);
+                        close_now = true;
+                    }
+                    unlock(dev);
+                    if fin {
+                        KeSetEvent(addr_of_mut!((*c).done), 0, 0);
+                    }
                 }
+                if close_now {
+                    (*params).Parameters.Disconnect.as_mut().CloseNow = 1;
+                }
+                trace!("ch{} remote disconnect reason={} ours={} close_now={}", index, reason, ours, close_now);
+                ExReleaseRundownProtection(addr_of_mut!((*cb).gate));
             }
-            _INDICATION_CODE::IndicationAddReference | _INDICATION_CODE::IndicationReleaseReference => {}
-            other => trace!("ch{} indication {}", (*c).index, other),
+            other => trace!("ch{} indication {}", index, other),
         }
     }
 }
@@ -1172,6 +1489,25 @@ unsafe extern "C" fn indication_cb(context: PVOID, code: INDICATION_CODE, params
 // I/O
 // ---------------------------------------------------------------------------
 
+/// The queue is being stopped (device leaving D0) or emptied (removal);
+/// called once per request the driver still owns. PASSIVE_LEVEL (the
+/// queue's execution level).
+///
+/// The framework waits, without a timeout, until each of these requests is
+/// completed (`FxIoQueue::StopProcessingForPower`; under Driver Verifier it
+/// breaks into the debugger after 60 s), and it does not call this callback
+/// again for a request that was already cancelled with
+/// `WdfRequestCancelSentRequest` (`m_Canceled`). So only requests that
+/// bthport is sure to complete when they are cancelled may be in bthport
+/// while this queue owns them: READ and WRITE (bthport has cancel routines
+/// for both; READ cancel is exercised on hardware by every CLOSE). They are
+/// cancelled here, exactly as before the crash review. An OPEN_CHANNEL,
+/// which bthport does not cancel once it is working on it, is never one of
+/// them: its request has left this queue before the BRB is sent
+/// ([`ioctl_open`]).
+///
+/// No `WdfRequestStopAcknowledge`: nothing here needs it, and an
+/// acknowledged request would have its completion routine run in Dx.
 unsafe extern "C" fn evt_io_stop(q: WDFQUEUE, req: WDFREQUEST, _flags: ULONG) {
     unsafe {
         let device = call_unsafe_wdf_function_binding!(WdfIoQueueGetDevice, q);
@@ -1348,7 +1684,8 @@ unsafe fn ioctl_get_info(dev: *mut DeviceContext, req: WDFREQUEST, rc: *mut Requ
 
 /// Link `rc` into `c.pending` and hand it to bthport with the
 /// already-initialised BRB in the request context. Lock must be held on entry;
-/// it is released here. On failure the request is completed.
+/// it is released here. On failure the request is completed; for an OPEN
+/// (`req` is the driver's own request) that is [`open_abort`].
 unsafe fn submit_locked(dev: *mut DeviceContext, c: *mut Channel, req: WDFREQUEST, rc: *mut RequestContext, brb_size: usize, done: PFN_WDF_REQUEST_COMPLETION_ROUTINE) {
     unsafe {
         (*rc).chan = c;
@@ -1410,9 +1747,10 @@ unsafe fn submit_locked(dev: *mut DeviceContext, c: *mut Channel, req: WDFREQUES
             KeSetEvent(addr_of_mut!((*c).done), 0, 0);
         }
         if (*rc).kind == ReqKind::Open {
-            open_failed(c);
+            open_abort(c, req, status);
+        } else {
+            complete(req, status, 0);
         }
-        complete(req, status, 0);
     }
 }
 
@@ -1434,21 +1772,96 @@ unsafe fn unlink_request(c: *mut Channel, rc: *mut RequestContext) -> bool {
     }
 }
 
-unsafe fn open_failed(c: *mut Channel) {
+/// The OPEN of slot `c` ended without a channel and without its completion
+/// routine: free the slot. Returns the caller's request if it was cancelled
+/// and kept (`open_held`), taken in the same lock hold that frees the slot;
+/// the caller of this function completes it.
+unsafe fn open_failed(c: *mut Channel) -> Option<WDFREQUEST> {
     unsafe {
         let dev = (*c).dev;
         lock(dev);
         let fin = (*c).state == ChanState::Opening;
+        let mut held: WDFREQUEST = null_mut();
         if fin {
+            held = core::ptr::replace(addr_of_mut!((*c).open_held), null_mut());
             release_slot_locked(c);
         }
         unlock(dev);
         if fin {
             KeSetEvent(addr_of_mut!((*c).done), 0, 0);
         }
+        if held.is_null() { None } else { Some(held) }
     }
 }
 
+/// The OPEN of slot `c` ends without its BRB having reached bthport (not
+/// sent, or the send failed; the completion routine never ran). `oreq` is
+/// the driver's request for it, no longer linked. Frees the slot, deletes
+/// `oreq` and completes the caller with `status`, if it is still parked or
+/// was cancelled and kept (`open_held`). IRQL <= DISPATCH; lock not held.
+///
+/// The caller's request is taken out of the queue BEFORE the slot is freed
+/// (and out of `open_held` while it is freed): once the slot is Free
+/// another OPEN can claim it and park its own request in the same queue.
+unsafe fn open_abort(c: *mut Channel, oreq: WDFREQUEST, status: NTSTATUS) {
+    unsafe {
+        let parked = audio::retrieve((*c).open_queue);
+        let held = open_failed(c);
+        let waiter = parked.or(held);
+        call_unsafe_wdf_function_binding!(WdfObjectDelete, oreq.cast());
+        if let Some(w) = waiter {
+            complete(w, status, 0);
+        }
+    }
+}
+
+/// OPEN_CHANNEL. PASSIVE_LEVEL, in the default queue's EvtIoDeviceControl.
+///
+/// The caller's request `req` does not carry the BRB. It is parked in the
+/// slot's `open_queue` (manual, not power-managed) and the BRB is sent on
+/// `oreq`, a request the driver creates for this one OPEN and deletes when
+/// the OPEN ends. Why: bthport does not cancel an OPEN_CHANNEL that it has
+/// made the connection's current signal request (the cancel only sets a
+/// flag; the request ends with the peer's answer or bthport's L2CAP timers,
+/// 15 s per step, 60 s after "connect pending"). A request of the
+/// power-managed default queue that sat in bthport like that would hold up
+/// every power-down and the removal of the device
+/// (`FxIoQueue::StopProcessingForPower` waits for it without a timeout,
+/// Driver Verifier breaks after 60 s), and `EvtIoStop` is no way out: the
+/// framework does not call it for a request that was cancelled before, and
+/// an acknowledgement does not count on a purge. A forwarded request is not
+/// the default queue's any more (`FxIoQueue::ForwardRequestWorker` takes it
+/// off the driver-owned list), so nothing of an OPEN is left there.
+///
+/// Who completes the caller's request: whoever takes it out of the park
+/// queue or out of `open_held`, and only that one (`open_park.rs`).
+/// * [`open_complete`] (or [`open_abort`]) retrieves it, or takes it from
+///   `open_held`, and completes it with the outcome of the BRB;
+/// * [`evt_open_canceled`] gets it from the framework when it is cancelled
+///   while parked (CancelIoEx, thread or process exit, CloseHandle with the
+///   OPEN pending, removal of the device). While the OPEN is in flight and
+///   no close was asked for, it keeps the request in `open_held` and only
+///   cancels the BRB, so the caller gets bthport's result, a late success
+///   included, as before the park queue. Otherwise it completes it with
+///   STATUS_CANCELLED at once;
+/// * [`begin_close`] completes a request kept in `open_held` with
+///   STATUS_CANCELLED when a close of the `Opening` slot is asked for.
+///
+/// Order: slot claimed (lock) -> request parked -> BRB linked and sent. The
+/// request is parked first so that the completion routine always finds it
+/// (or finds that it was cancelled). After the forward `req` is not this
+/// function's any more and is not touched. A close or a cancel that comes
+/// between parking and linking leaves `close_requested` or `open_held` on
+/// the slot, which are checked under the lock in the same hold in which the
+/// BRB is linked; after that the usual `cancel_wanted` / `sent` protocol of
+/// [`submit_locked`] applies to `oreq`.
+///
+/// `oreq` is a child of the device. If it is still in bthport when the
+/// device is deleted, the default I/O target waits for it while the device
+/// is disposed (`FxIoTarget::Dispose` -> `Remove` ->
+/// `WaitForSentIoToComplete`, an untimed wait without the verifier break),
+/// before `evt_device_cleanup`; the same holds for an abandoned CLOSE
+/// (crash review F9). That wait is bounded by bthport's timers.
 unsafe fn ioctl_open(dev: *mut DeviceContext, req: WDFREQUEST, rc: *mut RequestContext, input: RawInput) {
     unsafe {
         let Ok(o) = with_input(input, ioc::OpenChannelRequest::decode) else {
@@ -1466,9 +1879,25 @@ unsafe fn ioctl_open(dev: *mut DeviceContext, req: WDFREQUEST, rc: *mut RequestC
         }
         let file = call_unsafe_wdf_function_binding!(WdfRequestGetFileObject, req);
 
+        // The request that carries the BRB, with a (zeroed) RequestContext
+        // of its own.
+        let mut oattr = attributes();
+        oattr.ContextTypeInfo = &raw const REQUEST_CTX_INFO.0;
+        oattr.ParentObject = (*dev).device.cast();
+        let mut oreq: WDFREQUEST = null_mut();
+        let status = call_unsafe_wdf_function_binding!(WdfRequestCreate, &raw mut oattr, (*dev).target, &raw mut oreq);
+        if !nt_success(status) {
+            trace!("open: WdfRequestCreate failed {:#x}", status);
+            return complete(req, status, 0);
+        }
+        let orc = request_ctx(oreq.cast());
+        (*orc).request = oreq;
+        (*orc).kind = ReqKind::Open;
+
         lock(dev);
         let Some(i) = (0..ioc::MAX_CHANNELS).find(|&i| (*dev).channels[i].state == ChanState::Free) else {
             unlock(dev);
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, oreq.cast());
             return complete(req, STATUS_INSUFFICIENT_RESOURCES, 0);
         };
         let c = addr_of_mut!((*dev).channels[i]);
@@ -1481,11 +1910,13 @@ unsafe fn ioctl_open(dev: *mut DeviceContext, req: WDFREQUEST, rc: *mut RequestC
         (*c).remote_disconnected = false;
         (*c).release_when_done = false;
         KeClearEvent(addr_of_mut!((*c).done));
+        // For the park queue's cancel callback.
+        (*rc).chan = c;
+        (*rc).open_gen = (*c).generation;
 
-        (*rc).kind = ReqKind::Open;
         let init = (*dev).profile.BthInitializeBrb.unwrap_unchecked();
-        init(addr_of_mut!((*rc).brb).cast(), _BRB_TYPE::BRB_L2CA_OPEN_CHANNEL);
-        let b = &mut *addr_of_mut!((*rc).brb).cast::<_BRB_L2CA_OPEN_CHANNEL>();
+        init(addr_of_mut!((*orc).brb).cast(), _BRB_TYPE::BRB_L2CA_OPEN_CHANNEL);
+        let b = &mut *addr_of_mut!((*orc).brb).cast::<_BRB_L2CA_OPEN_CHANNEL>();
         b.BtAddress = (*dev).remote_addr;
         *b.__bindgen_anon_1.Psm.as_mut() = o.psm;
         b.ChannelFlags = CF_ROLE_EITHER;
@@ -1513,22 +1944,110 @@ unsafe fn ioctl_open(dev: *mut DeviceContext, req: WDFREQUEST, rc: *mut RequestC
         b.ConfigIn.Mtu.Max = out_max;
         b.CallbackFlags = CALLBACK_DISCONNECT;
         b.Callback = Some(indication_cb);
-        b.CallbackContext = c.cast();
+        // The slot of the callback block, not the channel: see CbBlock.
+        b.CallbackContext = addr_of_mut!((*(*dev).cb).slots[i]).cast();
         b.ReferenceObject = call_unsafe_wdf_function_binding!(WdfDeviceWdmGetDeviceObject, (*dev).device).cast();
         b.IncomingQueueDepth = INCOMING_QUEUE_DEPTH;
-        trace!("ch{} open psm={:#06x} in_mtu={} out_max={} flags={:#x}", i, o.psm, in_mtu, out_max, b.ChannelFlags);
+        let flags = b.ChannelFlags;
+        unlock(dev);
+        trace!("ch{} open psm={:#06x} in_mtu={} out_max={} flags={:#x}", i, o.psm, in_mtu, out_max, flags);
 
-        submit_locked(dev, c, req, rc, size_of::<_BRB_L2CA_OPEN_CHANNEL>(), Some(open_complete));
+        // Park the caller. Not under the lock: the forward can run the
+        // cancel callback inline, and that takes the lock.
+        let status = call_unsafe_wdf_function_binding!(WdfRequestForwardToIoQueue, req, (*c).open_queue);
+        if !nt_success(status) {
+            // Still ours, and nothing was sent.
+            trace!("ch{} open: could not park the request {:#x}", i, status);
+            let _ = open_failed(c);
+            call_unsafe_wdf_function_binding!(WdfObjectDelete, oreq.cast());
+            return complete(req, status, 0);
+        }
+        // `req` and `rc` belong to the queue (or to whoever took the request
+        // out of it) from here on.
+
+        lock(dev);
+        // The slot is still this OPEN's: it leaves `Opening` only through
+        // open_complete or open_abort, and neither has run.
+        if !open_park::send_after_park((*c).close_requested, !(*c).open_held.is_null()) {
+            unlock(dev);
+            trace!("ch{} open given up before it was sent (cancelled or closed)", i);
+            return open_abort(c, oreq, STATUS_CANCELLED);
+        }
+        submit_locked(dev, c, oreq, orc, size_of::<_BRB_L2CA_OPEN_CHANNEL>(), Some(open_complete));
     }
 }
 
+/// `EvtIoCanceledOnQueue` of a slot's `open_queue`: the caller's OPEN
+/// request `req` was cancelled while parked, and is the driver's again
+/// (the framework counts it as owned by the driver until it is completed:
+/// `FxIoQueue::CancelForQueue` -> `InsertInDriverOwnedList`).
+/// IRQL <= DISPATCH.
+///
+/// Decided under the lock (`open_park::on_cancel`):
+/// * The OPEN the request waited for is still in flight and no close was
+///   asked for: keep the request in `open_held` and cancel only the BRB
+///   (bthport honours that unless it is already working on the OPEN). The
+///   request then gets the OPEN's own result from [`open_complete`]
+///   (bthport's late success included) or [`open_abort`], or
+///   STATUS_CANCELLED from [`begin_close`] if a close comes first. This is
+///   what a cancel did when the caller's request carried the BRB, and what
+///   crossc-core relies on: it cancels an OPEN on its timeout and waits for
+///   the result, and so can never have a retry OPEN in bthport next to the
+///   old one.
+/// * Otherwise (the OPEN has ended, or a close was asked for, or the slot
+///   was freed or reused since): complete the request now with
+///   STATUS_CANCELLED; [`begin_close`] carries on with any close of the
+///   incarnation the request waited for (a no-op if the generation does not
+///   match).
+unsafe extern "C" fn evt_open_canceled(_q: WDFQUEUE, req: WDFREQUEST) {
+    unsafe {
+        let rc = request_ctx(req.cast());
+        let c = (*rc).chan;
+        let generation = (*rc).open_gen;
+        let dev = (*c).dev;
+        let index = (*c).index;
+        let mut victims: [WDFREQUEST; MAX_PENDING_PER_CHANNEL as usize] = [null_mut(); MAX_PENDING_PER_CHANNEL as usize];
+        let mut n = 0usize;
+        lock(dev);
+        // `open_held` is always null here (one OPEN, so one request, per
+        // incarnation); checked anyway so that a request can never be lost.
+        let in_flight = (*c).generation == generation && (*c).state == ChanState::Opening && (*c).open_held.is_null();
+        let action = open_park::on_cancel(in_flight, (*c).close_requested);
+        if action == open_park::OnCancel::Hold {
+            (*c).open_held = req;
+            // The OPEN's BRB request, if it is linked: cancelled below if it
+            // was sent, otherwise `cancel_wanted` for submit_locked. Not yet
+            // linked: ioctl_open sees `open_held` and gives the OPEN up.
+            n = collect_cancels_locked(c, &mut victims);
+        }
+        unlock(dev);
+        match action {
+            open_park::OnCancel::Hold => {
+                // `req` and `rc` are not touched any more: the cancel of the
+                // BRB can complete it inline (open_complete), and so can a
+                // close from another thread.
+                trace!("ch{} open request cancelled while parked: kept for the OPEN's result, BRB cancel asked", index);
+                cancel_referenced(&victims[..n]);
+            }
+            open_park::OnCancel::CompleteNow => {
+                let live = begin_close(c, false, generation, true);
+                trace!("ch{} open request cancelled while parked: completed now (slot still its own: {})", index, live);
+                complete(req, STATUS_CANCELLED, 0);
+            }
+        }
+    }
+}
+
+/// Completion routine of the driver's OPEN request `req` (IRQL <=
+/// DISPATCH). It can run in any power state and long after the caller has
+/// gone; it runs before the device is deleted (see [`ioctl_open`]).
 unsafe extern "C" fn open_complete(req: WDFREQUEST, _t: WDFIOTARGET, p: PWDF_REQUEST_COMPLETION_PARAMS, ctx: WDFCONTEXT) {
     unsafe {
         let c = ctx.cast::<Channel>();
         let dev = (*c).dev;
         let rc = request_ctx(req.cast());
         let b = &*addr_of_mut!((*rc).brb).cast::<_BRB_L2CA_OPEN_CHANNEL>();
-        let mut status = (*p).IoStatus.__bindgen_anon_1.Status;
+        let status = (*p).IoStatus.__bindgen_anon_1.Status;
         // InResults = outcome of the peer's configuration request (what we
         // may send); OutResults = outcome of ours (what we receive).
         trace!(
@@ -1542,49 +2061,77 @@ unsafe extern "C" fn open_complete(req: WDFREQUEST, _t: WDFIOTARGET, p: PWDF_REQ
             b.OutResults.Params.Mtu
         );
 
+        // The parked caller, if it has not been cancelled. Taken out first:
+        // from here on this routine owns it and the cancel callback cannot
+        // get it, and the slot (still Opening) cannot have another one.
+        let parked = audio::retrieve((*c).open_queue);
+
         let mut reply = None;
-        let mut close_now = false;
         let generation = (*c).generation;
-        let mut signal = false;
         lock(dev);
+        // Or the caller that was cancelled and kept for this result. Taken
+        // in the same lock hold that moves the slot out of Opening: a cancel
+        // callback that comes after this sees that and completes its
+        // request itself.
+        let held = core::ptr::replace(addr_of_mut!((*c).open_held), null_mut());
+        let waiter = if parked.is_some() { parked } else if held.is_null() { None } else { Some(held) };
         if (*rc).on_list {
             list_remove(addr_of_mut!((*rc).link));
             (*rc).on_list = false;
             (*c).pending_count -= 1;
         }
         (*rc).sent = false;
-        if nt_success(status) {
-            (*c).handle = b.ChannelHandle;
-            (*c).out_mtu = b.InResults.Params.Mtu;
-            (*c).in_mtu = b.OutResults.Params.Mtu;
-            (*c).state = ChanState::Open;
-            if (*c).close_requested || (*c).remote_disconnected {
-                // Owner went away / close or disconnect raced with the open.
-                close_now = true;
-                status = STATUS_CANCELLED;
-            } else {
-                reply = Some(ioc::OpenChannelReply { channel_id: chan_id(c), out_mtu: (*c).out_mtu, in_mtu: (*c).in_mtu });
+        let outcome = open_park::outcome(open_park::OpenDone {
+            success: nt_success(status),
+            have_waiter: waiter.is_some(),
+            close_requested: (*c).close_requested,
+            remote_disconnected: (*c).remote_disconnected,
+        });
+        match outcome {
+            open_park::Outcome::Reply | open_park::Outcome::CloseLate => {
+                (*c).handle = b.ChannelHandle;
+                (*c).out_mtu = b.InResults.Params.Mtu;
+                (*c).in_mtu = b.OutResults.Params.Mtu;
+                (*c).state = ChanState::Open;
+                if outcome == open_park::Outcome::Reply {
+                    reply = Some(ioc::OpenChannelReply { channel_id: chan_id(c), out_mtu: (*c).out_mtu, in_mtu: (*c).in_mtu });
+                }
             }
-        } else {
-            release_slot_locked(c);
-            signal = true;
+            open_park::Outcome::Free => {
+                // A failed OPEN frees the slot without a CLOSE. That rests on
+                // bthport (bthport.sys 10.0.26100, crash review F2): it fails an
+                // OPEN from inside the deletion of the connection, or before
+                // the connection exists, and a connection that never was open
+                // gets no disconnect indication.
+                release_slot_locked(c);
+            }
         }
         unlock(dev);
-        if signal {
-            KeSetEvent(addr_of_mut!((*c).done), 0, 0);
+        // `b` and `rc` are the BRB request's context: not used below.
+        call_unsafe_wdf_function_binding!(WdfObjectDelete, req.cast());
+        match outcome {
+            open_park::Outcome::Free => {
+                KeSetEvent(addr_of_mut!((*c).done), 0, 0);
+            }
+            open_park::Outcome::CloseLate => {
+                // The owner went away, a close or disconnect raced with the
+                // open, or the caller's cancel callback had not got the lock
+                // yet (see `open_park.rs`). No reply carried the id
+                // to anyone, so nobody could ever release a Zombie: free the
+                // slot when the close finishes.
+                let _ = begin_close(c, false, generation, true);
+            }
+            open_park::Outcome::Reply => {}
         }
-        if close_now {
-            // No reply carried the id to anyone, so nobody could ever release
-            // a Zombie: free the slot when the close finishes.
-            let _ = begin_close(c, false, generation, true);
-        }
+        let Some(w) = waiter else { return };
         match reply {
             Some(r) => {
+                let wrc = request_ctx(w.cast());
                 let e = r.encode();
-                core::ptr::copy_nonoverlapping(e.as_ptr(), (*rc).out_buf, e.len());
-                complete(req, STATUS_SUCCESS, e.len());
+                core::ptr::copy_nonoverlapping(e.as_ptr(), (*wrc).out_buf, e.len());
+                complete(w, STATUS_SUCCESS, e.len());
             }
-            None => complete(req, status, 0),
+            None => complete(w, open_park::waiter_status(outcome, status), 0),
         }
     }
 }
@@ -1658,6 +2205,13 @@ unsafe fn ioctl_transfer(dev: *mut DeviceContext, req: WDFREQUEST, rc: *mut Requ
         init(addr_of_mut!((*rc).brb).cast(), _BRB_TYPE::BRB_L2CA_ACL_TRANSFER);
         let b = &mut *addr_of_mut!((*rc).brb).cast::<_BRB_L2CA_ACL_TRANSFER>();
         b.BtAddress = (*dev).remote_addr;
+        // The handle is copied under the lock, but the BRB is sent after the
+        // lock is dropped (submit_locked), so it can reach bthport after a
+        // CLOSE for the same handle. Harmless only because bthport looks the
+        // handle up in its connection list before using it and fails the
+        // BRB with STATUS_DEVICE_NOT_CONNECTED if it is gone (bthport.sys
+        // 10.0.26100, crash review F4). Never dereference a channel handle
+        // on this side.
         b.ChannelHandle = (*c).handle;
         b.BufferMDL = null_mut();
         if kind == ReqKind::Read {

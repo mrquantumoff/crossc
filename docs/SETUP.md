@@ -1156,3 +1156,93 @@ written from the text alone would not expect them:
   (`pnputil /restart-device`) or pairing the buds again sets them back to 0.
 * **"Busy"** is `STATUS_DEVICE_BUSY`, which user mode sees as
   `ERROR_BUSY` (170).
+
+---
+
+## 13. Changes after the crash review
+
+A review of the whole driver for crash paths confirmed three findings. All
+three are fixed in this build; none of them was seen on hardware. Host
+tests: `cd drivers\crossc-bth\host-tests; cargo test`.
+
+**What changed**
+
+* **Sleep or removal with an OPEN in flight (F1).** When the device leaves
+  D0 or is removed, WDF waits until every request of the device's I/O queue
+  that the driver still owns is completed. bthport does not cancel an
+  `OPEN_CHANNEL` it is working on, so that wait could last until bthport's
+  own L2CAP timers ran out (15 s per step, 60 s after "connect pending"),
+  and under Driver Verifier a wait of more than 60 s breaks into the
+  debugger. The caller's `OPEN_CHANNEL` request now waits in a small queue
+  of its own that does not take part in power changes, and the BRB goes to
+  bthport on a request the driver creates for it. Leaving D0 or removal
+  therefore no longer waits for an OPEN; the close of the slot still waits
+  up to 8 s and then gives the slot up (`close ABANDONED ... state=Opening`),
+  and the caller gets `STATUS_CANCELLED` when bthport ends the OPEN (a
+  channel that still opens is closed again). What the caller sees otherwise
+  is unchanged: a cancelled OPEN (crossc-core cancels after its timeout and
+  then waits for the result) still returns whatever bthport makes of it,
+  a late success included, so no retry OPEN can overlap the old one. READ
+  and WRITE are cancelled as before.
+* **Disconnect callback after the device is gone (F2).** bthport may call the
+  driver's disconnect callback for as long as it has a channel. The memory
+  the callback works on is now a small block of its own that lives until the
+  device and bthport have both let go of it, and the callback can no longer
+  reach a deleted device. A `CLOSE_CHANNEL` that could not be handed to
+  bthport is no longer treated as a finished close: the slot stays reserved,
+  the close is tried again by the next close attempt, and when bthport
+  reports the disconnect it is told to close the channel itself
+  (`CloseNow`). The close request is formatted once at device start, so the
+  close path no longer allocates.
+* **Audio buffer size and stream count (F7).** The size of the audio
+  packets is chosen by the client. It is now limited to between 1 ms and 5 s
+  of audio in the stream's format (192 to 960000 bytes at 48 kHz/16-bit,
+  768 to 3840000 bytes at 96 kHz), and at most 4 streams can exist on the
+  endpoint at once. Before, one unprivileged process could take 2 GiB of
+  nonpaged memory per stream, with no limit on streams. The audio engine's
+  10 ms packets (1920 / 3840 / 7680 bytes) and every exclusive-mode buffer
+  WASAPI accepts (up to 5 s event driven, 2 s timer driven) are inside the
+  window.
+
+**What to watch in the live test (section 12)**
+
+* **Node start.** The device must start as before. New at start are one
+  small allocation and one extra call per channel slot; a failure shows as
+  `no memory for the indication callback block` (the node does not start) or
+  `close request could not be pre-formatted` (it starts anyway).
+* **Stream start, step 4 and 5 of 12c.** The line
+  `acx: N RT packet(s) of M bytes` must appear and sound must play. A line
+  `AllocateRtPackets(..) rejected: ...` or
+  `stream refused: 4 streams exist already` while Windows itself is the only
+  client means the limits are too tight: send the line, it carries the sizes.
+  The `stream created` line now ends in `K of 4 streams`. K is normally 1
+  and must not grow from one `stream created` line to the next over repeated
+  play/stop or format changes.
+* **Closing and disconnecting.** Every `ch{n} closing` is still followed by
+  `close BRB done`. Lines that should never appear in normal use:
+  `CLOSE NOT SENT`, `close ABANDONED`, and a `remote disconnect` line with
+  `ours=false` or `close_now=true`. Turning the buds off while connected
+  must still give `remote disconnect ... ours=true close_now=false`.
+* **Opening channels (probe, play, service connect).** This path changed
+  inside the driver; it must behave exactly as before. Each `ch{n} open`
+  line is followed by `open done 0x0 ...` and the tool works as before.
+  The line `open request cancelled while parked: kept for the OPEN's
+  result` appears only when a tool timed out on an OPEN; it must be
+  followed by `open done` and the tool must report what that line says.
+* **Sleep and resume, step 10 of 12c.** Expected as before. If the PC is put
+  to sleep in the moment a channel is being opened, the new line is
+  `close ABANDONED ... state=Opening`, at most 8 s after D0Exit; D0Exit
+  takes up to those 8 s. After resume the channel must be free again once
+  `open done` appears.
+* **Removal** (`pnputil /remove-device`, unpairing, Bluetooth off) with a
+  channel open: `device cleanup` must appear. The line
+  `bthport still holds N channel registration(s)` means the device went away
+  before bthport dropped a channel; it must be followed, when the buds
+  disconnect, by `left to bthport (CloseNow)` and `callback block freed`.
+  If it is not, send the log.
+* **Driver Verifier (12a).** An OPEN in flight no longer holds up the I/O
+  queue, so the Verifier break after 60 s of waiting there should not
+  happen. Removal of the node while an OPEN is in flight still waits, when
+  the device object is deleted, until bthport ends that OPEN (the same wait
+  as for an abandoned close), which is bounded by bthport's timers and has
+  no Verifier break.

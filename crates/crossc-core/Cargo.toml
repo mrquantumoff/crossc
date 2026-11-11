@@ -1,6 +1,6 @@
 [package]
 name = "crossc-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Device access, AVDTP session, SSC stream setup, packetiser and the audio session state machine shared by crossc-service and crossc-cli"
 publish = false

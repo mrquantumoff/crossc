@@ -62,6 +62,7 @@ use wdk_sys::ntddk::{
 use wdk_sys::*;
 
 use crate::audio_core::ring_bytes;
+use crate::rt_limits::{self, StreamSlots};
 use crate::{CtxInfo, DeviceContext, attributes, audio, nt_success, trace};
 use sys::*;
 
@@ -411,6 +412,29 @@ const _: () = {
     assert!(FORMATS[0].avg_bytes_per_sec == 384_000 && FORMATS[0].block_align == 8);
     assert!(FORMATS[1].avg_bytes_per_sec == 768_000 && FORMATS[1].block_align == 8);
     assert!(FORMATS[2].avg_bytes_per_sec == 192_000 && FORMATS[2].block_align == 4);
+    // RT packet window (rt_limits.rs): for every offered format, the sizes
+    // Windows is expected to ask for are accepted and the abusive ones are
+    // not. In turn: 3 ms and 10 ms packets (two of them, event driven); one
+    // page and 2 s rounded up to pages (one packet, timer driven); 5 s (the
+    // longest exclusive-mode buffer WASAPI accepts); then one frame, and
+    // what the old limit of 1 GiB let through.
+    let mut i = 0;
+    while i < FORMATS.len() {
+        let bps = FORMATS[i].avg_bytes_per_sec;
+        let frame = FORMATS[i].block_align as u32;
+        let max = MAX_PACKETS as u32;
+        assert!(rt_limits::packet_ok(2, max, bps / 1000 * 3, bps));
+        assert!(rt_limits::packet_ok(2, max, bps / 100, bps));
+        assert!(rt_limits::packet_ok(1, max, PAGE_SIZE, bps));
+        assert!(rt_limits::packet_ok(1, max, (bps * 2).div_ceil(PAGE_SIZE) * PAGE_SIZE, bps));
+        assert!(rt_limits::packet_ok(2, max, bps * 5, bps));
+        assert!(!rt_limits::packet_ok(2, max, frame, bps));
+        assert!(!rt_limits::packet_ok(2, max, bps * 5 + frame, bps));
+        assert!(!rt_limits::packet_ok(2, max, 0x4000_0000, bps));
+        assert!(!rt_limits::packet_ok(3, max, bps / 100, bps));
+        assert!(!rt_limits::packet_ok(0, max, bps / 100, bps));
+        i += 1;
+    }
     assert!(PAGE_SIZE == 0x1000);
     assert!(POOL_FLAG_NON_PAGED == 0x40);
     assert!(PLUGPLAY_REGKEY_DEVICE == 1);
@@ -461,6 +485,10 @@ struct AcxDeviceCtx {
     jack: AtomicUsize,
     /// Runs [`evt_jack_work`] at PASSIVE. Created once in [`device_created`].
     jack_work: WDFWORKITEM,
+    /// Streams that exist on this device (at most
+    /// [`rt_limits::MAX_STREAMS`]). All zero, as WDF hands the context out,
+    /// is the empty count.
+    streams: StreamSlots,
 }
 acx_context_type!(ACX_DEVICE_CTX_INFO, AcxDeviceCtx, c"CrossCAcxDeviceContext", acx_device_ctx);
 
@@ -480,6 +508,11 @@ struct StreamCtx {
     timer: WDFTIMER,
     /// The pipe's device context (owner of the PCM tap). Set at creation.
     dev: *mut DeviceContext,
+    /// The device's stream count while this stream holds one of its slots,
+    /// else null. Given back in [`evt_stream_cleanup`]. The count is in a
+    /// context of the WDFDEVICE, an ancestor of the stream, so it is still
+    /// there when the stream's cleanup callback runs.
+    slots: *const StreamSlots,
     /// This stream's format is one the audio contract can describe and it
     /// was registered with the tap ([`audio::stream_created`]).
     tap: bool,
@@ -1016,6 +1049,23 @@ unsafe extern "C" fn evt_circuit_create_stream(
     _var_arguments: ACXOBJECTBAG,
 ) -> NTSTATUS {
     unsafe {
+        // One more stream? The KS path is open to interactive users and
+        // every stream holds nonpaged RT packets, so the number is bounded
+        // (rt_limits.rs). The slot is taken before anything is created and
+        // is given back on every failure below, or by evt_stream_cleanup.
+        let adev = acx_device_ctx(device.cast());
+        let slots: *const StreamSlots = if adev.is_null() { core::ptr::null() } else { &raw const (*adev).streams };
+        if !slots.is_null() && !(*slots).try_acquire(rt_limits::MAX_STREAMS) {
+            trace!("acx: stream refused: {} streams exist already", rt_limits::MAX_STREAMS);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        let give_back = |status: NTSTATUS| {
+            if !slots.is_null() {
+                (*slots).release();
+            }
+            status
+        };
+
         // ACX_STREAM_CALLBACKS_INIT
         let mut callbacks = ACX_STREAM_CALLBACKS {
             Size: size_of::<ACX_STREAM_CALLBACKS>() as ULONG,
@@ -1033,7 +1083,7 @@ unsafe extern "C" fn evt_circuit_create_stream(
         );
         if !nt_success(status) {
             trace!("acx: AcxStreamInitAssignAcxStreamCallbacks failed {:#x}", status);
-            return status;
+            return give_back(status);
         }
         // ACX_RT_STREAM_CALLBACKS_INIT
         let mut rt = ACX_RT_STREAM_CALLBACKS {
@@ -1054,7 +1104,7 @@ unsafe extern "C" fn evt_circuit_create_stream(
         );
         if !nt_success(status) {
             trace!("acx: AcxStreamInitAssignAcxRtStreamCallbacks failed {:#x}", status);
-            return status;
+            return give_back(status);
         }
         acx!(
             AcxStreamInitSetAcxRtStreamSupportsNotificationsTableIndex,
@@ -1078,11 +1128,15 @@ unsafe extern "C" fn evt_circuit_create_stream(
         );
         if !nt_success(status) {
             trace!("acx: AcxRtStreamCreate failed {:#x}", status);
-            return status;
+            return give_back(status);
         }
 
         let s = stream_ctx(stream.cast());
         (*s).stream = stream;
+        // From here on the stream object owns the slot. Nothing below
+        // fails; if a failure is ever added, the stream's cleanup callback
+        // gives the slot back, not `give_back`.
+        (*s).slots = slots;
         let mut freq: LARGE_INTEGER = zeroed();
         KeQueryPerformanceCounter(&raw mut freq);
         (*s).qpc_freq = (freq.QuadPart as u64).max(1);
@@ -1109,13 +1163,15 @@ unsafe extern "C" fn evt_circuit_create_stream(
             && fmt.frame_bytes() == (*s).block_align as usize
             && audio::stream_created((*s).dev, s as usize, fmt);
         trace!(
-            "acx: stream created: {} Hz, {} ch, {} valid bits in {}-bit containers, block {} bytes, tap {}",
+            "acx: stream created: {} Hz, {} ch, {} valid bits in {}-bit containers, block {} bytes, tap {}, {} of {} streams",
             (*s).sample_rate,
             (*s).channels,
             valid_bits,
             (*s).bits,
             (*s).block_align,
-            (*s).tap
+            (*s).tap,
+            if slots.is_null() { 0 } else { (*slots).in_use() },
+            rt_limits::MAX_STREAMS
         );
         STATUS_SUCCESS
     }
@@ -1129,12 +1185,25 @@ unsafe extern "C" fn evt_stream_cleanup(obj: WDFOBJECT) {
         if !s.is_null() && !(*s).dev.is_null() && (*s).tap {
             audio::stream_destroyed((*s).dev, s as usize);
         }
+        // Give the stream slot back (WDF calls a cleanup callback once).
+        if !s.is_null() && !(*s).slots.is_null() {
+            let slots = (*s).slots;
+            (*s).slots = core::ptr::null();
+            (*slots).release();
+        }
     }
 }
 
 /// Last reference to the ACXSTREAM is gone (IRQL <= DISPATCH); its children,
 /// the timer included, are deleted. Normally ReleaseHardware has freed the
 /// ring already; this covers a stream that is torn down without it.
+///
+/// `free_ring` takes the device's audio spinlock through `(*s).dev`, at a
+/// time WDF does not pin down. That is safe only because (crash review F8)
+/// the ring is normally gone already, so `free_ring` returns before it
+/// touches the device, and because a stream is a descendant of the device
+/// and is destroyed before the device context is. Do not hold a reference
+/// on an ACXSTREAM past the life of its device.
 unsafe extern "C" fn evt_stream_destroy(obj: WDFOBJECT) {
     unsafe {
         let s = stream_ctx(obj);
@@ -1202,9 +1271,32 @@ unsafe extern "C" fn evt_stream_allocate_rt_packets(
 ) -> NTSTATUS {
     unsafe {
         let s = stream_ctx(stream.cast());
-        if packet_count == 0 || packet_count as usize > MAX_PACKETS || packet_size == 0 || packet_size > 0x4000_0000 {
-            trace!("acx: AllocateRtPackets({}, {}) rejected", packet_count, packet_size);
+        // Count and size come from the KS client; ACX passes them on with
+        // only the count, a non-zero size and the block alignment checked.
+        // The size has to hold between 1 ms and 5 s of this stream's audio
+        // (rt_limits.rs).
+        if !rt_limits::packet_ok(packet_count, MAX_PACKETS as u32, packet_size, (*s).bytes_per_sec) {
+            let (min, max) = rt_limits::packet_bounds((*s).bytes_per_sec);
+            trace!(
+                "acx: AllocateRtPackets({}, {}) rejected: 1..={} packets of {}..={} bytes at {} bytes/s",
+                packet_count,
+                packet_size,
+                MAX_PACKETS,
+                min,
+                max,
+                (*s).bytes_per_sec
+            );
             return STATUS_INVALID_PARAMETER;
+        }
+        // This callback writes the plain fields the timer DPC reads, with no
+        // fence of its own. That is safe only through two things together
+        // (crash review F6): evt_stream_run, the one place that arms the
+        // timer, refuses to start without packets, and ACX (Acx01000.sys
+        // 10.0.26100) refuses a second allocation without a free in between
+        // (STATUS_ALREADY_INITIALIZED). So this runs only while there are
+        // no packets, hence with the timer idle. Only reported here.
+        if (*s).running.load(Ordering::SeqCst) || !(*s).packets[0].is_null() {
+            trace!("acx: AllocateRtPackets while packets exist or the stream runs (unexpected; ACX is expected to refuse it)");
         }
         let page = PAGE_SIZE as usize;
         let alloc_size = (packet_size as usize).div_ceil(page) * page;
@@ -1283,6 +1375,12 @@ unsafe extern "C" fn evt_stream_free_rt_packets(stream: ACXSTREAM, packets: PACX
         // documents that this ordering is not guaranteed. Stop the timer and
         // wait out a running pass before the buffers it reads go away (no-op
         // when the timer is deleted or idle; this callback is PASSIVE).
+        // `(*s).timer` is only cleared by ReleaseHardware. If the stream is
+        // deleted without it, the handle here is still good only because
+        // ACX calls this callback from inside the stream's own cleanup pass
+        // (crash review F5, Acx01000.sys 10.0.26100), where WDF has
+        // disposed the child timer but not yet destroyed it. Do not call
+        // this from anywhere else.
         stop_timer(s);
         (*s).packets = [null_mut(); MAX_PACKETS];
         (*s).packet_count = 0;

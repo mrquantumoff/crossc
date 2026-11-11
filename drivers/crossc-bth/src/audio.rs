@@ -186,7 +186,7 @@ unsafe fn queue_of(a: *mut AudioDev, kind: Parked) -> WDFQUEUE {
 }
 
 /// Take the request at the head of `queue`, if any. The driver owns it then.
-unsafe fn retrieve(queue: WDFQUEUE) -> Option<WDFREQUEST> {
+pub unsafe fn retrieve(queue: WDFQUEUE) -> Option<WDFREQUEST> {
     unsafe {
         if queue.is_null() {
             return None;
@@ -201,7 +201,7 @@ unsafe fn retrieve(queue: WDFQUEUE) -> Option<WDFREQUEST> {
 // Setup
 // ---------------------------------------------------------------------------
 
-unsafe fn create_manual_queue(
+pub unsafe fn create_manual_queue(
     device: WDFDEVICE,
     level: WDF_EXECUTION_LEVEL,
     canceled: PFN_WDF_IO_QUEUE_IO_CANCELED_ON_QUEUE,
