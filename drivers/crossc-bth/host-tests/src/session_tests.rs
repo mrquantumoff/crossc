@@ -767,7 +767,7 @@ fn with_nothing_running_the_tap_moves_to_the_stream_left_when_its_own_goes_away(
 
 /// The review's sequence: A runs and holds the tap, B is created ("not
 /// now") and offers its ring, A pauses and goes away. B gets the tap at
-/// once, with the ring it offered, as a new stream would have in 1.0.0.
+/// once, with the ring it offered, as a new stream would have in 0.2.0.
 #[test]
 fn a_paused_stream_left_alone_gets_the_tap_with_the_ring_it_offered() {
     let (mut s, _st1) = setup(F16, 100);

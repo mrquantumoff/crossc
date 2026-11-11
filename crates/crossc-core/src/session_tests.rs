@@ -3360,7 +3360,7 @@ fn an_engine_that_keeps_the_old_format_is_reported_once() {
     assert_eq!(warned[0].0, 7000, "{warned:?}");
     assert!(
         warned[0].1.contains(
-            "48000 Hz/24 although the driver default is now 96000 Hz/24: the change applies when playback restarts"
+            "48000 Hz/24 although the driver default is now 96000 Hz/24: UHQ through the Windows device is a known issue"
         ),
         "{warned:?}"
     );

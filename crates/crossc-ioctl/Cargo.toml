@@ -1,6 +1,6 @@
 [package]
 name = "crossc-ioctl"
-version = "1.0.0"
+version = "0.3.0"
 edition = "2024"
 description = "IOCTL contract between the crossc-bth driver and user mode (no_std, shared)"
 publish = false

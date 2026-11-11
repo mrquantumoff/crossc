@@ -18,13 +18,13 @@ an open encoder.
 
 | | |
 |---|---|
-| Galaxy Buds4 Pro, Buds3 Pro | Tested: HiFi 24/48 and UHQ 24/96 play correctly |
+| Galaxy Buds4 Pro, Buds3 Pro | Tested: HiFi 24/48 plays correctly. UHQ 24/96 works from `crossc-cli play` but not yet through the Windows playback device (see [Known issues](#known-issues)) |
 | Other Galaxy Buds | Listed by product ID, untested: see [docs/MODELS.md](docs/MODELS.md) |
 | Windows | Windows 11 x64 (developed on build 26340). Not tested on Windows 10 or ARM64 |
 | Bluetooth radio | Developed on a MediaTek RZ616 (MT7922) with the inbox Microsoft stack |
 
-What works: the buds show up as *Headphones (your buds' name)*; pick 48 kHz or
-96 kHz, 24-bit, in the device's sound settings and any app plays through them.
+What works: the buds show up as *Headphones (your buds' name)* and any app
+plays through them in HiFi (48 kHz, 24-bit).
 The device shows as unplugged while the buds are away.
 
 The Windows volume slider and the buds' own volume are one control (AVRCP
@@ -41,9 +41,18 @@ from the 0.2.0 installer's own **Download and install** does not install the
 tray: that installer does not know it. Run the new `crossc-installer.exe`
 once and press **Install**.)
 
-The adaptive bitrate and the tray icon are new. Both pass their tests against
-a simulated driver; their live tests with real buds
-([docs/SETUP.md](docs/SETUP.md) sections 15 and 16f) have not been run yet.
+The tray icon has been checked with real buds. The adaptive bitrate's live test
+under a congested link ([docs/SETUP.md](docs/SETUP.md) section 15) has not been
+run yet.
+
+## Known issues
+
+* **UHQ (96 kHz) is not used by the Windows playback device.** Choosing
+  *24 bit, 96000 Hz* in sound settings is saved, and the driver takes it as its
+  default format, but Windows keeps rendering at 48 kHz, so the buds get HiFi.
+  Restarting the device did not change it either. Under investigation; see
+  [docs/SETUP.md](docs/SETUP.md) section 17. UHQ itself works: `crossc-cli play`
+  streams 96 kHz to the buds directly.
 
 What does not exist yet: SBC/AAC fallback through this driver, production code
 signing.

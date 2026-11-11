@@ -1,6 +1,6 @@
 [package]
 name = "crossc-installer"
-version = "1.0.0"
+version = "0.3.0"
 edition = "2024"
 description = "GPUI desktop tool that installs and uninstalls the crossc_bth driver and the crossc service for Galaxy Buds (and builds them in the repo)"
 publish = false

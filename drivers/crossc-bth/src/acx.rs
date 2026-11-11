@@ -433,7 +433,7 @@ const fn pcm_stereo(rate: u32, container_bits: u16, valid_bits: u16) -> KsWaveFo
 
 /// Give the host pin a DEFAULT signal processing mode list next to its RAW
 /// one (same [`FORMATS`], same default). Off: the pin offers RAW only,
-/// exactly as 1.0.0 did, the only layout run on a device so far.
+/// exactly as 0.2.0 did, the only layout run on a device so far.
 ///
 /// Why it exists: the hypothesis that the audio engine's DEFAULT-mode
 /// streams would then be described by the pin itself, and that this could
@@ -1887,7 +1887,7 @@ unsafe fn create_render_circuit(
         };
         formats.objs[0] = add_formats(device, circuit, list, default).map_err(|s| (s, circuit))?;
         if DEFAULT_MODE_LIST {
-            // Without the DEFAULT list the pin is exactly what 1.0.0 offered
+            // Without the DEFAULT list the pin is exactly what 0.2.0 offered
             // (RAW only), which plays; so a failure here is traced, not
             // fatal. A half-filled list was never assigned and goes away
             // with the circuit, its parent.

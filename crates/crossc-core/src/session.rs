@@ -667,7 +667,7 @@ impl<D: Driver, P: LinkProbe, K: Clock> Session<D, P, K> {
             && let Some(t) = self.fsync.applying()
         {
             self.warn(&format!(
-                "Windows still renders at {} although the driver default is now {}: the change applies when playback restarts (pause and resume playback)",
+                "Windows still renders at {} although the driver default is now {}: UHQ through the Windows device is a known issue in this release (see the README)",
                 short(self.audio.format),
                 short(t)
             ));

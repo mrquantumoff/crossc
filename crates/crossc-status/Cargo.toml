@@ -1,6 +1,6 @@
 [package]
 name = "crossc-status"
-version = "1.0.0"
+version = "0.3.0"
 edition = "2024"
 description = "Status protocol between crossc-service and its user interfaces: the snapshot, its wire format and the named pipe that carries it"
 publish = false

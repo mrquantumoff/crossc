@@ -65,7 +65,7 @@ Rules the driver keeps regardless of the service:
   dropped (counted, flagged as a discontinuity) and the stream keeps its pace.
 * The endpoint's host pin offers its formats (48 kHz/24-in-32,
   96 kHz/24-in-32, 48 kHz/16; `OFFERED_FORMATS` in `crossc-ioctl`) in the
-  RAW signal processing mode list only, as 1.0.0 did. Which one is the
+  RAW signal processing mode list only, as 0.2.0 did. Which one is the
   list's default is chosen per device ("Format selection" below); 48 kHz/24
   until something else is chosen. The driver can also give the pin a
   DEFAULT list with the same formats and default (`DEFAULT_MODE_LIST` in

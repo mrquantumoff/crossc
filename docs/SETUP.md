@@ -2017,7 +2017,7 @@ Windows reopens it by itself on the change has not been seen yet. The
 service warns when this is the case:
 
 ```
-... WARN  [AABBCCDDEEFF] Windows still renders at 48000 Hz/24 although the driver default is now 96000 Hz/24: the change applies when playback restarts (pause and resume playback)
+... WARN  [AABBCCDDEEFF] Windows still renders at 48000 Hz/24 although the driver default is now 96000 Hz/24: UHQ through the Windows device is a known issue in this release (see the README)
 ```
 
 If even a new stream comes at 48 kHz, wait until Windows closes the stream
@@ -2025,9 +2025,13 @@ If even a new stream comes at 48 kHz, wait until Windows closes the stream
 still does not switch, report it with the service log and the DebugView
 trace.
 
+**Known issue (0.3.0):** on the test machine Windows kept rendering at 48 kHz
+after 96000 Hz was picked, also after the device was restarted, so UHQ is not
+reached through the Windows device yet.
+
 The choice is also stored in the buds' device key (`DefaultSampleRate`,
 `DefaultBits` under `HKLM\SYSTEM\CurrentControlSet\Enum\<instance>\Device
-Parameters`), so the endpoint starts with it after a reboot or a reconnect,
+Parameters`), so the endpoint is meant to start with it after a reboot or a reconnect,
 before the service runs. The service needs no setting for any of this.
 
 ### 17a. Live test (user, service of this build installed)
