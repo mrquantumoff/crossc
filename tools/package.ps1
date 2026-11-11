@@ -7,7 +7,7 @@
 
       cd drivers\crossc-bth; cargo make default --release
       $env:RUSTFLAGS = '-C target-feature=+crt-static'             (see below)
-      cargo build --release -p crossc-cli -p crossc-installer      (and -p crossc-service once that crate exists)
+      cargo build --release -p crossc-cli -p crossc-installer -p crossc-service -p crossc-tray
 
     Output, under -OutDir (default <RepoRoot>\dist):
 
@@ -15,6 +15,7 @@
         crossc-installer.exe
         crossc-cli.exe
         crossc-service.exe             only if crates\crossc-service exists (then it must have been built)
+        crossc-tray.exe                only if crates\crossc-tray exists (then it must have been built)
         driver\                        crossc_bth.sys, crossc_bth.inf, crossc_bth.cat, WDRLocalTestCert.cer
         README.md, LICENSE             if present at the repo root
         TEST-SIGNING.md                what the test signature means for whoever installs this
@@ -293,7 +294,7 @@ pre.license-text { white-space: pre-wrap; background: #8881; padding: 1rem; over
 of the build (dependency graph for x86_64-pc-windows-msvc, without build-only and test-only crates). crossc's own
 license is in <code>LICENSE</code>; the notices for the SSC encoder port are in <code>licenses\ssc-enc</code>.</p>
 <ul>
-<li><a href="#user">User-mode programs</a> (crossc-cli, crossc-installer and, if shipped, crossc-service)</li>
+<li><a href="#user">User-mode programs</a> (crossc-cli, crossc-installer and, if shipped, crossc-service and crossc-tray)</li>
 <li><a href="#driver">Kernel driver</a> (crossc_bth.sys)</li>
 </ul>
 <h1 id="user">User-mode programs</h1>
@@ -384,13 +385,14 @@ foreach ($name in 'crossc_bth.sys', 'crossc_bth.inf', 'crossc_bth.cat', 'WDRLoca
 
 # --- user-mode programs ----------------------------------------------------------------------------------------
 $programs = @('crossc-installer', 'crossc-cli')
-$hasService = Test-Path -LiteralPath (Join-Path $RepoRoot 'crates\crossc-service\Cargo.toml') -PathType Leaf
-if ($hasService) {
-    $programs += 'crossc-service'
-}
-elseif (Test-Path -LiteralPath (Join-Path $binDir 'crossc-service.exe') -PathType Leaf) {
-    # Built from a tree that has the crate even though -RepoRoot does not: ship it rather than drop it silently.
-    $programs += 'crossc-service'
+# The service and the tray app ship when the source tree has their crate (a missing exe is then an error), and
+# also when they were built from a tree that has the crate even though -RepoRoot does not: ship them rather
+# than drop them silently.
+foreach ($optional in 'crossc-service', 'crossc-tray') {
+    $hasCrate = Test-Path -LiteralPath (Join-Path $RepoRoot "crates\$optional\Cargo.toml") -PathType Leaf
+    if ($hasCrate -or (Test-Path -LiteralPath (Join-Path $binDir "$optional.exe") -PathType Leaf)) {
+        $programs += $optional
+    }
 }
 foreach ($program in $programs) {
     Copy-Required (Join-Path $binDir "$program.exe") $bundleDir
