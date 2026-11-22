@@ -10,6 +10,16 @@ codec, which Samsung ships on Galaxy phones only. crossc replaces the Windows
 A2DP driver for the buds with one that carries SSC, and encodes the audio with
 an open encoder.
 
+**Linux:** a PipeWire codec plugin carries the same codec with the same
+encoder; no driver is needed there. Install it with
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mrquantumoff/crossc/master/linux/install.sh | bash
+```
+
+and update it with `crossc-cli update`. See [linux/README.md](linux/README.md).
+The rest of this page is about Windows.
+
 > **Experimental.** This is a test-signed kernel driver. It needs Windows test
 > signing mode with Secure Boot off, and a driver bug means a blue screen. Read
 > [Before you install](#before-you-install) first. No warranty.
@@ -152,6 +162,7 @@ audio device.
 | `crates/crossc-tray` | Tray icon and details window |
 | `crates/crossc-cli` | `probe`, `media`, `play`, `raw` |
 | `crates/crossc-installer` | Installer (GPUI) |
+| `linux/` | Linux: PipeWire A2DP codec plugin in Rust (own cargo workspace), see [linux/README.md](linux/README.md) |
 | `docs/` | Design, setup and test notes, supported models |
 
 ## License and provenance
@@ -171,6 +182,10 @@ crossc is licensed under the [BSD 2-Clause License](LICENSE).
   ([Windows-driver-samples](https://github.com/microsoft/Windows-driver-samples),
   MS-PL) and are built with
   [windows-drivers-rs](https://github.com/microsoft/windows-drivers-rs).
+* `linux/pipewire` holds PipeWire's private Bluetooth codec headers (MIT,
+  © Wim Taymans and contributors; `linux/pipewire/COPYING`).
+  `linux/tests/ssc-decoder` is the samsung-ssc-encoder test decoder
+  (BSD-3-Clause, with Opus notices), used only by the Linux tests.
 * Release bundles include a generated list of third-party dependency licenses.
 
 **Patents.** Samsung describes SSC as patented technology. No patent search

@@ -1,0 +1,19 @@
+[package]
+name = "spa-codec-bluez5-ssc"
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "PipeWire bluez5 A2DP codec plugin for Samsung SSC (Seamless HiFi 48/24, UHQ 96/24)"
+license = "MIT"
+publish = false
+build = "build.rs"
+
+[lib]
+name = "spa_codec_bluez5_ssc"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ssc-enc = { path = "../../crates/ssc-enc" }
+
+[build-dependencies]
+bindgen = "0.72"

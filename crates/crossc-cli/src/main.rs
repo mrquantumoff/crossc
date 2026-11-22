@@ -17,6 +17,10 @@
 //!                                      change is printed
 //!                                      --dry-run: no device, encode as fast as
 //!                                      possible and print the encoder speed
+//! crossc-cli update [--check] [--force] [--version vX.Y.Z]
+//!                                      Linux only: update the PipeWire SSC
+//!                                      plugin and crossc-cli from GitHub
+//!                                      releases (not built on Windows)
 //! global: --device N | --path \\?\...  pick interface (default: first)
 //!         --in-mtu N                   in_mtu requested for probe/media
 //!                                      channels (default 1021; see SETUP 7)
@@ -29,6 +33,8 @@ mod pcm;
 mod play;
 mod probe;
 mod resample;
+#[cfg(target_os = "linux")]
+mod update;
 mod wav;
 
 use std::process::ExitCode;
@@ -65,6 +71,8 @@ enum Cmd {
     Media,
     Raw(Vec<String>),
     Play(Box<play::PlayArgs>),
+    #[cfg(target_os = "linux")]
+    Update(update::UpdateArgs),
     Help,
 }
 
@@ -110,6 +118,8 @@ fn parse_args(args: &[String]) -> Result<(Global, Cmd), String> {
         Some("media") => Cmd::Media,
         Some("raw") => Cmd::Raw(rest[1..].to_vec()),
         Some("play") => Cmd::Play(Box::new(play::parse_play_args(&rest[1..])?)),
+        #[cfg(target_os = "linux")]
+        Some("update") => Cmd::Update(update::parse_update_args(&rest[1..])?),
         Some(o) => return Err(format!("unknown command {o:?}")),
     };
     if matches!(cmd, Cmd::Play(_)) && g.seid.is_some() {
@@ -269,7 +279,19 @@ fn main() -> ExitCode {
     };
     if cmd == Cmd::Help {
         println!("{USAGE}");
+        #[cfg(target_os = "linux")]
+        println!("Linux: crossc-cli {}", update::UPDATE_USAGE);
         return ExitCode::SUCCESS;
+    }
+    #[cfg(target_os = "linux")]
+    if let Cmd::Update(a) = &cmd {
+        return match update::run(a) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
     if let Cmd::Play(a) = &cmd
         && a.dry_run

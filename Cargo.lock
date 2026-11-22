@@ -1230,6 +1230,8 @@ dependencies = [
  "avdtp",
  "crossc-core",
  "crossc-ioctl",
+ "serde_json",
+ "sha2 0.10.9",
  "ssc-enc",
  "windows 0.62.2",
 ]
