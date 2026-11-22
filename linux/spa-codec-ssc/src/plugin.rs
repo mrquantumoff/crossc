@@ -3,7 +3,7 @@
 use core::ffi::{CStr, c_char, c_int, c_void};
 use core::ptr;
 
-use crate::codec::CODEC;
+use crate::codec::{CODEC, CODEC_UHQ};
 use crate::log::TOPIC;
 use crate::slot;
 use crate::sys;
@@ -15,7 +15,7 @@ const ENOENT: c_int = 2;
 pub struct Shared<T>(T);
 unsafe impl<T> Sync for Shared<T> {}
 
-static CODECS: Shared<[*const sys::media_codec; 2]> = Shared([&CODEC.0, ptr::null()]);
+static CODECS: Shared<[*const sys::media_codec; 3]> = Shared([&CODEC.0, &CODEC_UHQ.0, ptr::null()]);
 
 #[repr(C)]
 struct Handle {

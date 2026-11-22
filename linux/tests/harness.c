@@ -175,7 +175,7 @@ int main(int argc, char *argv[])
 	struct spa_handle *handle;
 	void *iface;
 	const struct spa_bluez5_codec_a2dp *a2dp;
-	const struct media_codec *c = NULL;
+	const struct media_codec *c = NULL, *uhq_codec = NULL;
 	char path[512];
 
 	pw_init(&argc, &argv);
@@ -199,7 +199,14 @@ int main(int argc, char *argv[])
 	CHECK(a2dp->iface.version == SPA_VERSION_BLUEZ5_CODEC_MEDIA, "codec ABI version %d",
 			a2dp->iface.version);
 	c = a2dp->codecs[0];
-	CHECK(c && a2dp->codecs[1] == NULL, "exactly one codec");
+	uhq_codec = c ? a2dp->codecs[1] : NULL;
+	CHECK(c && uhq_codec && a2dp->codecs[2] == NULL, "two codecs: ssc and ssc_uhq");
+	if (!uhq_codec)
+		return 1;
+	CHECK(spa_streq(uhq_codec->name, "ssc_uhq") && uhq_codec->fill_caps == NULL &&
+			spa_streq(uhq_codec->endpoint_name, "ssc") && spa_streq(c->endpoint_name, "ssc") &&
+			uhq_codec->id != c->id,
+			"ssc_uhq (%s) shares the ssc endpoint, own id %d", uhq_codec->description, uhq_codec->id);
 	CHECK(spa_streq(c->name, "ssc") && c->kind == MEDIA_CODEC_A2DP && c->codec_id == A2DP_CODEC_VENDOR &&
 			c->vendor.vendor_id == 0x75 && c->vendor.codec_id == 0x0103,
 			"codec %s (%s): vendor 0x%x codec 0x%04x, id %d", c->name, c->description,
@@ -212,13 +219,16 @@ int main(int argc, char *argv[])
 	CHECK(n == 7 && memcmp(caps, SSC_HDR, 6) == 0 && caps[6] == 0x3E, "local caps 75 00 00 00 03 01 %02x", caps[6]);
 
 	CHECK(select_for(c, 0x3E, 48000, NULL) == 0x0C, "48 kHz graph, full sink: HiFi 0x0C");
-	CHECK(select_for(c, 0x3E, 96000, NULL) == 0x0A, "96 kHz graph: UHQ 0x0A");
+	CHECK(select_for(c, 0x3E, 96000, NULL) == 0x0C, "ssc stays HiFi at a 96 kHz graph");
+	CHECK(select_for(uhq_codec, 0x3E, 48000, NULL) == 0x0A, "ssc_uhq: UHQ 0x0A");
+	CHECK(select_for(uhq_codec, 0x3F, 48000, NULL) < 0, "ssc_uhq refused when the sink disables UHQ");
+	CHECK(select_for(uhq_codec, 0x38, 48000, NULL) < 0, "ssc_uhq refused by a sink without UHQ");
 	CHECK(select_for(c, 0x3F, 96000, NULL) == 0x0C, "sink disables UHQ: HiFi");
 	CHECK(select_for(c, 0x28, 48000, NULL) == 0x28, "44.1 kHz SSC sink: 0x28");
 	CHECK(select_for(c, 0x80, 48000, NULL) < 0, "legacy-only sink refused");
-	struct spa_dict_item uhq_items[] = { { "bluez5.a2dp.ssc.mode", "uhq" } };
-	struct spa_dict uhq = SPA_DICT_INIT_ARRAY(uhq_items);
-	CHECK(select_for(c, 0x3E, 48000, &uhq) == 0x0A, "bluez5.a2dp.ssc.mode=uhq");
+	struct spa_dict_item alt_items[] = { { "bluez5.a2dp.ssc.uhq-alt-config", "true" } };
+	struct spa_dict alt = SPA_DICT_INIT_ARRAY(alt_items);
+	CHECK(select_for(uhq_codec, 0x3E, 48000, &alt) == 0x0E, "bluez5.a2dp.ssc.uhq-alt-config: UHQ as 0x0E");
 	uint8_t extra[8] = { 0x75, 0, 0, 0, 0x03, 0x01, 0x3E, 0xAA };
 	uint8_t conf[A2DP_MAX_CAPS_SIZE];
 	struct media_codec_audio_info ai = { 48000, 2 };

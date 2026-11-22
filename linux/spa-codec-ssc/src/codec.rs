@@ -1,6 +1,6 @@
 //! The `struct media_codec` callbacks PipeWire's media sink drives.
 
-use core::ffi::{CStr, c_char, c_int, c_void};
+use core::ffi::{CStr, c_int, c_void};
 use core::ptr;
 use core::slice;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -10,7 +10,7 @@ use ssc_enc::{FRAME_SAMPLES, PcmFrame};
 use crate::log::{error, info};
 use crate::pod;
 use crate::slot;
-use crate::ssc::{self, Abr, Preferences, Rung, SscMode};
+use crate::ssc::{self, Abr, Preferences, Rung, SscMode, Variant};
 use crate::sys;
 
 const EINVAL: c_int = 22;
@@ -91,11 +91,11 @@ unsafe extern "C" fn fill_caps(
 }
 
 unsafe extern "C" fn select_config(
-    _codec: *const sys::media_codec,
+    codec: *const sys::media_codec,
     _flags: u32,
     caps: *const c_void,
     caps_size: usize,
-    info: *const sys::media_codec_audio_info,
+    _info: *const sys::media_codec_audio_info,
     settings: *const sys::spa_dict,
     config: *mut u8,
     _config_data: *mut *mut c_void,
@@ -104,14 +104,16 @@ unsafe extern "C" fn select_config(
         let Some(remote) = ssc::parse_element(bytes(caps, caps_size)) else {
             return -ENOTSUP;
         };
-        let rate = info
-            .as_ref()
-            .map_or(sys::A2DP_CODEC_DEFAULT_RATE, |i| i.rate);
+        let variant = if ptr::eq(codec, &CODEC_UHQ.0) {
+            Variant::Uhq
+        } else {
+            Variant::Main
+        };
         let prefs = Preferences {
             mode: lookup(settings, c"bluez5.a2dp.ssc.mode").and_then(ssc::mode_by_name),
             uhq_alt_config: lookup(settings, c"bluez5.a2dp.ssc.uhq-alt-config").is_some_and(atob),
         };
-        match ssc::select_config(remote, rate, prefs) {
+        match ssc::select_config(remote, variant, prefs) {
             Some(conf) => write_config(config, conf, caps_size),
             None => -ENOTSUP,
         }
@@ -441,30 +443,52 @@ unsafe extern "C" fn set_log(log: *mut sys::spa_log) {
 pub struct Codec(pub sys::media_codec);
 unsafe impl Sync for Codec {}
 
-pub static CODEC: Codec = Codec(sys::media_codec {
-    id: slot::CODEC_ENUM,
-    kind: sys::MEDIA_CODEC_A2DP,
-    codec_id: sys::A2DP_CODEC_VENDOR as u8,
-    vendor: sys::a2dp_vendor_codec_t {
-        vendor_id: ssc::VENDOR_ID,
-        codec_id: ssc::CODEC_ID,
-    },
-    name: c"ssc".as_ptr(),
-    description: c"SSC (Samsung Seamless)".as_ptr() as *const c_char,
-    fill_caps: Some(fill_caps),
-    select_config: Some(select_config),
-    enum_config: Some(enum_config),
-    validate_config: Some(validate_config),
-    init_props: Some(init_props),
-    clear_props: Some(clear_props),
-    init: Some(init),
-    deinit: Some(deinit),
-    get_block_size: Some(get_block_size),
-    start_encode: Some(start_encode),
-    encode: Some(encode),
-    reduce_bitpool: Some(reduce_bitpool),
-    increase_bitpool: Some(increase_bitpool),
-    set_log: Some(set_log),
-    // SAFETY: every other field is a pointer, an Option of a function pointer, or an integer.
-    ..unsafe { core::mem::zeroed() }
-});
+const fn media_codec(
+    id: sys::spa_bluetooth_audio_codec,
+    name: &'static core::ffi::CStr,
+    description: &'static core::ffi::CStr,
+    owns_endpoint: bool,
+) -> sys::media_codec {
+    sys::media_codec {
+        id,
+        kind: sys::MEDIA_CODEC_A2DP,
+        codec_id: sys::A2DP_CODEC_VENDOR as u8,
+        vendor: sys::a2dp_vendor_codec_t {
+            vendor_id: ssc::VENDOR_ID,
+            codec_id: ssc::CODEC_ID,
+        },
+        name: name.as_ptr(),
+        description: description.as_ptr(),
+        endpoint_name: c"ssc".as_ptr(),
+        // Without fill_caps a codec registers no endpoint of its own and shares the "ssc" one.
+        fill_caps: if owns_endpoint { Some(fill_caps) } else { None },
+        select_config: Some(select_config),
+        enum_config: Some(enum_config),
+        validate_config: Some(validate_config),
+        init_props: Some(init_props),
+        clear_props: Some(clear_props),
+        init: Some(init),
+        deinit: Some(deinit),
+        get_block_size: Some(get_block_size),
+        start_encode: Some(start_encode),
+        encode: Some(encode),
+        reduce_bitpool: Some(reduce_bitpool),
+        increase_bitpool: Some(increase_bitpool),
+        set_log: Some(set_log),
+        // SAFETY: every other field is a pointer, an Option of a function pointer, or an integer.
+        ..unsafe { core::mem::zeroed() }
+    }
+}
+
+pub static CODEC: Codec = Codec(media_codec(
+    slot::CODEC_ENUM,
+    c"ssc",
+    c"SSC HiFi (Samsung Seamless)",
+    true,
+));
+pub static CODEC_UHQ: Codec = Codec(media_codec(
+    slot::UHQ_CODEC_ENUM,
+    c"ssc_uhq",
+    c"SSC UHQ 96 kHz (Samsung Seamless)",
+    false,
+));

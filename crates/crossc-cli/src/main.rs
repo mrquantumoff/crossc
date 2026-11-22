@@ -21,6 +21,11 @@
 //!                                      Linux only: update the PipeWire SSC
 //!                                      plugin and crossc-cli from GitHub
 //!                                      releases (not built on Windows)
+//! crossc-cli uhq [status|on|off|auto|watch]
+//!                                      Linux only: SSC UHQ 96 kHz on or off
+//!                                      (HiFi), or auto: UHQ while audio above
+//!                                      48 kHz plays (a systemd user service
+//!                                      running `uhq watch`)
 //! global: --device N | --path \\?\...  pick interface (default: first)
 //!         --in-mtu N                   in_mtu requested for probe/media
 //!                                      channels (default 1021; see SETUP 7)
@@ -33,6 +38,8 @@ mod pcm;
 mod play;
 mod probe;
 mod resample;
+#[cfg(target_os = "linux")]
+mod uhq;
 #[cfg(target_os = "linux")]
 mod update;
 mod wav;
@@ -73,6 +80,8 @@ enum Cmd {
     Play(Box<play::PlayArgs>),
     #[cfg(target_os = "linux")]
     Update(update::UpdateArgs),
+    #[cfg(target_os = "linux")]
+    Uhq(uhq::UhqCmd),
     Help,
 }
 
@@ -120,6 +129,8 @@ fn parse_args(args: &[String]) -> Result<(Global, Cmd), String> {
         Some("play") => Cmd::Play(Box::new(play::parse_play_args(&rest[1..])?)),
         #[cfg(target_os = "linux")]
         Some("update") => Cmd::Update(update::parse_update_args(&rest[1..])?),
+        #[cfg(target_os = "linux")]
+        Some("uhq") => Cmd::Uhq(uhq::parse_uhq_args(&rest[1..])?),
         Some(o) => return Err(format!("unknown command {o:?}")),
     };
     if matches!(cmd, Cmd::Play(_)) && g.seid.is_some() {
@@ -269,6 +280,17 @@ example: crossc-cli raw \"open 0x19\" \"send 1 00 01\" \"recv 1\"   (AVDTP DISCO
 Run elevated (device DACL is SYSTEM+Administrators).";
 
 fn main() -> ExitCode {
+    // Rust ignores SIGPIPE, so printing into a closed pipe (`crossc-cli uhq | head -1`) would panic.
+    // Restore the default: the process just ends, like other command-line tools.
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn signal(signum: i32, handler: usize) -> usize;
+        }
+        const SIGPIPE: i32 = 13;
+        const SIG_DFL: usize = 0;
+        unsafe { signal(SIGPIPE, SIG_DFL) };
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (g, cmd) = match parse_args(&args) {
         Ok(v) => v,
@@ -281,11 +303,18 @@ fn main() -> ExitCode {
         println!("{USAGE}");
         #[cfg(target_os = "linux")]
         println!("Linux: crossc-cli {}", update::UPDATE_USAGE);
+        #[cfg(target_os = "linux")]
+        println!("Linux: crossc-cli {}", uhq::UHQ_USAGE);
         return ExitCode::SUCCESS;
     }
     #[cfg(target_os = "linux")]
-    if let Cmd::Update(a) = &cmd {
-        return match update::run(a) {
+    if let Cmd::Update(_) | Cmd::Uhq(_) = &cmd {
+        let res = match &cmd {
+            Cmd::Update(a) => update::run(a),
+            Cmd::Uhq(c) => uhq::run(*c),
+            _ => unreachable!(),
+        };
+        return match res {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");

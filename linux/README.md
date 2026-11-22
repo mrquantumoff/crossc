@@ -22,8 +22,8 @@ enum. There are two ways in:
 | | Stock PipeWire | PipeWire with `patches/pipewire-ssc.patch` |
 |---|---|---|
 | Plugin file | `bluez5/libspa-codec-bluez5-lc3plus.so` | `bluez5/libspa-codec-bluez5-ssc.so` |
-| Codec id | `LC3PLUS_HR` (borrowed) | `SSC` (new) |
-| Shows as | "SSC (Samsung Seamless)" | "SSC (Samsung Seamless)" |
+| Codec ids | `LC3PLUS_HR` and `MPEG` (borrowed; no PipeWire plugin uses them) | `SSC` and `SSC_UHQ` (new) |
+| Profiles | `a2dp-sink-ssc` (HiFi), `a2dp-sink-ssc_uhq` (UHQ) | the same |
 
 Stock PipeWire works because distributions build it without LC3plus
 (`liblc3plus` is not packaged), which leaves that slot empty. If yours ships
@@ -41,18 +41,23 @@ plugin whose ABI version differs, it does not crash.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/mrquantumoff/crossc/master/linux/install.sh | bash
+# or, with UHQ 96 kHz switched on automatically for audio above 48 kHz:
+curl -fsSL https://raw.githubusercontent.com/mrquantumoff/crossc/master/linux/install.sh | bash -s -- --uhq auto
 ```
 
 The script downloads the latest release's `crossc-linux-<version>-x86_64.tar.gz`,
 checks it against its `.sha256`, and installs the plugin into PipeWire's SPA
 plugin directory (in the slot that PipeWire has, see above) and `crossc-cli`
 into `/usr/local/bin`. It asks for sudo only to copy those two files, then
-restarts PipeWire and WirePlumber in your session. It refuses to replace a
+restarts PipeWire and WirePlumber in your session and reconnects your
+Bluetooth headphones (the restart drops their A2DP link). It refuses to replace a
 real LC3plus plugin, and it warns when your PipeWire is not the version the
 plugin was built for.
 
-Then reconnect the buds and pick the *SSC* profile in your sound settings
-(or `pactl set-card-profile bluez_card.XX_XX_XX_XX_XX_XX a2dp-sink-ssc`).
+Then pick the *SSC HiFi* profile in your sound settings (or
+`pactl set-card-profile bluez_card.XX_XX_XX_XX_XX_XX a2dp-sink-ssc`), and
+choose how UHQ 96 kHz is used with `crossc-cli uhq auto`, `uhq on` or
+`uhq off` ([UHQ on, off or automatic](#uhq-on-off-or-automatic)).
 
 Options, also for a downloaded copy of the script (`install.sh --help`):
 
@@ -60,7 +65,8 @@ Options, also for a downloaded copy of the script (`install.sh --help`):
 |---|---|
 | `--version v0.4.0` | that release instead of the latest |
 | `--from-source [DIR]` | build the crossc checkout in DIR (default: the one holding the script); needs Rust, clang and pkg-config |
-| `--uninstall` | remove the plugin and `crossc-cli` |
+| `--uhq auto\|on\|off` | afterwards run `crossc-cli uhq <mode>`: UHQ for audio above 48 kHz, always, or never |
+| `--uninstall` | remove the plugin, `crossc-cli`, the UHQ auto service and its 96 kHz rule |
 | `--no-restart` | leave PipeWire running; the plugin loads at its next start |
 
 `PREFIX` (default `/usr/local`) and `SPA_DIR` (default: found automatically)
@@ -79,7 +85,8 @@ crossc-cli update --version v0.4.0 | --force
 asks GitHub for the latest release, and when that is newer downloads its
 Linux tarball, checks the `.sha256` (and GitHub's digest of the asset), and
 runs the `install.sh` inside it. So the plugin and `crossc-cli` itself are
-updated together. Downloads go through the system's `curl`. The `update`
+updated together, and a UHQ auto service keeps running on the new
+`crossc-cli`. Downloads go through the system's `curl`. The `update`
 command exists only in Linux builds of `crossc-cli`.
 
 ## Build from source
@@ -110,20 +117,55 @@ the same configuration octets as Samsung phones and the Windows service:
 | HiFi | `0x0C` | 48 kHz, 24-bit | 229, 192, 128, 88 |
 | SSC 48 / 44.1 kHz | `0x18` / `0x28` | 16-bit | 229, 128, 88 |
 
-Automatic choice: UHQ when PipeWire's Bluetooth default rate is 88.2 kHz or
-more, otherwise HiFi, then plain SSC. Only rates the buds are known to decode
-are sent, and only those whose packet fits the media MTU.
+The plugin registers two codecs on the buds' one SSC endpoint, so PipeWire
+lists two profiles: **SSC HiFi** (`a2dp-sink-ssc`: HiFi, or plain SSC on buds
+without HiFi) and **SSC UHQ 96 kHz** (`a2dp-sink-ssc_uhq`, only on buds that
+offer UHQ). Switching between them renegotiates the stream in about a second,
+without restarting PipeWire, and WirePlumber remembers the last one per
+device. Only rates the buds are known to decode are sent, and only those
+whose packet fits the media MTU.
+
+### UHQ on, off or automatic
+
+```sh
+crossc-cli uhq            # status: mode, stream rate, auto mode
+crossc-cli uhq on         # UHQ 96 kHz now
+crossc-cli uhq off        # HiFi 48 kHz now
+crossc-cli uhq auto       # UHQ while audio above 48 kHz plays, HiFi otherwise
+```
+
+`on` and `off` switch the connected buds at once and turn auto mode off.
+`auto` installs and starts a systemd user service, `crossc-uhq-auto.service`,
+that runs `crossc-cli uhq watch`. It follows the PipeWire graph and switches
+to UHQ once a stream above 48 kHz has played into the buds for a second, and
+back to HiFi after 10 s without one, so pauses and track changes do not flap
+it. Two switches are at least 5 s apart. It acts only while the buds are on
+one of the SSC profiles, so choosing AAC by hand stays respected.
+
+PipeWire changes its graph rate only while the output is idle, and a
+browser usually keeps a 48 kHz stream open, so 96 kHz audio would be
+resampled to 48 kHz and back. `uhq on` and `uhq auto` therefore install a
+WirePlumber rule, `wireplumber.conf.d/51-crossc-uhq-rate.conf`, that gives
+the UHQ output `node.force-rate = 96000`: while the buds play UHQ the graph
+runs at 96 kHz and other streams are resampled up instead. The HiFi output
+and other devices keep PipeWire's normal rate choice. Installing the rule
+restarts WirePlumber once, which drops the buds, so the command reconnects
+them. `default.clock.allowed-rates` should include 96000 as well
+(`crossc-cli uhq` warns when it does not).
+
+Note that most downloads are 44.1 kHz/16-bit (CD) or 48 kHz; only files
+above 48 kHz switch auto mode to UHQ. `metaflac --show-sample-rate file.flac`
+tells.
 
 Settings go in the `monitor.bluez.properties` of a WirePlumber config, e.g.
 `~/.config/wireplumber/wireplumber.conf.d/51-ssc.conf`:
 
 ```
 monitor.bluez.properties = {
-  bluez5.a2dp.ssc.mode = uhq          # auto (unset) | uhq | hifi | ssc48 | ssc44
-  bluez5.default.rate = 96000         # or this, to make auto pick UHQ
+  # bluez5.a2dp.ssc.mode = ssc48     # SSC HiFi profile: hifi (default) | ssc48 | ssc44
   # bluez5.a2dp.ssc.max-bitrate = 192 # kb/s cap; the ladder starts below it
   # bluez5.a2dp.ssc.adaptive = false  # one fixed rate
-  # bluez5.a2dp.ssc.uhq-alt-config = true  # send UHQ as 0x0E instead of 0x0A
+  # bluez5.a2dp.ssc.uhq-alt-config = true  # UHQ profile: send 0x0E instead of 0x0A
 }
 ```
 
@@ -142,8 +184,10 @@ Samsung's Continuity protocol, so a Galaxy phone hands the buds to the
 desktop the same way it hands them to another Galaxy device (Auto Switch).
 It decides when the buds switch over; crossc decides which codec they use
 once they are connected. When seuil brings the buds over, BlueZ connects
-A2DP, and PipeWire starts the profile WirePlumber remembers for them. Pick
-*SSC* once and later handoffs come back on it.
+A2DP and WirePlumber restores the profile it saved for them. With no saved
+profile, stock PipeWire ranks the borrowed LC3plus slot below AAC and picks
+AAC, so choose *SSC* once by hand; with the patch, SSC already ranks above
+AAC.
 
 seuil is installed on its own (see its README) and is GPL-3.0; crossc does
 not include or link any of its code. The two have not been tested together
@@ -183,6 +227,7 @@ bitrate on a congested link.
 | `patches/pipewire-ssc.patch` | Gives PipeWire its own SSC codec id and slot. |
 | `install.sh` | Installer and uninstaller; also what `crossc-cli update` runs. |
 | `../crates/crossc-cli/src/update.rs` | `crossc-cli update` (Linux builds only). |
+| `../crates/crossc-cli/src/uhq.rs` | `crossc-cli uhq` and its auto mode (Linux builds only). |
 
 This directory is its own Cargo workspace, so the Windows workspace at the
 repository root never builds it.

@@ -7,7 +7,9 @@
 #   install.sh --version v0.4.0     that release
 #   install.sh --local DIR          an extracted release in DIR (what `crossc-cli update` runs)
 #   install.sh --from-source [DIR]  build the crossc checkout in DIR (default: the one holding this script)
-#   install.sh --uninstall
+#   install.sh --uninstall          also removes the UHQ auto service and its 96 kHz rule
+#   --uhq auto|on|off               then run `crossc-cli uhq <mode>`: UHQ 96 kHz automatically for
+#                                   audio above 48 kHz, always, or never (HiFi 48 kHz)
 #   --no-restart                    leave PipeWire running; the plugin loads at its next start
 #
 # Root is needed only to write system directories; the script asks sudo for that step. CROSSC_REPO=owner/name
@@ -82,20 +84,86 @@ pipewire_version() {
     pipewire --version 2>/dev/null | sed -n 's/.*Linked with libpipewire \([0-9][0-9.]*\).*/\1/p' | head -n1
 }
 
-restart_pipewire() {
-    [ "$NO_RESTART" = 1 ] && { say "restart PipeWire to apply this: systemctl --user restart pipewire wireplumber"; return; }
-    local ok=0
+# Runs a command in the desktop user's session (systemctl --user, PipeWire), also under sudo.
+as_user() {
     if [ "$(id -u)" -ne 0 ]; then
-        systemctl --user restart pipewire wireplumber && ok=1
+        "$@"
     elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
         local uid
         uid="$(id -u "$SUDO_USER")"
-        sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user restart pipewire wireplumber && ok=1
+        sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$uid" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"
+    else
+        return 1
     fi
-    if [ "$ok" = 1 ]; then
-        say "PipeWire restarted; reconnect the buds and choose the SSC profile"
+}
+
+# Connected Bluetooth audio devices. Restarting PipeWire drops their A2DP link and
+# Galaxy Buds do not bring it back by themselves.
+connected_audio() {
+    command -v bluetoothctl >/dev/null 2>&1 || return 0
+    bluetoothctl devices Connected 2>/dev/null | while read -r _ mac _; do
+        bluetoothctl info "$mac" 2>/dev/null | grep -q 'Icon: audio' && echo "$mac"
+    done
+}
+
+reconnect() {
+    local mac
+    for mac in "$@"; do
+        say "reconnecting $mac"
+        bluetoothctl disconnect "$mac" >/dev/null 2>&1 || true
+        sleep 2
+        bluetoothctl connect "$mac" >/dev/null 2>&1 || warn "could not reconnect $mac; connect it again by hand"
+    done
+}
+
+restart_pipewire() {
+    [ "$NO_RESTART" = 1 ] && { say "restart PipeWire to apply this: systemctl --user restart pipewire wireplumber"; return; }
+    local devices
+    mapfile -t devices < <(connected_audio)
+    if as_user systemctl --user restart pipewire wireplumber; then
+        say "PipeWire restarted"
+        sleep 2
+        reconnect "${devices[@]}"
     else
         warn "could not restart PipeWire; run as your user: systemctl --user restart pipewire wireplumber"
+    fi
+}
+
+UHQ_UNIT="crossc-uhq-auto.service"
+
+user_config() {
+    local home
+    home="$(as_user sh -c 'echo "${XDG_CONFIG_HOME:-$HOME/.config}"' 2>/dev/null)" || return 1
+    echo "$home"
+}
+
+# After installing: apply --uhq, or point an existing auto service at the new crossc-cli.
+setup_uhq() {
+    local cli="$PREFIX/bin/crossc-cli" cfg mode="$UHQ"
+    cfg="$(user_config)" || { [ -n "$mode" ] && warn "no desktop user session; run: crossc-cli uhq $mode"; return 0; }
+    if [ -z "$mode" ] && [ -f "$cfg/systemd/user/$UHQ_UNIT" ]; then
+        mode=auto
+    fi
+    if [ -n "$mode" ]; then
+        as_user "$cli" uhq "$mode" || warn "crossc-cli uhq $mode failed; run it again once the buds are connected"
+    else
+        say "UHQ 96 kHz: crossc-cli uhq auto (UHQ for audio above 48 kHz), uhq on, uhq off, uhq status"
+    fi
+}
+
+remove_uhq() {
+    local cfg
+    cfg="$(user_config)" || return 0
+    if [ -f "$cfg/systemd/user/$UHQ_UNIT" ]; then
+        as_user systemctl --user disable --now "$UHQ_UNIT" >/dev/null 2>&1 || true
+        as_user rm -f "$cfg/systemd/user/$UHQ_UNIT"
+        as_user systemctl --user daemon-reload || true
+        say "removed the UHQ auto service"
+    fi
+    if [ -f "$cfg/wireplumber/wireplumber.conf.d/51-crossc-uhq-rate.conf" ]; then
+        as_user rm -f "$cfg/wireplumber/wireplumber.conf.d/51-crossc-uhq-rate.conf"
+        say "removed the 96 kHz UHQ rule"
     fi
 }
 
@@ -120,6 +188,7 @@ loads the plugin and skips it if it does not match. If no SSC profile shows up, 
     in_dir "$spa/bluez5" install -Dm755 "$dir/libspa-codec-bluez5-$slot.so" "$spa/bluez5/libspa-codec-bluez5-$slot.so"
     in_dir "$PREFIX/bin" install -Dm755 "$dir/crossc-cli" "$PREFIX/bin/crossc-cli"
     restart_pipewire
+    setup_uhq
 }
 
 arch_name() {
@@ -189,12 +258,14 @@ uninstall() {
         say "removed $PREFIX/bin/crossc-cli"
     fi
     [ "$removed" = 1 ] || say "no crossc plugin installed"
+    remove_uhq
     restart_pipewire
 }
 
 ACTION=""
 ARG=""
 NO_RESTART=0
+UHQ=
 while [ $# -gt 0 ]; do
     case "$1" in
         --version) ACTION=download; ARG="${2:?--version needs a tag, e.g. v0.4.0}"; shift ;;
@@ -205,7 +276,12 @@ while [ $# -gt 0 ]; do
             ;;
         --uninstall) ACTION=uninstall ;;
         --no-restart) NO_RESTART=1 ;;
-        -h | --help) sed -n '2,15s/^# \{0,1\}//p' "${BASH_SOURCE[0]}" 2>/dev/null || true; exit 0 ;;
+        --uhq)
+            UHQ="${2:?--uhq needs auto, on or off}"
+            case "$UHQ" in auto | on | off) ;; *) die "--uhq takes auto, on or off" ;; esac
+            shift
+            ;;
+        -h | --help) sed -n '2,18s/^# \{0,1\}//p' "${BASH_SOURCE[0]}" 2>/dev/null || true; exit 0 ;;
         *) die "unknown option $1 (see --help)" ;;
     esac
     shift

@@ -72,21 +72,31 @@ fn main() {
     // A PipeWire carrying patches/pipewire-ssc.patch has its own SSC codec id
     // and loader slot. Unpatched, the plugin takes the LC3plus slot, which
     // distributions leave empty (liblc3plus is not packaged).
-    let has_ssc_id = text.contains("SPA_BLUETOOTH_AUDIO_CODEC_SSC:");
+    // The UHQ codec needs a second id: SSC_UHQ from the patch, or, unpatched, MPEG, which no PipeWire
+    // codec plugin implements.
+    let has_ssc_id = text.contains("SPA_BLUETOOTH_AUDIO_CODEC_SSC:")
+        && text.contains("SPA_BLUETOOTH_AUDIO_CODEC_SSC_UHQ:");
     let slot = env::var("SSC_CODEC_SLOT")
         .unwrap_or_else(|_| if has_ssc_id { "ssc" } else { "lc3plus" }.into());
-    let id = match slot.as_str() {
-        "ssc" if has_ssc_id => "SPA_BLUETOOTH_AUDIO_CODEC_SSC",
+    let (id, uhq_id) = match slot.as_str() {
+        "ssc" if has_ssc_id => (
+            "SPA_BLUETOOTH_AUDIO_CODEC_SSC",
+            "SPA_BLUETOOTH_AUDIO_CODEC_SSC_UHQ",
+        ),
         "ssc" => panic!(
             "SSC_CODEC_SLOT=ssc needs PipeWire headers from a build with patches/pipewire-ssc.patch"
         ),
-        "lc3plus" => "SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR",
+        "lc3plus" => (
+            "SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR",
+            "SPA_BLUETOOTH_AUDIO_CODEC_MPEG",
+        ),
         other => panic!("SSC_CODEC_SLOT={other}: expected ssc or lc3plus"),
     };
     std::fs::write(
         out.join("slot.rs"),
         format!(
             "pub const CODEC_ENUM: crate::sys::spa_bluetooth_audio_codec = crate::sys::{id};\n\
+             pub const UHQ_CODEC_ENUM: crate::sys::spa_bluetooth_audio_codec = crate::sys::{uhq_id};\n\
              pub const FACTORY_NAME: &::core::ffi::CStr = c\"api.codec.bluez5.media.{slot}\";\n\
              pub const LOG_TOPIC: &::core::ffi::CStr = c\"spa.bluez5.codecs.{slot}\";\n\
              pub const SLOT: &str = \"{slot}\";\n"

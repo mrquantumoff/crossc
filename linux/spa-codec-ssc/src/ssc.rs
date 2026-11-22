@@ -143,24 +143,38 @@ fn usable(m: &SscMode, caps: u8) -> bool {
     caps & m.bit != 0 && !(m.bit == flags::UHQ_V2_96K_24 && caps & flags::SINK_DISABLES_UHQ != 0)
 }
 
+/// The two codecs the plugin registers on the one SSC endpoint. PipeWire
+/// shows each as a profile, so switching between them renegotiates the stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Variant {
+    /// `ssc`: HiFi 48 kHz/24, else plain SSC 48 / 44.1 kHz. Never UHQ.
+    Main,
+    /// `ssc_uhq`: UHQ 96 kHz/24 only.
+    Uhq,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Preferences {
-    /// `bluez5.a2dp.ssc.mode`; `None` is automatic.
+    /// `bluez5.a2dp.ssc.mode` for the main codec (`hifi`, `ssc48`, `ssc44`); `None` is automatic.
     pub mode: Option<&'static SscMode>,
     /// `bluez5.a2dp.ssc.uhq-alt-config`: send UHQ as `0x0E` instead of `0x0A`.
     pub uhq_alt_config: bool,
 }
 
 /// The configuration octet for a sink's capability octet, or `None` if the
-/// sink offers nothing we encode. Automatic choice: UHQ when the graph runs at
-/// 88.2 kHz or more, otherwise HiFi, then plain SSC 48 / 44.1 kHz, then UHQ.
-pub fn select_config(caps: u8, graph_rate: u32, prefs: Preferences) -> Option<u8> {
-    let wanted = prefs.mode.or((graph_rate >= 88_200).then_some(&UHQ));
-    let m = wanted.filter(|m| usable(m, caps)).or_else(|| {
-        [&HIFI, &SSC48, &SSC44, &UHQ]
-            .into_iter()
-            .find(|m| usable(m, caps))
-    })?;
+/// sink offers nothing this variant encodes.
+pub fn select_config(caps: u8, variant: Variant, prefs: Preferences) -> Option<u8> {
+    let m = match variant {
+        Variant::Uhq => Some(&UHQ).filter(|m| usable(m, caps))?,
+        Variant::Main => prefs
+            .mode
+            .filter(|m| m.bit != flags::UHQ_V2_96K_24 && usable(m, caps))
+            .or_else(|| {
+                [&HIFI, &SSC48, &SSC44]
+                    .into_iter()
+                    .find(|m| usable(m, caps))
+            })?,
+    };
     let mut config = m.bit | (caps & flags::NO_LIMIT_24BIT);
     if m.bit == flags::UHQ_V2_96K_24 && prefs.uhq_alt_config && caps & flags::HIFI_48K_24 != 0 {
         config |= flags::HIFI_48K_24;
@@ -315,32 +329,31 @@ mod tests {
 
     #[test]
     fn config_octets_match_the_reference() {
+        use Variant::{Main, Uhq};
         // crossc DESIGN.md "Format -> mode".
-        assert_eq!(select_config(0x3E, 48_000, AUTO), Some(0x0C));
-        assert_eq!(select_config(0x3E, 96_000, AUTO), Some(0x0A));
+        assert_eq!(select_config(0x3E, Main, AUTO), Some(0x0C), "HiFi");
+        assert_eq!(select_config(0x3E, Uhq, AUTO), Some(0x0A), "UHQ");
+        assert_eq!(select_config(0x3F, Uhq, AUTO), None, "sink disables UHQ");
+        assert_eq!(select_config(0x3F, Main, AUTO), Some(0x0C));
         assert_eq!(
-            select_config(0x3F, 96_000, AUTO),
-            Some(0x0C),
-            "sink disables UHQ"
-        );
-        assert_eq!(
-            select_config(0x38, 96_000, AUTO),
+            select_config(0x38, Main, AUTO),
             Some(0x18),
             "48 kHz SSC only, with 0x08"
         );
+        assert_eq!(select_config(0x38, Uhq, AUTO), None);
         assert_eq!(
-            select_config(0x10, 48_000, AUTO),
+            select_config(0x10, Main, AUTO),
             Some(0x10),
             "0x08 only when offered"
         );
-        assert_eq!(select_config(0x28, 48_000, AUTO), Some(0x28));
+        assert_eq!(select_config(0x28, Main, AUTO), Some(0x28));
         assert_eq!(
-            select_config(0x02, 48_000, AUTO),
-            Some(0x02),
-            "UHQ as the last resort"
+            select_config(0x02, Main, AUTO),
+            None,
+            "the main codec never sends UHQ"
         );
         assert_eq!(
-            select_config(0x80, 48_000, AUTO),
+            select_config(0x80, Main, AUTO),
             None,
             "legacy UHQ is not encoded"
         );
@@ -348,23 +361,33 @@ mod tests {
 
     #[test]
     fn preferences() {
+        use Variant::{Main, Uhq};
+        let alt = Preferences {
+            mode: None,
+            uhq_alt_config: true,
+        };
+        assert_eq!(select_config(0x3E, Uhq, alt), Some(0x0E));
+        assert_eq!(select_config(0x3E, Main, alt), Some(0x0C));
+        let ssc48 = Preferences {
+            mode: Some(&SSC48),
+            uhq_alt_config: false,
+        };
+        assert_eq!(select_config(0x3E, Main, ssc48), Some(0x18));
         let uhq = Preferences {
             mode: Some(&UHQ),
             uhq_alt_config: false,
         };
-        assert_eq!(select_config(0x3E, 48_000, uhq), Some(0x0A));
-        let alt = Preferences {
-            mode: Some(&UHQ),
-            uhq_alt_config: true,
-        };
-        assert_eq!(select_config(0x3E, 48_000, alt), Some(0x0E));
+        assert_eq!(
+            select_config(0x3E, Main, uhq),
+            Some(0x0C),
+            "mode=uhq is the ssc_uhq codec's job"
+        );
         let hifi = Preferences {
             mode: Some(&HIFI),
             uhq_alt_config: false,
         };
-        assert_eq!(select_config(0x3E, 96_000, hifi), Some(0x0C));
         assert_eq!(
-            select_config(0x38, 48_000, hifi),
+            select_config(0x38, Main, hifi),
             Some(0x18),
             "falls back when not offered"
         );

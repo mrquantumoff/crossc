@@ -14,10 +14,10 @@ an open encoder.
 encoder; no driver is needed there. Install it with
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/mrquantumoff/crossc/master/linux/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mrquantumoff/crossc/master/linux/install.sh | bash -s -- --uhq auto
 ```
 
-and update it with `crossc-cli update`. See [linux/README.md](linux/README.md).
+and update it with `crossc-cli update`; `crossc-cli uhq on|off|auto` switches UHQ. See [linux/README.md](linux/README.md).
 The rest of this page is about Windows.
 
 > **Experimental.** This is a test-signed kernel driver. It needs Windows test

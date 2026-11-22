@@ -1,40 +1,43 @@
 diff --git a/spa/include/spa/param/bluetooth/audio.h b/spa/include/spa/param/bluetooth/audio.h
-index 34b45e2..973f407 100644
+index 34b45e2..88af5c5 100644
 --- a/spa/include/spa/param/bluetooth/audio.h
 +++ b/spa/include/spa/param/bluetooth/audio.h
-@@ -36,6 +36,7 @@ enum spa_bluetooth_audio_codec {
+@@ -36,6 +36,8 @@ enum spa_bluetooth_audio_codec {
  	SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_DUPLEX,
  	SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO,
  	SPA_BLUETOOTH_AUDIO_CODEC_OPUS_G,
 +	SPA_BLUETOOTH_AUDIO_CODEC_SSC,
++	SPA_BLUETOOTH_AUDIO_CODEC_SSC_UHQ,
  
  	/* HFP */
  	SPA_BLUETOOTH_AUDIO_CODEC_CVSD = 0x100,
 diff --git a/spa/include/spa/param/bluetooth/type-info.h b/spa/include/spa/param/bluetooth/type-info.h
-index 7bf1da5..08c61af 100644
+index 7bf1da5..4e9aefa 100644
 --- a/spa/include/spa/param/bluetooth/type-info.h
 +++ b/spa/include/spa/param/bluetooth/type-info.h
-@@ -40,6 +40,7 @@ static const struct spa_type_info spa_type_bluetooth_audio_codec[] = {
+@@ -40,6 +40,8 @@ static const struct spa_type_info spa_type_bluetooth_audio_codec[] = {
  	{ SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_DUPLEX, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "opus_05_duplex", NULL },
  	{ SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "opus_05_pro", NULL },
  	{ SPA_BLUETOOTH_AUDIO_CODEC_OPUS_G, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "opus_g", NULL },
 +	{ SPA_BLUETOOTH_AUDIO_CODEC_SSC, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "ssc", NULL },
++	{ SPA_BLUETOOTH_AUDIO_CODEC_SSC_UHQ, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "ssc_uhq", NULL },
  
  	{ SPA_BLUETOOTH_AUDIO_CODEC_CVSD, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "cvsd", NULL },
  	{ SPA_BLUETOOTH_AUDIO_CODEC_MSBC, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "msbc", NULL },
 diff --git a/spa/plugins/bluez5/codec-loader.c b/spa/plugins/bluez5/codec-loader.c
-index 68e6af7..dfb8034 100644
+index 68e6af7..cbec53c 100644
 --- a/spa/plugins/bluez5/codec-loader.c
 +++ b/spa/plugins/bluez5/codec-loader.c
-@@ -32,6 +32,7 @@ static int codec_order(const struct media_codec *c)
+@@ -32,6 +32,8 @@ static int codec_order(const struct media_codec *c)
  {
  	static const enum spa_bluetooth_audio_codec order[] = {
  		SPA_BLUETOOTH_AUDIO_CODEC_LC3,
 +		SPA_BLUETOOTH_AUDIO_CODEC_SSC,
++		SPA_BLUETOOTH_AUDIO_CODEC_SSC_UHQ,
  		SPA_BLUETOOTH_AUDIO_CODEC_LDAC,
  		SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD,
  		SPA_BLUETOOTH_AUDIO_CODEC_APTX,
-@@ -184,6 +185,7 @@ const struct media_codec * const *load_media_codecs(struct spa_plugin_loader *lo
+@@ -184,6 +186,7 @@ const struct media_codec * const *load_media_codecs(struct spa_plugin_loader *lo
  		MEDIA_CODEC_FACTORY_LIB("aptx"),
  		MEDIA_CODEC_FACTORY_LIB("faststream"),
  		MEDIA_CODEC_FACTORY_LIB("ldac"),
