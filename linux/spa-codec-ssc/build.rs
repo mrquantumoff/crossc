@@ -15,6 +15,15 @@ fn pkg_config(args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// Whether the bindings declare the constant `name`, however bindgen spaced them.
+fn defines(bindings: &str, name: &str) -> bool {
+    bindings.match_indices(name).any(|(at, _)| {
+        let before = bindings[..at].trim_end();
+        let after = bindings[at + name.len()..].trim_start();
+        before.ends_with("const") && after.starts_with(':')
+    })
+}
+
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let headers = env::var_os("SSC_PIPEWIRE_HEADERS")
@@ -62,6 +71,8 @@ fn main() {
         .prepend_enum_name(false)
         .derive_default(true)
         .generate_cstr(true)
+        // Same output with or without rustfmt installed (release runners have none).
+        .formatter(bindgen::Formatter::None)
         .generate()
         .expect("bindgen failed on the PipeWire codec headers");
 
@@ -74,8 +85,8 @@ fn main() {
     // distributions leave empty (liblc3plus is not packaged).
     // The UHQ codec needs a second id: SSC_UHQ from the patch, or, unpatched, MPEG, which no PipeWire
     // codec plugin implements.
-    let has_ssc_id = text.contains("SPA_BLUETOOTH_AUDIO_CODEC_SSC:")
-        && text.contains("SPA_BLUETOOTH_AUDIO_CODEC_SSC_UHQ:");
+    let has_ssc_id = defines(&text, "SPA_BLUETOOTH_AUDIO_CODEC_SSC")
+        && defines(&text, "SPA_BLUETOOTH_AUDIO_CODEC_SSC_UHQ");
     let slot = env::var("SSC_CODEC_SLOT")
         .unwrap_or_else(|_| if has_ssc_id { "ssc" } else { "lc3plus" }.into());
     let (id, uhq_id) = match slot.as_str() {
